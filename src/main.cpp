@@ -82,6 +82,34 @@ constexpr int SEV_MIN_LOW = 10;
 #define ID_COMBO_THEME 120
 #define IDT_HEARTBEAT 1001
 
+// Menu Item IDs
+#define IDM_FILE_ATTACH_SELF 2001
+#define IDM_FILE_TRIAGE 2002
+#define IDM_FILE_EXPORT_JSON 2003
+#define IDM_FILE_EXIT 2004
+
+#define IDM_EDIT_COPY_ADDR 2010
+#define IDM_EDIT_COPY_HEX 2011
+#define IDM_EDIT_FIND_PATTERN 2012
+#define IDM_EDIT_FIND_NEXT 2013
+
+#define IDM_VIEW_TRIAGE_FINDINGS 2020
+#define IDM_VIEW_MEMORY_MAP 2021
+#define IDM_VIEW_THEME_LIGHT 2022
+#define IDM_VIEW_THEME_DARK 2023
+#define IDM_VIEW_HIDE_CLEAN 2024
+#define IDM_VIEW_HITS_ONLY 2025
+#define IDM_VIEW_REFRESH 2026
+
+#define IDM_TIMELINE_SNAP 2030
+#define IDM_TIMELINE_CLEAR 2031
+#define IDM_TIMELINE_HEARTBEAT 2032
+#define IDM_TIMELINE_PREV_PAGE 2033
+#define IDM_TIMELINE_NEXT_PAGE 2034
+
+#define IDM_HELP_HEURISTICS 2040
+#define IDM_HELP_ABOUT 2041
+
 // Custom window messages for background worker thread scanning & triage
 #define WM_SCAN_PROGRESS (WM_USER + 1)
 #define WM_SCAN_COMPLETE (WM_USER + 2)
@@ -1145,6 +1173,7 @@ static HFONT g_ui_font = nullptr;
 static HFONT g_ui_font_bold = nullptr;
 static HBRUSH g_br_window = nullptr;
 static HBRUSH g_br_control = nullptr;
+static HACCEL g_haccel = nullptr;
 
 static AppTheme g_theme = AppTheme::Light;
 static ViewMode g_view_mode = ViewMode::TriageFindings;
@@ -2830,6 +2859,83 @@ void make_button_modern(HWND btn, ModernButtonStyle style) {
     SetPropA(btn, DEADEYE_BTN_PROP, reinterpret_cast<HANDLE>(data));
 }
 
+void copy_text_to_clipboard(HWND hwnd, const std::string &text)
+{
+    if (!OpenClipboard(hwnd))
+        return;
+    EmptyClipboard();
+    HGLOBAL hGlob = GlobalAlloc(GMEM_MOVEABLE, text.size() + 1);
+    if (hGlob)
+    {
+        char *p = static_cast<char *>(GlobalLock(hGlob));
+        if (p)
+        {
+            std::memcpy(p, text.c_str(), text.size() + 1);
+            GlobalUnlock(hGlob);
+            SetClipboardData(CF_TEXT, hGlob);
+        }
+    }
+    CloseClipboard();
+}
+
+HMENU create_application_menu()
+{
+    HMENU hMenuBar = CreateMenu();
+
+    // 1. File Menu
+    HMENU hFileMenu = CreatePopupMenu();
+    AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_ATTACH_SELF, "Attach to &Self\tCtrl+Alt+S");
+    AppendMenuA(hFileMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_TRIAGE, "Run Defensive &Triage\tCtrl+T");
+    AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_EXPORT_JSON, "&Export Triage JSON...\tCtrl+S");
+    AppendMenuA(hFileMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_EXIT, "E&xit\tAlt+F4");
+    AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hFileMenu), "&File");
+
+    // 2. Edit Menu
+    HMENU hEditMenu = CreatePopupMenu();
+    AppendMenuA(hEditMenu, MF_STRING, IDM_EDIT_COPY_ADDR, "&Copy Region Address\tCtrl+C");
+    AppendMenuA(hEditMenu, MF_STRING, IDM_EDIT_COPY_HEX, "Copy &Hex Dump\tCtrl+Shift+C");
+    AppendMenuA(hEditMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(hEditMenu, MF_STRING, IDM_EDIT_FIND_PATTERN, "&Find Hex Pattern...\tCtrl+F");
+    AppendMenuA(hEditMenu, MF_STRING, IDM_EDIT_FIND_NEXT, "Find &Next Hit\tF3");
+    AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hEditMenu), "&Edit");
+
+    // 3. View Menu
+    HMENU hViewMenu = CreatePopupMenu();
+    AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_TRIAGE_FINDINGS, "&Triage Findings View\tCtrl+1");
+    AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_MEMORY_MAP, "&Memory Map View\tCtrl+2");
+    AppendMenuA(hViewMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_THEME_LIGHT, "&Light Mode");
+    AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_THEME_DARK, "&Dark Mode");
+    AppendMenuA(hViewMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_HIDE_CLEAN, "&Hide Clean Regions");
+    AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_HITS_ONLY, "&Hits Only Filter");
+    AppendMenuA(hViewMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_REFRESH, "&Refresh Memory Walk\tF5");
+    AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hViewMenu), "&View");
+
+    // 4. Timeline Menu
+    HMENU hTimelineMenu = CreatePopupMenu();
+    AppendMenuA(hTimelineMenu, MF_STRING, IDM_TIMELINE_SNAP, "&Take Snapshot\tCtrl+N");
+    AppendMenuA(hTimelineMenu, MF_STRING, IDM_TIMELINE_CLEAR, "&Clear All Snapshots");
+    AppendMenuA(hTimelineMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(hTimelineMenu, MF_STRING, IDM_TIMELINE_HEARTBEAT, "&Live Memory Heartbeat (1s)");
+    AppendMenuA(hTimelineMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(hTimelineMenu, MF_STRING, IDM_TIMELINE_PREV_PAGE, "&Previous 64K Page\tPgUp");
+    AppendMenuA(hTimelineMenu, MF_STRING, IDM_TIMELINE_NEXT_PAGE, "&Next 64K Page\tPgDn");
+    AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hTimelineMenu), "&Timeline");
+
+    // 5. Help Menu
+    HMENU hHelpMenu = CreatePopupMenu();
+    AppendMenuA(hHelpMenu, MF_STRING, IDM_HELP_HEURISTICS, "&Defensive Heuristics Guide...");
+    AppendMenuA(hHelpMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(hHelpMenu, MF_STRING, IDM_HELP_ABOUT, "&About Deadeye...");
+    AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hHelpMenu), "&Help");
+
+    return hMenuBar;
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg)
@@ -3003,7 +3109,40 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         make_button_modern(g_btn_prev_page, ModernButtonStyle::Standard);
         make_button_modern(g_btn_next_page, ModernButtonStyle::Standard);
 
+        // Attach application menu bar
+        HMENU hMenu = create_application_menu();
+        SetMenu(hwnd, hMenu);
+
+        // Build global keyboard accelerators
+        ACCEL accels[] = {
+            { FCONTROL | FVIRTKEY, 'T', ID_BTN_TRIAGE },
+            { FCONTROL | FVIRTKEY, 'S', ID_BTN_EXPORT_JSON },
+            { FCONTROL | FVIRTKEY, 'F', IDM_EDIT_FIND_PATTERN },
+            { FVIRTKEY, VK_F3, ID_BTN_NEXT_HIT },
+            { FVIRTKEY, VK_F5, ID_BTN_LOAD },
+            { FCONTROL | FVIRTKEY, 'C', IDM_EDIT_COPY_ADDR },
+            { FCONTROL | FSHIFT | FVIRTKEY, 'C', IDM_EDIT_COPY_HEX },
+            { FCONTROL | FVIRTKEY, 'N', ID_BTN_SNAP },
+            { FCONTROL | FVIRTKEY, '1', IDM_VIEW_TRIAGE_FINDINGS },
+            { FCONTROL | FVIRTKEY, '2', IDM_VIEW_MEMORY_MAP },
+            { FCONTROL | FALT | FVIRTKEY, 'S', IDM_FILE_ATTACH_SELF }
+        };
+        g_haccel = CreateAcceleratorTableA(accels, sizeof(accels) / sizeof(accels[0]));
+
         PostMessageA(hwnd, WM_COMMAND, ID_BTN_TRIAGE, 0);
+        return 0;
+    }
+
+    case WM_INITMENUPOPUP:
+    {
+        HMENU hMenu = reinterpret_cast<HMENU>(wp);
+        CheckMenuItem(hMenu, IDM_VIEW_THEME_LIGHT, (g_theme == AppTheme::Light) ? MF_CHECKED : MF_UNCHECKED);
+        CheckMenuItem(hMenu, IDM_VIEW_THEME_DARK, (g_theme == AppTheme::Dark) ? MF_CHECKED : MF_UNCHECKED);
+        CheckMenuItem(hMenu, IDM_VIEW_TRIAGE_FINDINGS, (g_view_mode == ViewMode::TriageFindings) ? MF_CHECKED : MF_UNCHECKED);
+        CheckMenuItem(hMenu, IDM_VIEW_MEMORY_MAP, (g_view_mode == ViewMode::MemoryMap) ? MF_CHECKED : MF_UNCHECKED);
+        CheckMenuItem(hMenu, IDM_VIEW_HIDE_CLEAN, g_hide_clean ? MF_CHECKED : MF_UNCHECKED);
+        CheckMenuItem(hMenu, IDM_VIEW_HITS_ONLY, (SendMessageA(g_chk_hits_only, BM_GETCHECK, 0, 0) == BST_CHECKED) ? MF_CHECKED : MF_UNCHECKED);
+        CheckMenuItem(hMenu, IDM_TIMELINE_HEARTBEAT, (SendMessageA(g_chk_heartbeat, BM_GETCHECK, 0, 0) == BST_CHECKED) ? MF_CHECKED : MF_UNCHECKED);
         return 0;
     }
 
@@ -3285,6 +3424,158 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 set_status("Heartbeat stopped.");
             }
         }
+        else if (id == IDM_FILE_ATTACH_SELF)
+        {
+            SetWindowTextA(g_edit_pid, "self");
+            PostMessageA(hwnd, WM_COMMAND, ID_BTN_LOAD, 0);
+        }
+        else if (id == IDM_FILE_TRIAGE)
+        {
+            PostMessageA(hwnd, WM_COMMAND, ID_BTN_TRIAGE, 0);
+        }
+        else if (id == IDM_FILE_EXPORT_JSON)
+        {
+            PostMessageA(hwnd, WM_COMMAND, ID_BTN_EXPORT_JSON, 0);
+        }
+        else if (id == IDM_FILE_EXIT)
+        {
+            PostMessageA(hwnd, WM_CLOSE, 0, 0);
+        }
+        else if (id == IDM_EDIT_COPY_ADDR)
+        {
+            HWND focused = GetFocus();
+            if (focused == g_edit_hex)
+            {
+                DWORD sel_start = 0, sel_end = 0;
+                SendMessageA(g_edit_hex, EM_GETSEL, reinterpret_cast<WPARAM>(&sel_start), reinterpret_cast<LPARAM>(&sel_end));
+                if (sel_start != sel_end)
+                {
+                    SendMessageA(g_edit_hex, WM_COPY, 0, 0);
+                    return 0;
+                }
+            }
+            if (g_has_selection && g_selected_region < g_regions.size())
+            {
+                std::string addr_hex = to_hex_string(g_regions[g_selected_region].base);
+                copy_text_to_clipboard(hwnd, addr_hex);
+                set_status("Copied region address " + addr_hex + " to clipboard.");
+            }
+        }
+        else if (id == IDM_EDIT_COPY_HEX)
+        {
+            int len = GetWindowTextLengthA(g_edit_hex);
+            if (len > 0)
+            {
+                std::vector<char> buf(len + 1);
+                GetWindowTextA(g_edit_hex, buf.data(), len + 1);
+                copy_text_to_clipboard(hwnd, buf.data());
+                set_status("Hex dump copied to clipboard (" + std::to_string(len) + " bytes).");
+            }
+        }
+        else if (id == IDM_EDIT_FIND_PATTERN)
+        {
+            SetFocus(g_edit_pattern);
+            SendMessageA(g_edit_pattern, EM_SETSEL, 0, -1);
+        }
+        else if (id == IDM_EDIT_FIND_NEXT)
+        {
+            PostMessageA(hwnd, WM_COMMAND, ID_BTN_NEXT_HIT, 0);
+        }
+        else if (id == IDM_VIEW_TRIAGE_FINDINGS)
+        {
+            SendMessageA(g_combo_view_mode, CB_SETCURSEL, 0, 0);
+            SendMessageA(hwnd, WM_COMMAND, MAKEWPARAM(ID_COMBO_VIEW_MODE, CBN_SELCHANGE), reinterpret_cast<LPARAM>(g_combo_view_mode));
+        }
+        else if (id == IDM_VIEW_MEMORY_MAP)
+        {
+            SendMessageA(g_combo_view_mode, CB_SETCURSEL, 1, 0);
+            SendMessageA(hwnd, WM_COMMAND, MAKEWPARAM(ID_COMBO_VIEW_MODE, CBN_SELCHANGE), reinterpret_cast<LPARAM>(g_combo_view_mode));
+        }
+        else if (id == IDM_VIEW_THEME_LIGHT)
+        {
+            SendMessageA(g_combo_theme, CB_SETCURSEL, 0, 0);
+            SendMessageA(hwnd, WM_COMMAND, MAKEWPARAM(ID_COMBO_THEME, CBN_SELCHANGE), reinterpret_cast<LPARAM>(g_combo_theme));
+        }
+        else if (id == IDM_VIEW_THEME_DARK)
+        {
+            SendMessageA(g_combo_theme, CB_SETCURSEL, 1, 0);
+            SendMessageA(hwnd, WM_COMMAND, MAKEWPARAM(ID_COMBO_THEME, CBN_SELCHANGE), reinterpret_cast<LPARAM>(g_combo_theme));
+        }
+        else if (id == IDM_VIEW_HIDE_CLEAN)
+        {
+            bool cur = (SendMessageA(g_chk_hide_clean, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            SendMessageA(g_chk_hide_clean, BM_SETCHECK, cur ? BST_UNCHECKED : BST_CHECKED, 0);
+            SendMessageA(hwnd, WM_COMMAND, ID_CHK_HIDE_CLEAN, 0);
+        }
+        else if (id == IDM_VIEW_HITS_ONLY)
+        {
+            bool cur = (SendMessageA(g_chk_hits_only, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            SendMessageA(g_chk_hits_only, BM_SETCHECK, cur ? BST_UNCHECKED : BST_CHECKED, 0);
+            SendMessageA(hwnd, WM_COMMAND, ID_CHK_HITS_ONLY, 0);
+        }
+        else if (id == IDM_VIEW_REFRESH)
+        {
+            PostMessageA(hwnd, WM_COMMAND, ID_BTN_LOAD, 0);
+        }
+        else if (id == IDM_TIMELINE_SNAP)
+        {
+            PostMessageA(hwnd, WM_COMMAND, ID_BTN_SNAP, 0);
+        }
+        else if (id == IDM_TIMELINE_CLEAR)
+        {
+            PostMessageA(hwnd, WM_COMMAND, ID_BTN_CLEAR_SNAPS, 0);
+        }
+        else if (id == IDM_TIMELINE_HEARTBEAT)
+        {
+            bool cur = (SendMessageA(g_chk_heartbeat, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            SendMessageA(g_chk_heartbeat, BM_SETCHECK, cur ? BST_UNCHECKED : BST_CHECKED, 0);
+            SendMessageA(hwnd, WM_COMMAND, ID_CHK_HEARTBEAT, 0);
+        }
+        else if (id == IDM_TIMELINE_PREV_PAGE)
+        {
+            PostMessageA(hwnd, WM_COMMAND, ID_BTN_PREV_PAGE, 0);
+        }
+        else if (id == IDM_TIMELINE_NEXT_PAGE)
+        {
+            PostMessageA(hwnd, WM_COMMAND, ID_BTN_NEXT_PAGE, 0);
+        }
+        else if (id == IDM_HELP_HEURISTICS)
+        {
+            std::string info =
+                "Deadeye Defensive Triage Heuristics & Scoring Guide\n"
+                "====================================================\n\n"
+                "[+50] INJECTED_PE:\n"
+                "   MZ/PE header detected inside committed MEM_PRIVATE pages.\n"
+                "   (Reflective DLL injection, process hollowing, unhooking)\n\n"
+                "[+45] UNLINKED_MODULE:\n"
+                "   MEM_IMAGE allocation missing from PEB InLoadOrderModuleList.\n"
+                "   (DKOM evasion, stealth module unlinking)\n\n"
+                "[+40] PRIVATE_RWX:\n"
+                "   Committed MEM_PRIVATE page with PAGE_EXECUTE_READWRITE.\n"
+                "   (Classic shellcode staging, JIT anomaly)\n\n"
+                "[+35] WRITE_THEN_FLIP:\n"
+                "   Allocated writable (PAGE_READWRITE), currently executable (PAGE_EXECUTE_READ).\n"
+                "   (Evasive staged payload execution)\n\n"
+                "[+25] UNBACKED_EXEC:\n"
+                "   Executable memory not backed by an on-disk image file.\n\n"
+                "Severity Scoring Thresholds:\n"
+                "  * CRITICAL: Score >= 80\n"
+                "  * HIGH:     Score >= 50\n"
+                "  * MEDIUM:   Score >= 25\n"
+                "  * LOW:      Score >= 10\n"
+                "  * CLEAN:    Score = 0";
+            MessageBoxA(hwnd, info.c_str(), "Deadeye Heuristics Reference", MB_OK | MB_ICONINFORMATION);
+        }
+        else if (id == IDM_HELP_ABOUT)
+        {
+            std::string about =
+                "Deadeye v1.0\n"
+                "Process Memory Triage Scanner & Real-Time Diff Timeline\n\n"
+                "Built with C++17 & Native Win32 for defensive reverse engineering,\n"
+                "malware analysis, and detection engineering.\n\n"
+                "Repository: https://github.com/Winter0x11/Deadeye";
+            MessageBoxA(hwnd, about.c_str(), "About Deadeye", MB_OK | MB_ICONINFORMATION);
+        }
         return 0;
     }
 
@@ -3350,6 +3641,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             DeleteObject(g_br_window);
         if (g_br_control)
             DeleteObject(g_br_control);
+        if (g_haccel)
+        {
+            DestroyAcceleratorTable(g_haccel);
+            g_haccel = nullptr;
+        }
         PostQuitMessage(0);
         return 0;
     }
@@ -3381,6 +3677,10 @@ int run_gui(HINSTANCE hInst, int nCmdShow)
     MSG msg;
     while (GetMessageA(&msg, nullptr, 0, 0))
     {
+        if (g_haccel != nullptr && TranslateAcceleratorA(hwnd, g_haccel, &msg))
+        {
+            continue;
+        }
         if (!IsDialogMessageA(hwnd, &msg))
         {
             TranslateMessage(&msg);
