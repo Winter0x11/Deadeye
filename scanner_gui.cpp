@@ -35,6 +35,8 @@
 #define ID_BTN_SNAP        111
 #define ID_COMBO_DIFF      112
 #define ID_BTN_CLEAR_SNAPS 113
+#define ID_CHK_HEARTBEAT   114
+#define IDT_HEARTBEAT      1001
 
 // Display 64 KB (4096 rows) per page so huge regions stay fast and responsive.
 static const SIZE_T VIEW_PAGE_SIZE = 64 * 1024;
@@ -74,6 +76,7 @@ static HWND g_edit_pattern = nullptr;
 static HWND g_btn_search = nullptr;
 static HWND g_btn_next_hit = nullptr;
 static HWND g_chk_hits_only = nullptr;
+static HWND g_chk_heartbeat = nullptr;
 static HWND g_list_regions = nullptr;
 static HWND g_lbl_hex_info = nullptr;
 static HWND g_btn_prev_page = nullptr;
@@ -99,6 +102,7 @@ static size_t g_hit_cursor_region = 0;
 static size_t g_hit_cursor_index = 0;
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+void populate_region_list();
 
 // Converts a Win32 error code into a readable system error string.
 // Frees the FormatMessageA buffer with LocalFree before returning.
@@ -528,6 +532,13 @@ void on_take_snapshot() {
 
     reg.snapshots.push_back(snap);
     update_diff_combo();
+    populate_region_list();
+    for (size_t vis = 0; vis < g_visible_indices.size(); ++vis) {
+        if (g_visible_indices[vis] == g_selected_region) {
+            SendMessageA(g_list_regions, LB_SETCURSEL, static_cast<WPARAM>(vis), 0);
+            break;
+        }
+    }
 
     char status[192];
     std::snprintf(status, sizeof(status),
@@ -547,6 +558,13 @@ void on_clear_snapshots() {
     size_t count = reg.snapshots.size();
     reg.snapshots.clear();
     update_diff_combo();
+    populate_region_list();
+    for (size_t vis = 0; vis < g_visible_indices.size(); ++vis) {
+        if (g_visible_indices[vis] == g_selected_region) {
+            SendMessageA(g_list_regions, LB_SETCURSEL, static_cast<WPARAM>(vis), 0);
+            break;
+        }
+    }
     display_selected_region(static_cast<SIZE_T>(-1));
 
     char status[128];
@@ -743,23 +761,26 @@ void populate_region_list() {
             continue;
         }
 
-        char row[128];
+        char row[160];
+        std::string tag;
         if (!r.hits.empty()) {
-            std::snprintf(row, sizeof(row), "%016llX %s %s %s%s [%zu hit%s]",
-                          static_cast<unsigned long long>(r.base),
-                          fmt_size_short(r.size).c_str(),
-                          type_short(r.type).c_str(),
-                          prot_short(r.protect).c_str(),
-                          r.private_rwx ? "!" : " ",
-                          r.hits.size(), r.hits.size() == 1 ? "" : "s");
-        } else {
-            std::snprintf(row, sizeof(row), "%016llX %s %s %s%s",
-                          static_cast<unsigned long long>(r.base),
-                          fmt_size_short(r.size).c_str(),
-                          type_short(r.type).c_str(),
-                          prot_short(r.protect).c_str(),
-                          r.private_rwx ? "!" : " ");
+            char hbuf[32];
+            std::snprintf(hbuf, sizeof(hbuf), " [%zu hit%s]", r.hits.size(), r.hits.size() == 1 ? "" : "s");
+            tag += hbuf;
         }
+        if (!r.snapshots.empty()) {
+            char sbuf[32];
+            std::snprintf(sbuf, sizeof(sbuf), " (%zu snap%s)", r.snapshots.size(), r.snapshots.size() == 1 ? "" : "s");
+            tag += sbuf;
+        }
+
+        std::snprintf(row, sizeof(row), "%016llX %s %s %s%s%s",
+                      static_cast<unsigned long long>(r.base),
+                      fmt_size_short(r.size).c_str(),
+                      type_short(r.type).c_str(),
+                      prot_short(r.protect).c_str(),
+                      r.private_rwx ? "!" : " ",
+                      tag.c_str());
 
         SendMessageA(g_list_regions, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(row));
         g_visible_indices.push_back(i);
@@ -1052,6 +1073,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         g_chk_hits_only = CreateWindowA("BUTTON", "Hits only",
                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                                         x, M, 84, RH, hwnd, reinterpret_cast<HMENU>(ID_CHK_HITS_ONLY), hInst, nullptr);
+        x += 88;
+
+        g_chk_heartbeat = CreateWindowA("BUTTON", "Heartbeat (1s)",
+                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                        x, M, 116, RH, hwnd, reinterpret_cast<HMENU>(ID_CHK_HEARTBEAT), hInst, nullptr);
 
         HWND lbl_map = CreateWindowA("STATIC", "Memory Map (Address | Size | Type | Prot | !RWX)",
                                      WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
@@ -1096,7 +1122,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
         HWND ui_items[] = {
             lbl_pid, g_edit_pid, g_btn_load, lbl_pat, g_edit_pattern, g_btn_search,
-            g_btn_next_hit, g_chk_hits_only, lbl_map, g_lbl_hex_info,
+            g_btn_next_hit, g_chk_hits_only, g_chk_heartbeat, lbl_map, g_lbl_hex_info,
             g_btn_snap, g_combo_diff, g_btn_clear_snaps,
             g_btn_prev_page, g_btn_next_page, g_lbl_status
         };
@@ -1206,11 +1232,36 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             on_clear_snapshots();
         } else if (id == ID_COMBO_DIFF && code == CBN_SELCHANGE) {
             display_selected_region(static_cast<SIZE_T>(-1));
+        } else if (id == ID_CHK_HEARTBEAT) {
+            bool checked = (SendMessageA(g_chk_heartbeat, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            if (checked) {
+                if (g_has_selection && g_selected_region < g_regions.size()) {
+                    RegionInfo& reg = g_regions[g_selected_region];
+                    if (reg.snapshots.empty()) {
+                        on_take_snapshot();
+                    }
+                }
+                SetTimer(hwnd, IDT_HEARTBEAT, 1000, nullptr);
+                set_status("Heartbeat active (1s interval): Monitoring memory diff in real time...");
+            } else {
+                KillTimer(hwnd, IDT_HEARTBEAT);
+                set_status("Heartbeat stopped.");
+            }
         }
         return 0;
     }
 
+    case WM_TIMER:
+        if (wp == IDT_HEARTBEAT) {
+            if (g_has_selection && g_selected_region < g_regions.size()) {
+                display_selected_region(static_cast<SIZE_T>(-1));
+            }
+            return 0;
+        }
+        break;
+
     case WM_DESTROY:
+        KillTimer(hwnd, IDT_HEARTBEAT);
         // Free GDI fonts before exiting.
         if (g_mono_font) DeleteObject(g_mono_font);
         if (g_ui_font) DeleteObject(g_ui_font);
