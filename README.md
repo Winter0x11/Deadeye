@@ -1,13 +1,30 @@
 # Deadeye 🎯
 
-**Deadeye** is a lightweight, high-performance Windows process memory pattern scanner, interactive hex viewer, and real-time memory diff timeline built in modern C++ and native Win32.
+**Deadeye** is a unified, lightweight, high-performance Windows process memory pattern scanner, interactive hex viewer, and real-time memory diff timeline built in modern C++ and native Win32.
 
 Designed for defensive reverse engineering, malware analysis, and detection engineering, Deadeye lets you inspect memory layouts, search for signatures with wildcards, flag suspicious `PRIVATE RWX` regions, and monitor live memory changes in real-time without pausing or attaching a debugger to the target.
 
 ---
 
+## 📁 Project Structure
+
+```text
+Deadeye/
+├── build/                 # Output directory for compiled binaries (gitignored)
+│   ├── deadeye.exe        # Unified executable (CLI + GUI)
+│   └── test_target.exe    # Test target with memory mutation support
+├── src/
+│   ├── main.cpp           # Unified Deadeye application (CLI scanner + GUI viewer)
+│   └── test_target.cpp    # Test process allocating heap and RWX regions
+├── .gitignore
+└── README.md
+```
+
+---
+
 ## ✨ Features
 
+- **Dual-Mode Single Binary**: Automatically launches in interactive GUI mode when double-clicked, or runs as a headless CLI scanner when passed arguments in a terminal.
 - **Real-Time Memory Heartbeat**: Periodic (1s) live diff monitoring that flags modified rows and shows exact previous byte values as memory changes in running targets.
 - **Visual Memory Diff Timeline**: Capture point-in-time snapshots of any region (`[+ Snap]`) and compare `Live vs Snapshot` or `Snapshot vs Snapshot` with byte-aligned `old:` sub-rows.
 - **YARA-Like Pattern Scanner**: Fast sliding-window pattern scanner supporting hex bytes and `??` wildcards (e.g., `4D 5A ?? 00 03`).
@@ -27,31 +44,31 @@ Designed for defensive reverse engineering, malware analysis, and detection engi
 
 ### Build with MinGW-w64 (GCC)
 ```powershell
-# Compile the GUI viewer (Deadeye)
-g++ -std=c++17 -m64 -Wall -Wextra -O2 scanner_gui.cpp -o scanner_gui.exe -mwindows
+# Create build directory
+if (-not (Test-Path build)) { New-Item -ItemType Directory -Path build }
 
-# Compile the CLI pattern scanner
-g++ -std=c++17 -m64 -Wall -Wextra -Wpedantic -O2 main.cpp -o scanner.exe
+# Compile unified Deadeye (CLI + GUI)
+g++ -std=c++17 -m64 -Wall -Wextra -O2 src/main.cpp -o build/deadeye.exe -lgdi32 -luser32
 
 # Compile the test target
-g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 test_target.cpp -o test_target.exe
+g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 src/test_target.cpp -o build/test_target.exe
 ```
 
 ### Build with MSVC (Visual Studio x64 Native Tools)
 ```bat
-cl /std:c++17 /EHsc /W4 /O2 scanner_gui.cpp /Fe:scanner_gui.exe /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib
-cl /std:c++17 /EHsc /W4 /O2 main.cpp /Fe:scanner.exe
-cl /std:c++17 /EHsc /W4 /O2 test_target.cpp /Fe:test_target.exe
+if not exist build mkdir build
+cl /std:c++17 /EHsc /W4 /O2 src/main.cpp /Fe:build/deadeye.exe /link /SUBSYSTEM:CONSOLE user32.lib gdi32.lib
+cl /std:c++17 /EHsc /W4 /O2 src/test_target.cpp /Fe:build/test_target.exe
 ```
 
 ---
 
 ## 🚀 Quick Start
 
-### 1. GUI (Hex Viewer & Diff Timeline)
-Simply run `scanner_gui.exe`:
+### 1. Interactive GUI Mode
+Double-click `build/deadeye.exe` or run:
 ```powershell
-.\scanner_gui.exe
+.\build\deadeye.exe
 ```
 - By default, it inspects `self` and displays its memory map immediately.
 - Enter any process PID and click **Load** to inspect another application.
@@ -59,13 +76,14 @@ Simply run `scanner_gui.exe`:
 - Check **`Heartbeat (1s)`** to watch memory changes pulse in real time with aligned `old:` byte annotations.
 - Optionally enter a hex pattern (e.g. `4D 5A 90 00` or `DE AD ?? EF`) and click **Search** to highlight matches.
 
-### 2. CLI Scanner
+### 2. Headless CLI Scanner Mode
+When passed command-line arguments, Deadeye runs directly in your terminal:
 ```powershell
 # Scan another process
-.\scanner.exe <pid> "4D 5A ?? 00 03"
+.\build\deadeye.exe <pid> "4D 5A ?? 00 03"
 
 # Scan the scanner's own process
-.\scanner.exe self "4D 5A 90 00"
+.\build\deadeye.exe self "4D 5A 90 00"
 ```
 
 #### Exit Codes
@@ -82,13 +100,13 @@ Simply run `scanner_gui.exe`:
 
 1. Start the included test target in a terminal:
    ```powershell
-   .\test_target.exe
+   .\build\test_target.exe
    ```
    It prints its PID, addresses of both heap and `VirtualAlloc` RWX buffers, and waits for commands.
 
 2. In another terminal, run the CLI scanner:
    ```powershell
-   .\scanner.exe <PID> "DE AD ?? EF 13 37 ?? FE"
+   .\build\deadeye.exe <PID> "DE AD ?? EF 13 37 ?? FE"
    ```
    Output:
    ```text
@@ -102,4 +120,4 @@ Simply run `scanner_gui.exe`:
    Total hits:      2
    ```
 
-3. Or load the PID in `scanner_gui.exe`, select the `RWX!` region, check **Heartbeat (1s)**, and press `m` in `test_target.exe` to see live memory mutation diffs!
+3. Or load the PID in `deadeye.exe` GUI, select the `RWX!` region, check **Heartbeat (1s)**, and press `m` in `test_target.exe` to see live memory mutation diffs!

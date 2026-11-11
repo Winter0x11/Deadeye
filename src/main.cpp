@@ -1,15 +1,17 @@
-// Deadeye - Interactive Win32 Memory Map, Hex Viewer & Real-Time Diff Timeline.
+// src/main.cpp
+// Deadeye - Unified Process Memory Pattern Scanner, Hex Viewer & Real-Time Diff Timeline.
 // Built for defensive malware analysis and detection engineering.
-// Opens a target process (defaulting to "self" on startup), lists every
-// committed virtual memory region on the left, and displays a full 16-byte
-// hex+ASCII dump of the selected region on the right (64 KB per page).
-// Pattern search is optional: enter a hex pattern at any time to find all
-// hits across the process and step through them with Next Hit.
+// Supports both headless CLI mode and interactive GUI mode from a single executable.
+//
+// Usage:
+//   deadeye.exe                         -> Launches interactive GUI mode
+//   deadeye.exe <pid|self> "<pattern>"  -> Runs fast headless CLI scan
+//   deadeye.exe --gui                   -> Explicitly opens GUI window
 //
 // Build (MinGW-w64, x64):
-//   g++ -std=c++17 -m64 -Wall -Wextra -O2 scanner_gui.cpp -o scanner_gui.exe -mwindows
-// Build (MSVC x64 Native Tools Command Prompt):
-//   cl /std:c++17 /EHsc /W4 /O2 scanner_gui.cpp /Fe:scanner_gui.exe /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib
+//   g++ -std=c++17 -m64 -Wall -Wextra -O2 src/main.cpp -o build/deadeye.exe -mwindows
+// Build (MSVC x64):
+//   cl /std:c++17 /EHsc /W4 /O2 src/main.cpp /Fe:build/deadeye.exe /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib
 
 #include <cctype>
 #include <cerrno>
@@ -17,19 +19,34 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iostream>
 #include <string>
 #include <vector>
 #include <windows.h>
 
-// Control IDs for child windows.
-#define ID_EDIT_PID       101
-#define ID_BTN_LOAD       102
-#define ID_EDIT_PATTERN   103
-#define ID_BTN_SEARCH     104
-#define ID_BTN_NEXT_HIT   105
-#define ID_CHK_HITS_ONLY  106
-#define ID_LIST_REGIONS   107
-#define ID_EDIT_HEX       108
+// ============================================================================
+// 1. Constants & Core Data Structures
+// ============================================================================
+
+// CLI exit codes
+const int EXIT_HITS_FOUND  = 0;
+const int EXIT_NO_HITS     = 1;
+const int EXIT_BAD_ARGS    = 2;
+const int EXIT_OPEN_FAILED = 3;
+
+// Memory read chunk sizes
+static const SIZE_T CLI_CHUNK_SIZE  = 1024 * 1024; // 1 MB per read
+static const SIZE_T VIEW_PAGE_SIZE  = 64 * 1024;   // 64 KB per GUI page
+
+// Control IDs for GUI child windows
+#define ID_EDIT_PID        101
+#define ID_BTN_LOAD        102
+#define ID_EDIT_PATTERN    103
+#define ID_BTN_SEARCH      104
+#define ID_BTN_NEXT_HIT    105
+#define ID_CHK_HITS_ONLY   106
+#define ID_LIST_REGIONS    107
+#define ID_EDIT_HEX        108
 #define ID_BTN_PREV_PAGE   109
 #define ID_BTN_NEXT_PAGE   110
 #define ID_BTN_SNAP        111
@@ -38,12 +55,7 @@
 #define ID_CHK_HEARTBEAT   114
 #define IDT_HEARTBEAT      1001
 
-// Display 64 KB (4096 rows) per page so huge regions stay fast and responsive.
-static const SIZE_T VIEW_PAGE_SIZE = 64 * 1024;
-// Read at most 1 MB per ReadProcessMemory call while scanning.
-static const SIZE_T SCAN_CHUNK_SIZE = 1024 * 1024;
-
-// Compiled byte pattern: mask[i] == 1 means exact match, 0 means wildcard.
+// Compiled byte pattern: mask[i] == 1 means exact byte match, 0 means wildcard (??).
 struct Pattern {
     std::vector<uint8_t> bytes;
     std::vector<uint8_t> mask;
@@ -57,7 +69,7 @@ struct Snapshot {
     std::string label;
 };
 
-// Metadata, hit offsets, and snapshot timeline for one committed region.
+// Metadata, hit offsets, and snapshot timeline for a committed virtual memory region.
 struct RegionInfo {
     uintptr_t base;
     SIZE_T size;
@@ -68,55 +80,27 @@ struct RegionInfo {
     std::vector<Snapshot> snapshots;
 };
 
-// Global UI handles and current scan state.
-static HWND g_hwnd_main = nullptr;
-static HWND g_edit_pid = nullptr;
-static HWND g_btn_load = nullptr;
-static HWND g_edit_pattern = nullptr;
-static HWND g_btn_search = nullptr;
-static HWND g_btn_next_hit = nullptr;
-static HWND g_chk_hits_only = nullptr;
-static HWND g_chk_heartbeat = nullptr;
-static HWND g_list_regions = nullptr;
-static HWND g_lbl_hex_info = nullptr;
-static HWND g_btn_prev_page = nullptr;
-static HWND g_btn_next_page = nullptr;
-static HWND g_btn_snap = nullptr;
-static HWND g_combo_diff = nullptr;
-static HWND g_btn_clear_snaps = nullptr;
-static HWND g_edit_hex = nullptr;
-static HWND g_lbl_status = nullptr;
-static HFONT g_mono_font = nullptr;
-static HFONT g_ui_font = nullptr;
+// Statistics tracked during a CLI memory walk.
+struct ScanStats {
+    SIZE_T regions_scanned;
+    SIZE_T bytes_scanned;
+    SIZE_T total_hits;
+};
 
-static DWORD g_current_pid = 0;
-static std::string g_current_pid_label;
-static Pattern g_active_pattern;
-static bool g_has_pattern = false;
-static std::vector<RegionInfo> g_regions;
-static std::vector<size_t> g_visible_indices;
-static size_t g_selected_region = 0;
-static bool g_has_selection = false;
-static SIZE_T g_view_offset = 0;
-static size_t g_hit_cursor_region = 0;
-static size_t g_hit_cursor_index = 0;
+// ============================================================================
+// 2. Shared Utilities (Win32, Hex Formatting, Pattern Parser, Matcher)
+// ============================================================================
 
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
-void populate_region_list();
-
-// Converts a Win32 error code into a readable system error string.
-// Frees the FormatMessageA buffer with LocalFree before returning.
+// Formats a Win32 error code into a human-readable string.
 std::string format_win32_error(DWORD err) {
     LPSTR buf = nullptr;
     DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
-    // Ask Windows to allocate and format the message for this error code.
     DWORD len = FormatMessageA(flags, nullptr, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
                                reinterpret_cast<LPSTR>(&buf), 0, nullptr);
     if (len == 0 || buf == nullptr) {
         return "Unknown error";
     }
     std::string s(buf, len);
-    // Release the system-allocated message buffer.
     LocalFree(buf);
     while (!s.empty() && (s.back() == '\r' || s.back() == '\n' || s.back() == ' ')) {
         s.pop_back();
@@ -131,7 +115,23 @@ std::string fmt_addr(uintptr_t v) {
     return std::string(buf);
 }
 
-// Formats a region byte size concisely (B, KB, or MB) for the memory map list.
+// Formats a 64-bit value as a "0x..." hex string.
+std::string to_hex_string(uintptr_t value) {
+    const char* digits = "0123456789ABCDEF";
+    if (value == 0) return "0x0";
+    std::string rev;
+    while (value > 0) {
+        rev.push_back(digits[value & 0xF]);
+        value >>= 4;
+    }
+    std::string out = "0x";
+    for (size_t i = rev.size(); i > 0; --i) {
+        out.push_back(rev[i - 1]);
+    }
+    return out;
+}
+
+// Formats a region size concisely (B, KB, MB) for memory maps.
 std::string fmt_size_short(SIZE_T sz) {
     char buf[32];
     if (sz >= 1024 * 1024) {
@@ -144,7 +144,7 @@ std::string fmt_size_short(SIZE_T sz) {
     return std::string(buf);
 }
 
-// Converts one hexadecimal character to its 0..15 nibble value.
+// Converts a single hex character to its 0..15 value.
 bool hex_nibble(char c, uint8_t& out) {
     if (c >= '0' && c <= '9') { out = static_cast<uint8_t>(c - '0'); return true; }
     if (c >= 'a' && c <= 'f') { out = static_cast<uint8_t>(10 + (c - 'a')); return true; }
@@ -152,8 +152,7 @@ bool hex_nibble(char c, uint8_t& out) {
     return false;
 }
 
-// Parses a hex pattern string such as "4D 5A ?? 00" into bytes and a mask.
-// Rejects odd-length tokens, invalid hex bytes, and empty patterns.
+// Parses hex strings like "4D 5A ?? 00 03" into bytes and a match mask.
 bool parse_pattern(const std::string& input, Pattern& out, std::string& err) {
     out.bytes.clear();
     out.mask.clear();
@@ -168,7 +167,7 @@ bool parse_pattern(const std::string& input, Pattern& out, std::string& err) {
         std::string tok = input.substr(start, i - start);
 
         if (tok.size() % 2 != 0) {
-            err = "Odd-length token '" + tok + "'";
+            err = "Odd-length token '" + tok + "' in pattern.";
             return false;
         }
 
@@ -180,7 +179,7 @@ bool parse_pattern(const std::string& input, Pattern& out, std::string& err) {
                 uint8_t hi = 0;
                 uint8_t lo = 0;
                 if (!hex_nibble(tok[k], hi) || !hex_nibble(tok[k + 1], lo)) {
-                    err = "Invalid hex byte '" + tok.substr(k, 2) + "'";
+                    err = "Invalid hex byte '" + tok.substr(k, 2) + "' in token '" + tok + "'.";
                     return false;
                 }
                 out.bytes.push_back(static_cast<uint8_t>((hi << 4) | lo));
@@ -196,7 +195,7 @@ bool parse_pattern(const std::string& input, Pattern& out, std::string& err) {
     return true;
 }
 
-// Searches buf[0..len) using a naive loop and returns every matching offset.
+// Searches buf[0..len) using a naive sliding window and returns match offsets.
 std::vector<size_t> find_all(const uint8_t* buf, size_t len, const Pattern& p) {
     std::vector<size_t> hits;
     size_t pl = p.bytes.size();
@@ -219,7 +218,7 @@ std::vector<size_t> find_all(const uint8_t* buf, size_t len, const Pattern& p) {
     return hits;
 }
 
-// Translates Win32 protection bits into a short code for the region list.
+// Translates Win32 memory protection flags into short text.
 std::string prot_short(DWORD protect) {
     DWORD base = protect & 0xFF;
     if (base == PAGE_READONLY) return "R--";
@@ -232,7 +231,7 @@ std::string prot_short(DWORD protect) {
     return "???";
 }
 
-// Translates Win32 protection bits into a full PAGE_* string for the hex header.
+// Translates Win32 protection flags into full readable string.
 std::string prot_full(DWORD protect) {
     DWORD base = protect & 0xFF;
     std::string s;
@@ -249,13 +248,13 @@ std::string prot_full(DWORD protect) {
         std::snprintf(tmp, sizeof(tmp), "0x%02lX", static_cast<unsigned long>(base));
         s = tmp;
     }
-    if (protect & PAGE_GUARD) s += "|GUARD";
-    if (protect & PAGE_NOCACHE) s += "|NOCACHE";
-    if (protect & PAGE_WRITECOMBINE) s += "|WRITECOMBINE";
+    if (protect & PAGE_GUARD) s += "|PAGE_GUARD";
+    if (protect & PAGE_NOCACHE) s += "|PAGE_NOCACHE";
+    if (protect & PAGE_WRITECOMBINE) s += "|PAGE_WRITECOMBINE";
     return s;
 }
 
-// Translates MEMORY_BASIC_INFORMATION.Type into a short tag.
+// Translates MEMORY_BASIC_INFORMATION.Type into short tag.
 std::string type_short(DWORD t) {
     if (t == MEM_IMAGE) return "IMG ";
     if (t == MEM_MAPPED) return "MAP ";
@@ -263,7 +262,7 @@ std::string type_short(DWORD t) {
     return "UNK ";
 }
 
-// Translates MEMORY_BASIC_INFORMATION.Type into IMAGE, MAPPED, or PRIVATE.
+// Translates MEMORY_BASIC_INFORMATION.Type into full string.
 std::string type_full(DWORD t) {
     if (t == MEM_IMAGE) return "IMAGE";
     if (t == MEM_MAPPED) return "MAPPED";
@@ -271,23 +270,29 @@ std::string type_full(DWORD t) {
     return "UNKNOWN";
 }
 
-// Returns true when a region is PRIVATE and both executable and writable.
+// Returns true if a region is MEM_PRIVATE and has executable+writable protection.
 bool is_private_rwx(DWORD type, DWORD protect) {
     if (type != MEM_PRIVATE) return false;
     DWORD base = protect & 0xFF;
     return base == PAGE_EXECUTE_READWRITE || base == PAGE_EXECUTE_WRITECOPY;
 }
 
-// Updates the bottom status bar text.
-void set_status(const std::string& text) {
-    // Update the static status label text at the bottom of the window.
-    SetWindowTextA(g_lbl_status, text.c_str());
+// ============================================================================
+// 3. CLI Subsystem
+// ============================================================================
+
+void print_cli_usage(const char* prog_name) {
+    std::cout << "Deadeye - Process Memory Pattern Scanner & Hex Diff Viewer\n"
+              << "Usage:\n"
+              << "  " << prog_name << "                         (Launch GUI viewer)\n"
+              << "  " << prog_name << " <pid|self> \"<pattern>\"    (Headless CLI scan)\n"
+              << "Example:\n"
+              << "  " << prog_name << " 1234 \"4D 5A ?? 00 03\"\n"
+              << "Exit codes: 0=hits found, 1=no hits, 2=bad args, 3=OpenProcess failed\n";
 }
 
-// Parses "self" or a positive integer PID string into a Win32 DWORD.
-bool parse_pid_text(const std::string& arg, DWORD& out_pid) {
+bool parse_pid_arg(const std::string& arg, DWORD& out_pid) {
     if (arg == "self") {
-        // Fetch the GUI's own PID so self-inspection uses the same OpenProcess flow.
         out_pid = GetCurrentProcessId();
         return true;
     }
@@ -296,16 +301,220 @@ bool parse_pid_text(const std::string& arg, DWORD& out_pid) {
         if (!std::isdigit(static_cast<unsigned char>(arg[i]))) return false;
     }
     errno = 0;
-    char* end = nullptr;
-    unsigned long v = std::strtoul(arg.c_str(), &end, 10);
-    if (errno != 0 || end == nullptr || *end != '\0' || v == 0) return false;
-    out_pid = static_cast<DWORD>(v);
+    char* end_ptr = nullptr;
+    unsigned long val = std::strtoul(arg.c_str(), &end_ptr, 10);
+    if (errno != 0 || end_ptr == nullptr || *end_ptr != '\0' || val == 0) {
+        return false;
+    }
+    out_pid = static_cast<DWORD>(val);
     return true;
 }
 
-// Formats a full hex+ASCII dump for buf[0..buf_len), marking matched rows
-// with ">>>", diff rows with "CHG" (and "!>>" if both), and printing an
-// aligned "old:" sub-row under any row with modified bytes.
+void scan_region_cli(HANDLE proc, const MEMORY_BASIC_INFORMATION& mbi, const Pattern& pat, ScanStats& stats) {
+    uintptr_t region_base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+    SIZE_T region_size = mbi.RegionSize;
+    SIZE_T overlap = pat.bytes.size() - 1;
+    SIZE_T offset = 0;
+    SIZE_T prev_overlap = 0;
+
+    stats.regions_scanned += 1;
+
+    while (offset < region_size) {
+        SIZE_T remaining = region_size - offset;
+        SIZE_T to_read = (remaining < CLI_CHUNK_SIZE) ? remaining : CLI_CHUNK_SIZE;
+        std::vector<uint8_t> buf(to_read);
+        SIZE_T bytes_read = 0;
+
+        BOOL ok = ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(region_base + offset),
+                                    buf.data(), to_read, &bytes_read);
+        if (!ok) {
+            DWORD err = GetLastError();
+            std::cout << "[WARN] ReadProcessMemory failed at " << to_hex_string(region_base + offset)
+                      << " (read " << bytes_read << "/" << to_read << " bytes): "
+                      << format_win32_error(err) << " (err=" << err << ")\n";
+        }
+        if (bytes_read == 0) break;
+
+        if (bytes_read > prev_overlap) {
+            stats.bytes_scanned += (bytes_read - prev_overlap);
+        }
+
+        std::vector<size_t> hits = find_all(buf.data(), bytes_read, pat);
+        for (size_t i = 0; i < hits.size(); ++i) {
+            uintptr_t hit_addr = region_base + offset + hits[i];
+            std::string marker = is_private_rwx(mbi.Type, mbi.Protect) ? "[!] " : "    ";
+            std::cout << marker << "HIT addr=" << to_hex_string(hit_addr)
+                      << " region_base=" << to_hex_string(region_base)
+                      << " region_size=" << to_hex_string(region_size)
+                      << " type=" << type_full(mbi.Type)
+                      << " protect=" << prot_full(mbi.Protect) << "\n";
+            stats.total_hits += 1;
+        }
+
+        if (!ok || offset + bytes_read >= region_size || bytes_read <= overlap) break;
+        offset += (bytes_read - overlap);
+        prev_overlap = overlap;
+    }
+}
+
+int run_cli(int argc, char* argv[]) {
+    if (argc < 3) {
+        print_cli_usage(argv[0]);
+        return EXIT_BAD_ARGS;
+    }
+
+    DWORD pid = 0;
+    if (!parse_pid_arg(argv[1], pid)) {
+        std::cout << "[ERROR] Invalid PID: '" << argv[1] << "'\n";
+        print_cli_usage(argv[0]);
+        return EXIT_BAD_ARGS;
+    }
+
+    Pattern pat;
+    std::string pat_err;
+    if (!parse_pattern(argv[2], pat, pat_err)) {
+        std::cout << "[ERROR] " << pat_err << "\n";
+        print_cli_usage(argv[0]);
+        return EXIT_BAD_ARGS;
+    }
+
+    HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (proc == nullptr) {
+        DWORD err = GetLastError();
+        std::cout << "[ERROR] OpenProcess failed for PID " << pid << ": "
+                  << format_win32_error(err) << " (err=" << err << ")\n";
+        if (err == ERROR_ACCESS_DENIED) {
+            std::cout << "        Access denied: the target may be a Protected Process (PPL),\n"
+                      << "        running elevated, or require Administrator/SeDebugPrivilege.\n";
+        }
+        return EXIT_OPEN_FAILED;
+    }
+
+    std::cout << "[Deadeye] Scanning PID " << pid << " for " << pat.bytes.size() << "-byte pattern...\n";
+
+    ScanStats stats;
+    stats.regions_scanned = 0;
+    stats.bytes_scanned = 0;
+    stats.total_hits = 0;
+
+    uintptr_t addr = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    while (true) {
+        std::memset(&mbi, 0, sizeof(mbi));
+        SIZE_T queried = VirtualQueryEx(proc, reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi));
+        if (queried == 0) {
+            DWORD err = GetLastError();
+            if (err == ERROR_INVALID_PARAMETER) break;
+            std::cout << "[WARN] VirtualQueryEx failed at " << to_hex_string(addr)
+                      << ": " << format_win32_error(err) << " (err=" << err << ")\n";
+            break;
+        }
+
+        uintptr_t region_base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+        SIZE_T region_size = mbi.RegionSize;
+        if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_NOACCESS) == 0 && (mbi.Protect & PAGE_GUARD) == 0) {
+            scan_region_cli(proc, mbi, pat, stats);
+        }
+
+        if (region_size == 0) break;
+        uintptr_t next_addr = region_base + region_size;
+        if (next_addr <= addr) break;
+        addr = next_addr;
+    }
+
+    CloseHandle(proc);
+
+    std::cout << "\n--- Deadeye Summary ---\n"
+              << "Regions scanned: " << stats.regions_scanned << "\n"
+              << "Bytes scanned:   " << stats.bytes_scanned << "\n"
+              << "Total hits:      " << stats.total_hits << "\n";
+
+    return (stats.total_hits > 0) ? EXIT_HITS_FOUND : EXIT_NO_HITS;
+}
+
+// ============================================================================
+// 4. GUI Subsystem (Memory Map, Hex Viewer, Heartbeat Diff Timeline)
+// ============================================================================
+
+static HWND g_hwnd_main       = nullptr;
+static HWND g_edit_pid        = nullptr;
+static HWND g_btn_load        = nullptr;
+static HWND g_edit_pattern    = nullptr;
+static HWND g_btn_search      = nullptr;
+static HWND g_btn_next_hit    = nullptr;
+static HWND g_chk_hits_only   = nullptr;
+static HWND g_chk_heartbeat   = nullptr;
+static HWND g_list_regions    = nullptr;
+static HWND g_lbl_hex_info    = nullptr;
+static HWND g_btn_prev_page   = nullptr;
+static HWND g_btn_next_page   = nullptr;
+static HWND g_btn_snap        = nullptr;
+static HWND g_combo_diff      = nullptr;
+static HWND g_btn_clear_snaps = nullptr;
+static HWND g_edit_hex        = nullptr;
+static HWND g_lbl_status      = nullptr;
+static HFONT g_mono_font      = nullptr;
+static HFONT g_ui_font        = nullptr;
+
+static DWORD g_current_pid = 0;
+static std::string g_current_pid_label;
+static Pattern g_active_pattern;
+static bool g_has_pattern = false;
+static std::vector<RegionInfo> g_regions;
+static std::vector<size_t> g_visible_indices;
+static size_t g_selected_region = 0;
+static bool g_has_selection = false;
+static SIZE_T g_view_offset = 0;
+static size_t g_hit_cursor_region = 0;
+static size_t g_hit_cursor_index = 0;
+
+void set_status(const std::string& text) {
+    SetWindowTextA(g_lbl_status, text.c_str());
+}
+
+struct DiffPair {
+    bool active;
+    std::string title;
+    const std::vector<uint8_t>* ref_data;
+    const std::vector<uint8_t>* cmp_data;
+    SIZE_T ref_view_offset;
+    SIZE_T cmp_view_offset;
+};
+
+DiffPair get_active_diff_pair() {
+    DiffPair dp = { false, "", nullptr, nullptr, 0, 0 };
+    if (!g_has_selection || g_selected_region >= g_regions.size()) return dp;
+    const RegionInfo& reg = g_regions[g_selected_region];
+    if (reg.snapshots.empty()) return dp;
+
+    LRESULT sel = SendMessageA(g_combo_diff, CB_GETCURSEL, 0, 0);
+    if (sel <= 0 || sel == CB_ERR) return dp;
+
+    size_t snap_count = reg.snapshots.size();
+    if (static_cast<size_t>(sel) <= snap_count) {
+        size_t idx = static_cast<size_t>(sel - 1);
+        dp.active = true;
+        dp.title = "Live vs " + reg.snapshots[idx].label;
+        dp.ref_data = &reg.snapshots[idx].data;
+        dp.cmp_data = nullptr; // Live
+        dp.ref_view_offset = reg.snapshots[idx].view_offset;
+        dp.cmp_view_offset = g_view_offset;
+        return dp;
+    }
+
+    size_t pair_idx = static_cast<size_t>(sel - 1 - snap_count);
+    if (pair_idx + 1 < snap_count) {
+        dp.active = true;
+        dp.title = reg.snapshots[pair_idx].label + " vs " + reg.snapshots[pair_idx + 1].label;
+        dp.ref_data = &reg.snapshots[pair_idx].data;
+        dp.cmp_data = &reg.snapshots[pair_idx + 1].data;
+        dp.ref_view_offset = reg.snapshots[pair_idx].view_offset;
+        dp.cmp_view_offset = reg.snapshots[pair_idx + 1].view_offset;
+        return dp;
+    }
+    return dp;
+}
+
 std::string build_hex_dump(const uint8_t* buf, size_t buf_len, uintptr_t view_addr,
                            const std::vector<SIZE_T>& region_hits, SIZE_T view_offset,
                            size_t pat_len, SIZE_T focus_offset, int& out_focus_line,
@@ -341,7 +550,7 @@ std::string build_hex_dump(const uint8_t* buf, size_t buf_len, uintptr_t view_ad
     out += "    ----------------  -----------------------  -----------------------  ----------------\r\n";
 
     size_t num_rows = (buf_len + 15) / 16;
-    int line_counter = 2; // header lines
+    int line_counter = 2;
 
     for (size_t row = 0; row < num_rows; ++row) {
         size_t rs = row * 16;
@@ -412,7 +621,7 @@ std::string build_hex_dump(const uint8_t* buf, size_t buf_len, uintptr_t view_ad
         out += "\r\n";
         line_counter++;
 
-        // Render aligned diff sub-row if any byte in this row changed.
+        // Sub-row for changed bytes
         if (row_has_diff && ref_buf != nullptr) {
             out += "        old:          ";
             for (size_t i = rs; i < rs + 16; ++i) {
@@ -441,8 +650,8 @@ std::string build_hex_dump(const uint8_t* buf, size_t buf_len, uintptr_t view_ad
 }
 
 void display_selected_region(SIZE_T focus_offset);
+void populate_region_list();
 
-// Updates the diff selection combo box based on snapshots of the active region.
 void update_diff_combo() {
     SendMessageA(g_combo_diff, CB_RESETCONTENT, 0, 0);
     SendMessageA(g_combo_diff, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Diff: Off (Normal)"));
@@ -480,14 +689,12 @@ void update_diff_combo() {
         }
     }
 
-    // Default to comparing Live vs the most recent snapshot.
     LRESULT count = SendMessageA(g_combo_diff, CB_GETCOUNT, 0, 0);
     WPARAM sel = (reg.snapshots.size() > 0) ? static_cast<WPARAM>(reg.snapshots.size()) : 0;
     if (sel >= static_cast<WPARAM>(count)) sel = 0;
     SendMessageA(g_combo_diff, CB_SETCURSEL, sel, 0);
 }
 
-// Captures a snapshot of the current 64 KB page for timeline diffing.
 void on_take_snapshot() {
     if (!g_has_selection || g_selected_region >= g_regions.size()) return;
     RegionInfo& reg = g_regions[g_selected_region];
@@ -547,11 +754,9 @@ void on_take_snapshot() {
                   static_cast<unsigned long long>(reg.base + g_view_offset),
                   bytes_read, reg.snapshots.size());
     set_status(status);
-
     display_selected_region(static_cast<SIZE_T>(-1));
 }
 
-// Clears all snapshots stored for the currently active region.
 void on_clear_snapshots() {
     if (!g_has_selection || g_selected_region >= g_regions.size()) return;
     RegionInfo& reg = g_regions[g_selected_region];
@@ -572,56 +777,8 @@ void on_clear_snapshots() {
     set_status(status);
 }
 
-// Describes the active pair of buffers for memory timeline comparison.
-struct DiffPair {
-    bool active;
-    std::string title;
-    const std::vector<uint8_t>* ref_data;
-    const std::vector<uint8_t>* cmp_data;
-    SIZE_T ref_view_offset;
-    SIZE_T cmp_view_offset;
-};
-
-// Resolves which snapshots/live buffers are being compared from the combo selection.
-DiffPair get_active_diff_pair() {
-    DiffPair dp = { false, "", nullptr, nullptr, 0, 0 };
-    if (!g_has_selection || g_selected_region >= g_regions.size()) return dp;
-    const RegionInfo& reg = g_regions[g_selected_region];
-    if (reg.snapshots.empty()) return dp;
-
-    LRESULT sel = SendMessageA(g_combo_diff, CB_GETCURSEL, 0, 0);
-    if (sel <= 0 || sel == CB_ERR) return dp;
-
-    size_t snap_count = reg.snapshots.size();
-    if (static_cast<size_t>(sel) <= snap_count) {
-        size_t idx = static_cast<size_t>(sel - 1);
-        dp.active = true;
-        dp.title = "Live vs " + reg.snapshots[idx].label;
-        dp.ref_data = &reg.snapshots[idx].data;
-        dp.cmp_data = nullptr; // live
-        dp.ref_view_offset = reg.snapshots[idx].view_offset;
-        dp.cmp_view_offset = g_view_offset;
-        return dp;
-    }
-
-    size_t pair_idx = static_cast<size_t>(sel - 1 - snap_count);
-    if (pair_idx + 1 < snap_count) {
-        dp.active = true;
-        dp.title = reg.snapshots[pair_idx].label + " vs " + reg.snapshots[pair_idx + 1].label;
-        dp.ref_data = &reg.snapshots[pair_idx].data;
-        dp.cmp_data = &reg.snapshots[pair_idx + 1].data;
-        dp.ref_view_offset = reg.snapshots[pair_idx].view_offset;
-        dp.cmp_view_offset = reg.snapshots[pair_idx + 1].view_offset;
-        return dp;
-    }
-    return dp;
-}
-
-// Reads up to VIEW_PAGE_SIZE bytes of the selected region at g_view_offset
-// and renders its hex+ASCII dump into g_edit_hex, scrolling to focus_offset.
 void display_selected_region(SIZE_T focus_offset) {
     if (!g_has_selection || g_selected_region >= g_regions.size()) {
-        // Clear the hex display when no region is selected.
         SetWindowTextA(g_lbl_hex_info, "Hex View: (no region selected)");
         SetWindowTextA(g_edit_hex, "");
         EnableWindow(g_btn_prev_page, FALSE);
@@ -647,11 +804,9 @@ void display_selected_region(SIZE_T focus_offset) {
     DWORD read_err = 0;
 
     if (dp.active && dp.cmp_data != nullptr) {
-        // Snapshot A vs Snapshot B: use stored snapshot bytes
         buf = *dp.cmp_data;
         bytes_read = buf.size();
     } else {
-        // Live memory read
         HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, g_current_pid);
         if (proc == nullptr) {
             DWORD err = GetLastError();
@@ -698,7 +853,7 @@ void display_selected_region(SIZE_T focus_offset) {
     if (offset_mismatch) {
         char warn_note[192];
         std::snprintf(warn_note, sizeof(warn_note),
-                      "[Note: Selected snapshot belongs to offset 0x%llX; current page is 0x%llX. Page alignment required for diff.]\r\n\r\n",
+                      "[Note: Selected snapshot belongs to offset 0x%llX; current page is 0x%llX. Navigate back or take a new snapshot.]\r\n\r\n",
                       static_cast<unsigned long long>(dp.ref_view_offset),
                       static_cast<unsigned long long>(g_view_offset));
         dump = warn_note + dump;
@@ -735,10 +890,8 @@ void display_selected_region(SIZE_T focus_offset) {
     }
     SetWindowTextA(g_lbl_hex_info, info);
 
-    // Replace the hex box contents in one call and reset scroll to top or hit row.
     SetWindowTextA(g_edit_hex, dump.c_str());
     if (focus_line > 3) {
-        // Scroll the edit control vertically so the matched row is near the top.
         SendMessageA(g_edit_hex, EM_LINESCROLL, 0, static_cast<LPARAM>(focus_line - 3));
     } else {
         SendMessageA(g_edit_hex, EM_SETSEL, 0, 0);
@@ -746,9 +899,7 @@ void display_selected_region(SIZE_T focus_offset) {
     }
 }
 
-// Populates the left Memory Map listbox from g_regions, honoring "Hits only".
 void populate_region_list() {
-    // Pause list redrawing while inserting all rows for snappy updates.
     SendMessageA(g_list_regions, WM_SETREDRAW, FALSE, 0);
     SendMessageA(g_list_regions, LB_RESETCONTENT, 0, 0);
     g_visible_indices.clear();
@@ -790,7 +941,6 @@ void populate_region_list() {
     InvalidateRect(g_list_regions, nullptr, TRUE);
 }
 
-// Selects a specific g_regions index in the listbox and shows its hex page.
 void select_region_in_ui(size_t region_idx, SIZE_T view_offset, SIZE_T focus_offset) {
     g_selected_region = region_idx;
     g_has_selection = true;
@@ -798,7 +948,6 @@ void select_region_in_ui(size_t region_idx, SIZE_T view_offset, SIZE_T focus_off
 
     for (size_t vis = 0; vis < g_visible_indices.size(); ++vis) {
         if (g_visible_indices[vis] == region_idx) {
-            // Highlight the matching row in the listbox.
             SendMessageA(g_list_regions, LB_SETCURSEL, static_cast<WPARAM>(vis), 0);
             break;
         }
@@ -807,8 +956,6 @@ void select_region_in_ui(size_t region_idx, SIZE_T view_offset, SIZE_T focus_off
     display_selected_region(focus_offset);
 }
 
-// Loads all committed regions for the PID in g_edit_pid and optionally scans
-// them for the hex pattern in g_edit_pattern (if non-empty).
 void run_load_or_search(bool require_pattern) {
     char pid_buf[64] = {};
     char pat_buf[512] = {};
@@ -819,7 +966,7 @@ void run_load_or_search(bool require_pattern) {
     std::string pat_str(pat_buf);
 
     DWORD pid = 0;
-    if (!parse_pid_text(pid_str, pid)) {
+    if (!parse_pid_arg(pid_str, pid)) {
         MessageBoxA(g_hwnd_main, "Enter a numeric PID or 'self'.", "Invalid PID", MB_ICONWARNING);
         return;
     }
@@ -835,7 +982,6 @@ void run_load_or_search(bool require_pattern) {
     Pattern pat;
     bool use_pattern = !trim_empty;
     if (require_pattern && !use_pattern) {
-        // Empty search clears active pattern highlights and reloads full memory map.
         use_pattern = false;
     }
     if (use_pattern) {
@@ -846,7 +992,6 @@ void run_load_or_search(bool require_pattern) {
         }
     }
 
-    // Request query + read rights on the target process.
     HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
     if (proc == nullptr) {
         DWORD err = GetLastError();
@@ -882,11 +1027,8 @@ void run_load_or_search(bool require_pattern) {
     MEMORY_BASIC_INFORMATION mbi;
     while (true) {
         std::memset(&mbi, 0, sizeof(mbi));
-        // Query the next virtual address region's layout and protection.
         SIZE_T q = VirtualQueryEx(proc, reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi));
-        if (q == 0) {
-            break;
-        }
+        if (q == 0) break;
 
         uintptr_t region_base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
         SIZE_T region_size = mbi.RegionSize;
@@ -907,10 +1049,9 @@ void run_load_or_search(bool require_pattern) {
                 SIZE_T prev_ov = 0;
                 while (offset < region_size) {
                     SIZE_T rem = region_size - offset;
-                    SIZE_T to_read = (rem < SCAN_CHUNK_SIZE) ? rem : SCAN_CHUNK_SIZE;
+                    SIZE_T to_read = (rem < CLI_CHUNK_SIZE) ? rem : CLI_CHUNK_SIZE;
                     std::vector<uint8_t> chunk(to_read);
                     SIZE_T bytes_read = 0;
-                    // Copy bytes from the target process into our local scan chunk.
                     BOOL ok = ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(region_base + offset),
                                                 chunk.data(), to_read, &bytes_read);
                     if (!ok && bytes_read == 0) break;
@@ -946,7 +1087,6 @@ void run_load_or_search(bool require_pattern) {
         addr = next;
     }
 
-    // Close the scan handle now that region enumeration/scanning is finished.
     CloseHandle(proc);
 
     EnableWindow(g_btn_load, TRUE);
@@ -984,7 +1124,6 @@ void run_load_or_search(bool require_pattern) {
     set_status(status);
 }
 
-// Advances to the next pattern match across all regions and scrolls to it.
 void on_next_hit() {
     if (!g_has_pattern || g_regions.empty()) return;
 
@@ -1019,14 +1158,12 @@ void on_next_hit() {
     set_status(status);
 }
 
-// Handles window creation, resizing, list selection, and button commands.
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
         g_hwnd_main = hwnd;
         HINSTANCE hInst = GetModuleHandleA(nullptr);
 
-        // Standard UI font for labels/buttons and monospace font for memory map + hex dump.
         g_ui_font = CreateFontA(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                 CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
@@ -1113,7 +1250,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                    WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | WS_HSCROLL |
                                    WS_TABSTOP | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
                                    406, 60, 500, 400, hwnd, reinterpret_cast<HMENU>(ID_EDIT_HEX), hInst, nullptr);
-        // Remove the 32 KB edit-control limit so full 64 KB hex pages fit cleanly.
         SendMessageA(g_edit_hex, EM_SETLIMITTEXT, 0, 0);
 
         g_lbl_status = CreateWindowA("STATIC", "Ready.",
@@ -1132,7 +1268,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SendMessageA(g_list_regions, WM_SETFONT, reinterpret_cast<WPARAM>(g_mono_font), TRUE);
         SendMessageA(g_edit_hex, WM_SETFONT, reinterpret_cast<WPARAM>(g_mono_font), TRUE);
 
-        // Trigger initial load of "self" right after window creation finishes.
         PostMessageA(hwnd, WM_COMMAND, ID_BTN_LOAD, 0);
         return 0;
     }
@@ -1262,7 +1397,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_DESTROY:
         KillTimer(hwnd, IDT_HEARTBEAT);
-        // Free GDI fonts before exiting.
         if (g_mono_font) DeleteObject(g_mono_font);
         if (g_ui_font) DeleteObject(g_ui_font);
         PostQuitMessage(0);
@@ -1271,8 +1405,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
-// GUI entry point for Windows applications.
-int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
+int run_gui(HINSTANCE hInst, int nCmdShow) {
     WNDCLASSA wc = {};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
@@ -1290,11 +1423,33 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 
     MSG msg;
     while (GetMessageA(&msg, nullptr, 0, 0)) {
-        // IsDialogMessageA enables Tab navigation and Enter triggering the default button.
         if (!IsDialogMessageA(hwnd, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageA(&msg);
         }
     }
     return static_cast<int>(msg.wParam);
+}
+
+// ============================================================================
+// 5. Unified Entry Point (CLI vs GUI Dispatcher)
+// ============================================================================
+
+int main(int argc, char* argv[]) {
+    // If no arguments or explicitly "--gui", launch interactive GUI mode
+    if (argc <= 1 || (argc == 2 && std::strcmp(argv[1], "--gui") == 0)) {
+        HWND console_hwnd = GetConsoleWindow();
+        if (console_hwnd != nullptr) {
+            DWORD proc_list[2] = {};
+            DWORD proc_count = GetConsoleProcessList(proc_list, 2);
+            // Hide the console only if it was spawned solely for this process (e.g. from Explorer)
+            if (proc_count <= 1) {
+                ShowWindow(console_hwnd, SW_HIDE);
+            }
+        }
+        return run_gui(GetModuleHandleA(nullptr), SW_SHOW);
+    }
+
+    // Otherwise, run in high-performance headless CLI scanner mode
+    return run_cli(argc, argv);
 }
