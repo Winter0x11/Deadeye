@@ -1,12 +1,13 @@
 // src/main.cpp
 // Deadeye - Windows Process Memory Triage Scanner, Hex Viewer & Real-Time Diff Timeline.
 // Built for defensive malware analysis and detection engineering.
-// Pure Win32 GUI application (/SUBSYSTEM:WINDOWS, -mwindows) with Process Hacker color theme.
+// Pure Win32 GUI application (/SUBSYSTEM:WINDOWS, -mwindows) with visual triage memory theme.
 //
 // Build (MinGW-w64, x64):
-//   g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 src/main.cpp -o build/deadeye.exe -mwindows -ladvapi32 -lcomdlg32 -lgdi32 -luser32
+//   windres src/deadeye.rc -O coff -o build/deadeye_res.o
+//   g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 src/main.cpp build/deadeye_res.o -o build/deadeye.exe -mwindows -ladvapi32 -lcomctl32 -lcomdlg32 -lgdi32 -luser32
 // Build (MSVC x64):
-//   cl /std:c++17 /EHsc /W4 /O2 src/main.cpp /Fe:build/deadeye.exe /link /SUBSYSTEM:WINDOWS advapi32.lib comdlg32.lib user32.lib gdi32.lib
+//   cl /std:c++17 /EHsc /W4 /O2 src/main.cpp /Fe:build/deadeye.exe /link /SUBSYSTEM:WINDOWS advapi32.lib comctl32.lib comdlg32.lib user32.lib gdi32.lib
 
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
@@ -163,19 +164,19 @@ enum class ViewMode
 // Application Color Themes
 enum class AppTheme
 {
-    ProcessHackerLight = 0,
-    SystemInformerDark = 1
+    Light = 0,
+    Dark = 1
 };
 
-// Process Hacker Theme Colors
-struct PHThemeColors
+// Visual Theme Colors
+struct ThemeColors
 {
     COLORREF bg_window;
     COLORREF bg_control;
     COLORREF text_normal;
     COLORREF text_muted;
 
-    // Process Hacker Row Highlighting Palette
+    // Visual Triage Row Highlighting Palette
     COLORREF row_crit_bg;
     COLORREF row_crit_text;
     COLORREF row_rwx_bg;
@@ -199,28 +200,28 @@ struct PHThemeColors
     COLORREF row_sel_text;
 };
 
-// Authentic Process Hacker Classic Light Theme
-static const PHThemeColors g_ph_light = {
+// Classic Light Theme
+static const ThemeColors g_theme_light = {
     RGB(240, 240, 240), // bg_window
     RGB(255, 255, 255), // bg_control
     RGB(20, 20, 20),    // text_normal
     RGB(100, 100, 100), // text_muted
 
-    RGB(255, 180, 180), RGB(140, 0, 0),  // Crit (Process Hacker alert red)
-    RGB(255, 192, 192), RGB(150, 0, 0),  // RWX (Process Hacker salmon/red)
-    RGB(232, 208, 255), RGB(75, 0, 130), // Injected PE (Process Hacker packed purple)
+    RGB(255, 180, 180), RGB(140, 0, 0),  // Crit (Alert Red)
+    RGB(255, 192, 192), RGB(150, 0, 0),  // RWX (Salmon / Red Alert)
+    RGB(232, 208, 255), RGB(75, 0, 130), // Injected PE (Violet Purple)
     RGB(255, 224, 185), RGB(140, 60, 0), // Write-then-flip (Peach / Orange)
-    RGB(232, 208, 255), RGB(75, 0, 130), // Unlinked module (Process Hacker purple)
+    RGB(232, 208, 255), RGB(75, 0, 130), // Unlinked module (Violet Purple)
     RGB(255, 245, 180), RGB(120, 80, 0), // Unbacked exec (Light gold/yellow)
-    RGB(255, 255, 225), RGB(70, 70, 0),  // MEM_PRIVATE clean (Process Hacker own/private yellow)
-    RGB(230, 242, 255), RGB(0, 60, 120), // MEM_MAPPED clean (Process Hacker service blue)
+    RGB(255, 255, 225), RGB(70, 70, 0),  // MEM_PRIVATE clean (Warm Yellow)
+    RGB(230, 242, 255), RGB(0, 60, 120), // MEM_MAPPED clean (Sky Blue)
     RGB(255, 255, 255), RGB(20, 20, 20), // MEM_IMAGE clean (Pure white)
 
     RGB(51, 153, 255), RGB(255, 255, 255) // Selection (Windows blue / white text)
 };
 
-// Authentic System Informer (Process Hacker 3) Dark Theme
-static const PHThemeColors g_ph_dark = {
+// Modern Dark Theme
+static const ThemeColors g_theme_dark = {
     RGB(30, 30, 30),    // bg_window
     RGB(37, 37, 38),    // bg_control
     RGB(220, 220, 220), // text_normal
@@ -704,9 +705,9 @@ SIZE_T scan_chunk_robust(HANDLE proc, uintptr_t chunk_addr, SIZE_T to_read,
             }
 
             std::vector<size_t> phits = find_all(page_buf.data(), p_read, *pat);
-            for (size_t ph : phits)
+            for (size_t hit_off : phits)
             {
-                SIZE_T hit_pos = chunk_offset_in_reg + page_off + ph;
+                SIZE_T hit_pos = chunk_offset_in_reg + page_off + hit_off;
                 if (out_hits.size() < max_hits)
                 {
                     out_hits.push_back(hit_pos);
@@ -1109,7 +1110,7 @@ std::string export_triage_json(const TriageReport &report)
 }
 
 // ============================================================================
-// 3. GUI Subsystem (Process Hacker Theme, Owner-Draw, Memory Hex Viewer)
+// 3. GUI Subsystem (Visual Triage, Owner-Draw List, Memory Hex Viewer)
 // ============================================================================
 
 static HWND g_hwnd_main = nullptr;
@@ -1145,7 +1146,7 @@ static HFONT g_ui_font_bold = nullptr;
 static HBRUSH g_br_window = nullptr;
 static HBRUSH g_br_control = nullptr;
 
-static AppTheme g_theme = AppTheme::ProcessHackerLight;
+static AppTheme g_theme = AppTheme::Light;
 static ViewMode g_view_mode = ViewMode::TriageFindings;
 static int g_min_sev_filter = 0;
 static bool g_hide_clean = false;
@@ -1202,9 +1203,9 @@ void set_status(const std::string &text)
     SetWindowTextA(g_lbl_status, text.c_str());
 }
 
-const PHThemeColors &get_current_theme()
+const ThemeColors &get_current_theme()
 {
-    return (g_theme == AppTheme::ProcessHackerLight) ? g_ph_light : g_ph_dark;
+    return (g_theme == AppTheme::Light) ? g_theme_light : g_theme_dark;
 }
 
 void update_theme_brushes()
@@ -1213,7 +1214,7 @@ void update_theme_brushes()
         DeleteObject(g_br_window);
     if (g_br_control)
         DeleteObject(g_br_control);
-    const PHThemeColors &tc = get_current_theme();
+    const ThemeColors &tc = get_current_theme();
     g_br_window = CreateSolidBrush(tc.bg_window);
     g_br_control = CreateSolidBrush(tc.bg_control);
 }
@@ -2011,7 +2012,7 @@ void select_region_in_ui(size_t region_idx, SIZE_T view_offset, SIZE_T focus_off
     update_triage_details_label(region_idx);
 }
 
-// Process Hacker Item Drawing Handler
+// Visual Triage List Item Drawing Handler
 void draw_region_list_item(DRAWITEMSTRUCT *dis)
 {
     if (dis->itemID == static_cast<UINT>(-1))
@@ -2025,13 +2026,13 @@ void draw_region_list_item(DRAWITEMSTRUCT *dis)
         return;
     const RegionInfo &reg = g_regions[reg_idx];
 
-    const PHThemeColors &tc = get_current_theme();
+    const ThemeColors &tc = get_current_theme();
     bool is_selected = (dis->itemState & ODS_SELECTED) != 0;
 
     COLORREF bg_color = tc.row_image_bg;
     COLORREF text_color = tc.row_image_text;
 
-    // Apply authentic Process Hacker highlight colors based on region threat indicators
+    // Apply highlight colors based on region threat indicators
     if (reg.is_pe_in_private)
     {
         bg_color = tc.row_pe_bg;
@@ -2087,7 +2088,7 @@ void draw_region_list_item(DRAWITEMSTRUCT *dis)
     SelectObject(hdc, g_mono_font);
 
     RECT text_rc = dis->rcItem;
-    text_rc.left += 6; // Process Hacker left padding
+    text_rc.left += 6; // Left margin padding
     DrawTextA(hdc, buf, -1, &text_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
 }
 
@@ -2701,7 +2702,7 @@ LRESULT CALLBACK ModernButtonSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
         HGDIOBJ oldBmp = SelectObject(memDC, memBmp);
 
         // Pre-fill corners with parent window background color
-        const PHThemeColors& tc = get_current_theme();
+        const ThemeColors& tc = get_current_theme();
         HBRUSH brParent = CreateSolidBrush(tc.bg_window);
         FillRect(memDC, &rc, brParent);
         DeleteObject(brParent);
@@ -2710,7 +2711,7 @@ LRESULT CALLBACK ModernButtonSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
         bool is_pressed = ((SendMessageA(hwnd, BM_GETSTATE, 0, 0) & BST_PUSHED) != 0);
         bool is_hovered = (data->is_hovered && is_enabled);
         bool is_focused = (GetFocus() == hwnd && is_enabled);
-        bool is_dark    = (g_theme == AppTheme::SystemInformerDark);
+        bool is_dark    = (g_theme == AppTheme::Dark);
 
         COLORREF bg_color, border_color, text_color;
 
@@ -2905,8 +2906,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_combo_theme = CreateWindowA("COMBOBOX", "",
                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
                                       x, M, 150, 100, hwnd, reinterpret_cast<HMENU>(ID_COMBO_THEME), hInst, nullptr);
-        SendMessageA(g_combo_theme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Theme: PH Classic Light"));
-        SendMessageA(g_combo_theme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Theme: PH Dark Mode"));
+        SendMessageA(g_combo_theme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Theme: Light Mode"));
+        SendMessageA(g_combo_theme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Theme: Dark Mode"));
         SendMessageA(g_combo_theme, CB_SETCURSEL, 0, 0);
 
         // Row 2: Filter Bar (Left side) & Hex Timeline Bar (Right side)
@@ -3011,7 +3012,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         MEASUREITEMSTRUCT *mis = reinterpret_cast<MEASUREITEMSTRUCT *>(lp);
         if (mis->CtlID == ID_LIST_REGIONS)
         {
-            mis->itemHeight = 20; // Process Hacker row height
+            mis->itemHeight = 20; // Row height
             return TRUE;
         }
         break;
@@ -3031,7 +3032,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_CTLCOLOREDIT:
     {
         HDC hdc = reinterpret_cast<HDC>(wp);
-        const PHThemeColors &tc = get_current_theme();
+        const ThemeColors &tc = get_current_theme();
         SetTextColor(hdc, tc.text_normal);
         SetBkColor(hdc, tc.bg_control);
         return reinterpret_cast<INT_PTR>(g_br_control);
@@ -3040,7 +3041,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_CTLCOLORSTATIC:
     {
         HDC hdc = reinterpret_cast<HDC>(wp);
-        const PHThemeColors &tc = get_current_theme();
+        const ThemeColors &tc = get_current_theme();
         SetTextColor(hdc, tc.text_normal);
         SetBkColor(hdc, tc.bg_window);
         return reinterpret_cast<INT_PTR>(g_br_window);
@@ -3049,7 +3050,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_CTLCOLORLISTBOX:
     {
         HDC hdc = reinterpret_cast<HDC>(wp);
-        const PHThemeColors &tc = get_current_theme();
+        const ThemeColors &tc = get_current_theme();
         SetTextColor(hdc, tc.text_normal);
         SetBkColor(hdc, tc.bg_control);
         return reinterpret_cast<INT_PTR>(g_br_control);
@@ -3187,7 +3188,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         else if (id == ID_COMBO_THEME && code == CBN_SELCHANGE)
         {
             LRESULT sel = SendMessageA(g_combo_theme, CB_GETCURSEL, 0, 0);
-            g_theme = (sel == 1) ? AppTheme::SystemInformerDark : AppTheme::ProcessHackerLight;
+            g_theme = (sel == 1) ? AppTheme::Dark : AppTheme::Light;
             update_theme_brushes();
             InvalidateRect(hwnd, nullptr, TRUE);
             InvalidateRect(g_list_regions, nullptr, TRUE);

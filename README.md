@@ -2,27 +2,27 @@
 
 **Deadeye** is a high-performance Windows process memory triage scanner, interactive hex viewer, and real-time diff timeline built in modern C++17 and native Win32.
 
-Designed for defensive reverse engineering, malware analysis, and detection engineering, Deadeye brings **Process Hacker**-style color-coded visual triage directly to your desktop. It automatically flags suspicious memory conditions (such as private RWX regions, write-then-flip executable memory, reflective DLL/PE headers in private heap/stack pages, and unlinked modules), monitors live memory mutations in real time without pausing or attaching a debugger, and exports valid JSON reports for automation.
+Designed for defensive reverse engineering, malware analysis, and detection engineering, Deadeye brings color-coded visual triage directly to your desktop. It automatically flags suspicious memory conditions (such as private RWX regions, write-then-flip executable memory, reflective DLL/PE headers in private heap/stack pages, and unlinked modules), monitors live memory mutations in real time without pausing or attaching a debugger, and exports valid JSON reports for automation.
 
 ---
 
-## Process Hacker Visual Styling & Color Scheme
+## Visual Memory Highlighting & Color Scheme
 
-Deadeye incorporates the authentic color-coding and highlighting language of **Process Hacker** / **System Informer** to give analysts instant visual situational awareness:
+Deadeye provides an intuitive, high-contrast visual highlighting palette to give analysts instant situational awareness:
 
-| Condition / Region Type | Process Hacker Light Theme | Dark Mode (System Informer) | Significance |
+| Condition / Region Type | Light Theme | Dark Theme | Significance |
 |:---|:---|:---|:---|
 | **Critical Threat / Injected PE** | `#FFB4B4` (Alert Red) | `#4B1419` (Dark Crimson) | Injected PE / Reflective DLL header (`MZ`/`PE`) in private memory |
 | **Private RWX Memory** | `#FFC0C0` (Salmon / Red Alert) | `#461919` (Deep Red) | Memory allocated as `MEM_PRIVATE` with `PAGE_EXECUTE_READWRITE` |
 | **Write-then-Flip** | `#FFE0B9` (Peach / Orange) | `#412D14` (Dark Amber) | Allocated writable (`PAGE_READWRITE`), flipped to executable (`PAGE_EXECUTE_READ`) |
 | **Unlinked Module** | `#E8D0FF` (Packed Purple) | `#371941` (Dark Violet) | `MEM_IMAGE` allocation unlinked/hidden from PEB loader list |
 | **Unbacked Executable** | `#FFF5B4` (Light Gold) | `#3C3714` (Dark Gold) | Executable pages not backed by a disk image (`MEM_MAPPED` / `MEM_PRIVATE`) |
-| **Private Memory (Clean)** | `#FFFFE1` (PH Own/Private Yellow) | `#2A2A1E` (Muted Amber) | Standard heap, stack, or private data |
-| **Mapped Memory (Clean)** | `#E6F2FF` (PH Service Blue) | `#192837` (Muted Slate) | File-mapped section or shared memory |
+| **Private Memory (Clean)** | `#FFFFE1` (Warm Yellow) | `#2A2A1E` (Muted Amber) | Standard heap, stack, or private data |
+| **Mapped Memory (Clean)** | `#E6F2FF` (Sky Blue) | `#192837` (Muted Slate) | File-mapped section or shared memory |
 | **Image Memory (Clean)** | `#FFFFFF` (Pure White) | `#252526` (Neutral Dark) | Standard on-disk binary or loaded DLL image |
 | **Active Selection** | `#3399FF` (Windows Blue) | `#1A5FB4` (Deep Slate Blue) | Currently focused row |
 
-A built-in theme switcher (`Theme: PH Classic Light` / `Theme: PH Dark Mode`) lets you toggle between classic Process Hacker light and modern System Informer dark mode on the fly.
+A built-in theme switcher (`Theme: Light Mode` / `Theme: Dark Mode`) lets you toggle between light and dark visual themes on the fly.
 
 ---
 
@@ -50,7 +50,7 @@ Deadeye inspects target processes in a background worker thread and computes an 
 ## Features
 
 - **Pure Windows Subsystem Application**: Built strictly as a native GUI binary (`/SUBSYSTEM:WINDOWS`, `-mwindows`). No console flashing on launch, no command-line baggage.
-- **Modern Fluent / Process Hacker UI**:
+- **Modern Fluent UI Engine**:
   - **Sleek Rounded Pushbuttons**: Custom double-buffered button engine with smooth rounded borders (6px radius) and seamless parent corner blending.
   - **Interactive Hover & Click States**: Real-time cursor state changes (`IDC_HAND`), mouse tracking (`TrackMouseEvent` / `WM_MOUSELEAVE`), tactile 1px pressed offsets, and high-visibility keyboard focus rings.
   - **Visual CTA Hierarchy**: Cobalt Azure Primary button for **Triage**, Emerald Green Accent for **Export JSON**, and clean modern Card buttons for search and navigation.
@@ -118,13 +118,13 @@ cl /std:c++17 /EHsc /W4 /O2 src/test_target.cpp /Fe:build/test_target.exe /Fo:bu
 
 Use the included `test_target.exe` tool to verify each defensive triage condition inside Deadeye:
 
-| Test Mode | Test Command | Simulated Condition | Expected Triage Flags | Expected Severity | Process Hacker Color |
+| Test Mode | Test Command | Simulated Condition | Expected Triage Flags | Expected Severity | Visual Highlight Color |
 |:---:|:---|:---|:---|:---:|:---|
 | **1** | `.\build\test_target.exe 1` | `VirtualAlloc(PAGE_EXECUTE_READWRITE)` | `PRIVATE_RWX`, `UNBACKED_EXEC` | **65 (HIGH)** | Salmon / Red alert (`#FFC0C0`) |
 | **2** | `.\build\test_target.exe 2` | `VirtualAlloc(PAGE_READWRITE)` &rarr; `VirtualProtect(PAGE_EXECUTE_READ)` | `WRITE_THEN_FLIP`, `UNBACKED_EXEC` | **60 (HIGH)** | Peach / Orange (`#FFE0B9`) |
 | **3** | `.\build\test_target.exe 3` | Private memory containing `MZ` & `PE\0\0` headers | `INJECTED_PE`, `WRITE_THEN_FLIP`, `UNBACKED_EXEC` | **110 (CRIT)** | Alert Red (`#FFB4B4`) |
 | **4** | `.\build\test_target.exe 4` | `LoadLibraryA("version.dll")` & unlinked from PEB `InLoadOrderModuleList` | `UNLINKED_MODULE` | **45 (MED)** | Packed Purple (`#E8D0FF`) |
-| **All** | `.\build\test_target.exe all` | Simulates all 4 conditions simultaneously | Multiple rows matching above | **45 to 110** | Multi-colored Process Hacker palette |
+| **All** | `.\build\test_target.exe all` | Simulates all 4 conditions simultaneously | Multiple rows matching above | **45 to 110** | Multi-colored threat palette |
 
 ### Verification Steps:
 1. Launch `test_target.exe`:
