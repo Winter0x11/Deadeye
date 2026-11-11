@@ -64,6 +64,18 @@ int main() {
 
     std::memcpy(rwx_buf, heap_buf.data(), heap_buf.size());
 
+    // Reserve and commit a private RX page with a simulated PE header to test [!PE] detection
+    void* pe_buf = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (pe_buf != nullptr) {
+        uint8_t* p = reinterpret_cast<uint8_t*>(pe_buf);
+        p[0] = 0x4D; p[1] = 0x5A; // MZ
+        *reinterpret_cast<uint32_t*>(p + 0x3C) = 0x80;
+        p[0x80] = 'P'; p[0x81] = 'E'; p[0x82] = 0; p[0x83] = 0;
+        std::memcpy(p + 0x100, heap_buf.data(), heap_buf.size());
+        DWORD old_prot = 0;
+        VirtualProtect(pe_buf, 4096, PAGE_EXECUTE_READ, &old_prot);
+    }
+
     // Fetch our process ID so the user can pass it to scanner.exe.
     DWORD pid = GetCurrentProcessId();
 
@@ -71,6 +83,9 @@ int main() {
     std::cout << "PID:         " << pid << "\n";
     std::cout << "Heap buffer: " << ptr_to_hex(heap_buf.data()) << " (PRIVATE, RW)\n";
     std::cout << "RWX buffer:  " << ptr_to_hex(rwx_buf) << " (PRIVATE, PAGE_EXECUTE_READWRITE)\n";
+    if (pe_buf != nullptr) {
+        std::cout << "PE buffer:   " << ptr_to_hex(pe_buf) << " (PRIVATE, PAGE_EXECUTE_READ, Injected PE Header)\n";
+    }
     std::cout << "Pattern:     DE AD BE EF 13 37 CA FE\n";
     std::cout << "Commands: enter 'm' to mutate bytes, or press Enter/q to quit...\n";
     std::string line;
@@ -89,7 +104,10 @@ int main() {
         }
     }
 
-    // Release the VirtualAlloc region back to the OS before exiting.
+    // Release allocated regions back to the OS before exiting.
     VirtualFree(rwx_buf, 0, MEM_RELEASE);
+    if (pe_buf != nullptr) {
+        VirtualFree(pe_buf, 0, MEM_RELEASE);
+    }
     return 0;
 }

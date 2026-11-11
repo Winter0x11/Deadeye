@@ -8,10 +8,16 @@
 //   deadeye.exe <pid|self> "<pattern>"  -> Runs fast headless CLI scan
 //   deadeye.exe --gui                   -> Explicitly opens GUI window
 //
+// Subsystem Architecture:
+//   Built as a standard console application (/SUBSYSTEM:CONSOLE). When launched with CLI
+//   arguments, standard console output and exit codes are produced synchronously.
+//   When launched without arguments (or with --gui) from Explorer/GUI, the console window
+//   is automatically hidden via ShowWindow(SW_HIDE).
+//
 // Build (MinGW-w64, x64):
-//   g++ -std=c++17 -m64 -Wall -Wextra -O2 src/main.cpp -o build/deadeye.exe -mwindows
+//   g++ -std=c++17 -m64 -Wall -Wextra -O2 src/main.cpp -o build/deadeye.exe -lgdi32 -luser32
 // Build (MSVC x64):
-//   cl /std:c++17 /EHsc /W4 /O2 src/main.cpp /Fe:build/deadeye.exe /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib
+//   cl /std:c++17 /EHsc /W4 /O2 src/main.cpp /Fe:build/deadeye.exe /link /SUBSYSTEM:CONSOLE user32.lib gdi32.lib
 
 #include <cctype>
 #include <cerrno>
@@ -56,6 +62,10 @@ static const size_t MAX_HITS_PER_REGION = 10000;       // Max pattern matches tr
 #define ID_CHK_HEARTBEAT   114
 #define IDT_HEARTBEAT      1001
 
+// Custom window messages for background worker thread scanning
+#define WM_SCAN_PROGRESS   (WM_USER + 1)
+#define WM_SCAN_COMPLETE   (WM_USER + 2)
+
 // Compiled byte pattern: mask[i] == 1 means exact byte match, 0 means wildcard (??).
 struct Pattern {
     std::vector<uint8_t> bytes;
@@ -70,13 +80,17 @@ struct Snapshot {
     std::string label;
 };
 
-// Metadata, hit offsets, and snapshot timeline for a committed virtual memory region.
+// Metadata, detection heuristics, hit offsets, and snapshot timeline for a memory region.
 struct RegionInfo {
     uintptr_t base;
     SIZE_T size;
     DWORD type;
     DWORD protect;
-    bool private_rwx;
+    uintptr_t alloc_base = 0;
+    DWORD alloc_protect = 0;
+    bool is_unbacked_exec = false;
+    bool is_pe_in_private = false;
+    bool private_rwx = false;
     std::vector<SIZE_T> hits;
     bool hits_truncated = false;
     std::vector<Snapshot> snapshots;
@@ -317,6 +331,159 @@ bool is_private_rwx(DWORD type, DWORD protect) {
     return base == PAGE_EXECUTE_READWRITE || base == PAGE_EXECUTE_WRITECOPY;
 }
 
+// Returns true if memory protection grants execution permission.
+bool is_executable_protect(DWORD protect) {
+    DWORD base = protect & 0xFF;
+    return (base == PAGE_EXECUTE ||
+            base == PAGE_EXECUTE_READ ||
+            base == PAGE_EXECUTE_READWRITE ||
+            base == PAGE_EXECUTE_WRITECOPY);
+}
+
+// Returns true if region is executable but not backed by an image file on disk.
+bool is_unbacked_exec(DWORD type, DWORD protect) {
+    return (type != MEM_IMAGE) && is_executable_protect(protect);
+}
+
+// Checks if buffer starts with a valid DOS ("MZ") and PE NT ("PE\0\0") header.
+bool has_pe_header(const uint8_t* buf, size_t len) {
+    if (len < 0x40) return false;
+    if (buf[0] != 0x4D || buf[1] != 0x5A) return false;
+    uint32_t e_lfanew = 0;
+    std::memcpy(&e_lfanew, buf + 0x3C, sizeof(e_lfanew));
+    if (e_lfanew == 0 || e_lfanew + 4 > len) return false;
+    return (buf[e_lfanew] == 'P' &&
+            buf[e_lfanew + 1] == 'E' &&
+            buf[e_lfanew + 2] == '\0' &&
+            buf[e_lfanew + 3] == '\0');
+}
+
+// Returns a detection marker tag for CLI output.
+std::string get_detection_marker(const RegionInfo& reg) {
+    if (reg.is_pe_in_private)  return "[!PE ]";
+    if (reg.private_rwx)       return "[!RWX]";
+    if (reg.is_unbacked_exec)  return "[!X  ]";
+    return "      ";
+}
+
+// Attempts to enable SeDebugPrivilege for inspecting elevated/service processes.
+bool enable_debug_privilege() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+        return false;
+    }
+    LUID luid;
+    if (!LookupPrivilegeValueA(nullptr, "SeDebugPrivilege", &luid)) {
+        CloseHandle(token);
+        return false;
+    }
+    TOKEN_PRIVILEGES tp = {};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    BOOL ok = AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    DWORD err = GetLastError();
+    CloseHandle(token);
+    return (ok && err == ERROR_SUCCESS);
+}
+
+// Reads memory from proc at base+offset for up to to_read bytes.
+// If the 1 MB chunk read fails or is partial, it falls back to 4 KB page-by-page reads,
+// skipping unreadable/guarded pages without aborting the rest of the region.
+SIZE_T scan_chunk_robust(HANDLE proc, uintptr_t chunk_addr, SIZE_T to_read,
+                         const Pattern* pat, std::vector<uint8_t>& chunk_buf,
+                         SIZE_T chunk_offset_in_reg, std::vector<SIZE_T>& out_hits,
+                         size_t max_hits, bool& out_truncated, bool& out_has_pe) {
+    if (to_read == 0) return 0;
+    if (chunk_buf.size() < to_read) chunk_buf.resize(to_read);
+
+    SIZE_T bytes_read = 0;
+    BOOL ok = ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(chunk_addr),
+                                chunk_buf.data(), to_read, &bytes_read);
+
+    if (ok && bytes_read == to_read) {
+        if (chunk_offset_in_reg == 0 && has_pe_header(chunk_buf.data(), bytes_read)) {
+            out_has_pe = true;
+        }
+        if (pat != nullptr && !pat->bytes.empty()) {
+            std::vector<size_t> hits = find_all(chunk_buf.data(), bytes_read, *pat);
+            for (size_t h : hits) {
+                if (out_hits.size() < max_hits) {
+                    out_hits.push_back(chunk_offset_in_reg + h);
+                } else {
+                    out_truncated = true;
+                    break;
+                }
+            }
+        }
+        return bytes_read;
+    }
+
+    // Fallback: Read page-by-page (4 KB) across this chunk window
+    static const SIZE_T PAGE_4K = 4096;
+    SIZE_T total_read = 0;
+    std::vector<uint8_t> page_buf(PAGE_4K);
+    std::vector<uint8_t> prev_tail;
+    SIZE_T overlap = (pat != nullptr && !pat->bytes.empty()) ? (pat->bytes.size() - 1) : 0;
+
+    for (SIZE_T page_off = 0; page_off < to_read; page_off += PAGE_4K) {
+        SIZE_T page_len = (to_read - page_off < PAGE_4K) ? (to_read - page_off) : PAGE_4K;
+        SIZE_T p_read = 0;
+        BOOL p_ok = ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(chunk_addr + page_off),
+                                      page_buf.data(), page_len, &p_read);
+        if (!p_ok || p_read == 0) {
+            prev_tail.clear();
+            continue;
+        }
+
+        total_read += p_read;
+        if (chunk_offset_in_reg + page_off == 0 && has_pe_header(page_buf.data(), p_read)) {
+            out_has_pe = true;
+        }
+
+        if (pat != nullptr && !pat->bytes.empty()) {
+            if (!prev_tail.empty() && overlap > 0) {
+                size_t b_len = prev_tail.size() + std::min(overlap, p_read);
+                std::vector<uint8_t> b_buf(b_len);
+                std::memcpy(b_buf.data(), prev_tail.data(), prev_tail.size());
+                std::memcpy(b_buf.data() + prev_tail.size(), page_buf.data(), std::min(overlap, p_read));
+
+                std::vector<size_t> b_hits = find_all(b_buf.data(), b_len, *pat);
+                for (size_t bh : b_hits) {
+                    if (bh < prev_tail.size()) {
+                        SIZE_T hit_pos = chunk_offset_in_reg + (page_off - prev_tail.size()) + bh;
+                        if (out_hits.size() < max_hits) {
+                            out_hits.push_back(hit_pos);
+                        } else {
+                            out_truncated = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            std::vector<size_t> phits = find_all(page_buf.data(), p_read, *pat);
+            for (size_t ph : phits) {
+                SIZE_T hit_pos = chunk_offset_in_reg + page_off + ph;
+                if (out_hits.size() < max_hits) {
+                    out_hits.push_back(hit_pos);
+                } else {
+                    out_truncated = true;
+                    break;
+                }
+            }
+
+            if (p_read >= overlap) {
+                prev_tail.assign(page_buf.data() + (p_read - overlap), page_buf.data() + p_read);
+            } else {
+                prev_tail.assign(page_buf.data(), page_buf.data() + p_read);
+            }
+        }
+    }
+    return total_read;
+}
+
 // ============================================================================
 // 3. CLI Subsystem
 // ============================================================================
@@ -358,37 +525,49 @@ void scan_region_cli(HANDLE proc, const MEMORY_BASIC_INFORMATION& mbi, const Pat
     SIZE_T prev_overlap = 0;
     size_t region_hits = 0;
     bool hits_capped = false;
+    bool pe_found = false;
 
     stats.regions_scanned += 1;
     std::vector<uint8_t> buf(CLI_CHUNK_SIZE);
+    std::vector<SIZE_T> chunk_hits;
+
+    RegionInfo reg;
+    reg.base = region_base;
+    reg.size = region_size;
+    reg.type = mbi.Type;
+    reg.protect = mbi.Protect;
+    reg.alloc_base = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
+    reg.alloc_protect = mbi.AllocationProtect;
+    reg.is_unbacked_exec = is_unbacked_exec(mbi.Type, mbi.Protect);
+    reg.private_rwx = is_private_rwx(mbi.Type, mbi.Protect);
 
     while (offset < region_size) {
         SIZE_T remaining = region_size - offset;
         SIZE_T to_read = (remaining < CLI_CHUNK_SIZE) ? remaining : CLI_CHUNK_SIZE;
-        SIZE_T bytes_read = 0;
+        chunk_hits.clear();
 
-        BOOL ok = ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(region_base + offset),
-                                    buf.data(), to_read, &bytes_read);
-        if (!ok) {
-            DWORD err = GetLastError();
-            std::cerr << "[WARN] ReadProcessMemory failed at " << to_hex_string(region_base + offset)
-                      << " (read " << bytes_read << "/" << to_read << " bytes): "
-                      << format_win32_error(err) << " (err=" << err << ")\n";
+        bool truncated = false;
+        SIZE_T bytes_read = scan_chunk_robust(proc, region_base + offset, to_read,
+                                              &pat, buf, offset, chunk_hits,
+                                              MAX_HITS_PER_REGION - region_hits,
+                                              truncated, pe_found);
+
+        if (mbi.Type == MEM_PRIVATE && pe_found) {
+            reg.is_pe_in_private = true;
         }
-        if (bytes_read == 0) break;
 
         if (bytes_read > prev_overlap) {
             stats.bytes_scanned += (bytes_read - prev_overlap);
         }
 
-        std::vector<size_t> hits = find_all(buf.data(), bytes_read, pat);
-        for (size_t i = 0; i < hits.size(); ++i) {
+        for (SIZE_T h : chunk_hits) {
             if (region_hits < MAX_HITS_PER_REGION) {
-                uintptr_t hit_addr = region_base + offset + hits[i];
-                std::string marker = is_private_rwx(mbi.Type, mbi.Protect) ? "[!] " : "    ";
-                std::cout << marker << "HIT addr=" << to_hex_string(hit_addr)
+                uintptr_t hit_addr = region_base + h;
+                std::string marker = get_detection_marker(reg);
+                std::cout << marker << " HIT addr=" << to_hex_string(hit_addr)
                           << " region_base=" << to_hex_string(region_base)
                           << " region_size=" << to_hex_string(region_size)
+                          << " alloc_base=" << to_hex_string(reg.alloc_base)
                           << " type=" << type_full(mbi.Type)
                           << " protect=" << prot_full(mbi.Protect) << "\n";
                 stats.total_hits += 1;
@@ -402,9 +581,14 @@ void scan_region_cli(HANDLE proc, const MEMORY_BASIC_INFORMATION& mbi, const Pat
             }
         }
 
-        if (!ok || offset + bytes_read >= region_size || bytes_read <= overlap) break;
-        offset += (bytes_read - overlap);
-        prev_overlap = overlap;
+        if (offset + to_read >= region_size) break;
+        if (bytes_read <= overlap) {
+            offset += to_read;
+            prev_overlap = 0;
+        } else {
+            offset += (bytes_read - overlap);
+            prev_overlap = overlap;
+        }
     }
 }
 
@@ -916,29 +1100,52 @@ void display_selected_region(SIZE_T focus_offset) {
     const uint8_t* ref_ptr = nullptr;
     size_t ref_len = 0;
     bool offset_mismatch = false;
-    if (dp.active && dp.ref_data != nullptr) {
-        if (dp.ref_view_offset == g_view_offset) {
-            ref_ptr = dp.ref_data->data();
-            ref_len = dp.ref_data->size();
+    uintptr_t display_addr = reg.base + g_view_offset;
+    SIZE_T display_view_offset = g_view_offset;
+
+    if (dp.active) {
+        if (dp.cmp_data != nullptr) {
+            // Snapshot vs Snapshot diff
+            display_view_offset = dp.cmp_view_offset;
+            display_addr = reg.base + display_view_offset;
+            if (dp.ref_view_offset != dp.cmp_view_offset) {
+                offset_mismatch = true;
+            } else {
+                ref_ptr = dp.ref_data->data();
+                ref_len = dp.ref_data->size();
+            }
         } else {
-            offset_mismatch = true;
+            // Live vs Snapshot diff
+            if (dp.ref_view_offset == g_view_offset) {
+                ref_ptr = dp.ref_data->data();
+                ref_len = dp.ref_data->size();
+            } else {
+                offset_mismatch = true;
+            }
         }
     }
 
     int focus_line = -1;
     size_t chg_bytes = 0, new_bytes = 0, zeroed_bytes = 0;
-    std::string dump = build_hex_dump(buf.data(), bytes_read, reg.base + g_view_offset,
-                                      reg.hits, g_view_offset, g_active_pattern.bytes.size(),
+    std::string dump = build_hex_dump(buf.data(), bytes_read, display_addr,
+                                      reg.hits, display_view_offset, g_active_pattern.bytes.size(),
                                       focus_offset, focus_line,
                                       ref_ptr, ref_len, dp.active && !offset_mismatch,
                                       chg_bytes, new_bytes, zeroed_bytes);
 
     if (offset_mismatch) {
-        char warn_note[192];
-        std::snprintf(warn_note, sizeof(warn_note),
-                      "[Note: Selected snapshot belongs to offset 0x%llX; current page is 0x%llX. Navigate back or take a new snapshot.]\r\n\r\n",
-                      static_cast<unsigned long long>(dp.ref_view_offset),
-                      static_cast<unsigned long long>(g_view_offset));
+        char warn_note[256];
+        if (dp.cmp_data != nullptr) {
+            std::snprintf(warn_note, sizeof(warn_note),
+                          "[Note: Snapshots belong to different page offsets (0x%llX vs 0x%llX). Cannot diff across different offsets.]\r\n\r\n",
+                          static_cast<unsigned long long>(dp.ref_view_offset),
+                          static_cast<unsigned long long>(dp.cmp_view_offset));
+        } else {
+            std::snprintf(warn_note, sizeof(warn_note),
+                          "[Note: Selected snapshot belongs to offset 0x%llX; current page is 0x%llX. Navigate back or take a new snapshot.]\r\n\r\n",
+                          static_cast<unsigned long long>(dp.ref_view_offset),
+                          static_cast<unsigned long long>(g_view_offset));
+        }
         dump = warn_note + dump;
         if (focus_line >= 0) focus_line += 2;
     }
@@ -949,26 +1156,33 @@ void display_selected_region(SIZE_T focus_offset) {
         if (focus_line >= 0) focus_line += 2;
     }
 
-    char info[320];
+    char info[360];
+    std::string det_tag;
+    if (reg.is_pe_in_private)       det_tag = " [! INJECTED PE]";
+    else if (reg.private_rwx)      det_tag = " [! RWX]";
+    else if (reg.is_unbacked_exec) det_tag = " [! UNBACKED EXEC]";
+
     if (dp.active && !offset_mismatch) {
         std::snprintf(info, sizeof(info),
-                      "Region %zu/%zu | Base 0x%016llX | %s | %s%s | Diff [%s]: %zu chg (%zu new, %zu wiped)",
+                      "Reg %zu/%zu | Base 0x%016llX | AllocBase 0x%016llX | %s | %s%s | Diff [%s]: %zu chg (%zu new, %zu wiped)",
                       g_selected_region + 1, g_regions.size(),
                       static_cast<unsigned long long>(reg.base),
+                      static_cast<unsigned long long>(reg.alloc_base),
                       type_full(reg.type).c_str(),
                       prot_full(reg.protect).c_str(),
-                      reg.private_rwx ? " [!]" : "",
+                      det_tag.c_str(),
                       dp.title.c_str(), chg_bytes, new_bytes, zeroed_bytes);
     } else {
         std::snprintf(info, sizeof(info),
-                      "Region %zu/%zu | Base 0x%016llX | %s | %s%s | Showing 0x%llX..0x%llX of 0x%llX",
+                      "Reg %zu/%zu | Base 0x%016llX | AllocBase 0x%016llX | %s | %s%s | Showing 0x%llX..0x%llX of 0x%llX",
                       g_selected_region + 1, g_regions.size(),
                       static_cast<unsigned long long>(reg.base),
+                      static_cast<unsigned long long>(reg.alloc_base),
                       type_full(reg.type).c_str(),
                       prot_full(reg.protect).c_str(),
-                      reg.private_rwx ? " [!]" : "",
-                      static_cast<unsigned long long>(g_view_offset),
-                      static_cast<unsigned long long>(g_view_offset + to_read),
+                      det_tag.c_str(),
+                      static_cast<unsigned long long>(display_view_offset),
+                      static_cast<unsigned long long>(display_view_offset + to_read),
                       static_cast<unsigned long long>(reg.size));
     }
 
@@ -1011,7 +1225,7 @@ void populate_region_list() {
             continue;
         }
 
-        char row[160];
+        char row[192];
         std::string tag;
         if (!r.hits.empty()) {
             char hbuf[48];
@@ -1028,12 +1242,17 @@ void populate_region_list() {
             tag += sbuf;
         }
 
-        std::snprintf(row, sizeof(row), "%016llX %s %s %s%s%s",
+        std::string flag = "    ";
+        if (r.is_pe_in_private) flag = "!PE ";
+        else if (r.private_rwx) flag = "!RWX";
+        else if (r.is_unbacked_exec) flag = "!X  ";
+
+        std::snprintf(row, sizeof(row), "%016llX %s %s %s %s%s",
                       static_cast<unsigned long long>(r.base),
                       fmt_size_short(r.size).c_str(),
                       type_short(r.type).c_str(),
                       prot_short(r.protect).c_str(),
-                      r.private_rwx ? "!" : " ",
+                      flag.c_str(),
                       tag.c_str());
 
         SendMessageA(g_list_regions, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(row));
@@ -1060,7 +1279,247 @@ void select_region_in_ui(size_t region_idx, SIZE_T view_offset, SIZE_T focus_off
     display_selected_region(focus_offset);
 }
 
+struct ScanTask {
+    HWND hwnd;
+    DWORD pid;
+    std::string pid_label;
+    Pattern pat;
+    bool use_pattern;
+};
+
+struct ScanResult {
+    DWORD pid;
+    std::string pid_label;
+    Pattern pat;
+    bool use_pattern;
+    bool success;
+    DWORD error_code;
+    std::string error_msg;
+    std::vector<RegionInfo> regions;
+    SIZE_T total_bytes;
+    SIZE_T total_hits;
+    size_t regions_with_hits;
+};
+
+static HANDLE g_h_worker_thread = nullptr;
+static volatile bool g_scan_abort = false;
+
+DWORD WINAPI ScanWorkerThread(LPVOID param) {
+    ScanTask* task = reinterpret_cast<ScanTask*>(param);
+    ScanResult* res = new ScanResult();
+    res->pid = task->pid;
+    res->pid_label = task->pid_label;
+    res->pat = task->pat;
+    res->use_pattern = task->use_pattern;
+    res->success = false;
+    res->error_code = 0;
+    res->total_bytes = 0;
+    res->total_hits = 0;
+    res->regions_with_hits = 0;
+
+    HWND hwnd = task->hwnd;
+    delete task;
+
+    HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, res->pid);
+    if (proc == nullptr) {
+        res->error_code = GetLastError();
+        res->error_msg = format_win32_error(res->error_code);
+        PostMessageA(hwnd, WM_SCAN_COMPLETE, FALSE, reinterpret_cast<LPARAM>(res));
+        return 0;
+    }
+
+    std::vector<uint8_t> chunk_buf(CLI_CHUNK_SIZE);
+    std::vector<SIZE_T> chunk_hits;
+    uintptr_t addr = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    SIZE_T last_progress_bytes = 0;
+
+    while (!g_scan_abort) {
+        std::memset(&mbi, 0, sizeof(mbi));
+        SIZE_T q = VirtualQueryEx(proc, reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi));
+        if (q == 0) break;
+
+        uintptr_t region_base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+        SIZE_T region_size = mbi.RegionSize;
+
+        if (mbi.State == MEM_COMMIT &&
+            (mbi.Protect & PAGE_NOACCESS) == 0 &&
+            (mbi.Protect & PAGE_GUARD) == 0) {
+
+            RegionInfo reg;
+            reg.base = region_base;
+            reg.size = region_size;
+            reg.type = mbi.Type;
+            reg.protect = mbi.Protect;
+            reg.alloc_base = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
+            reg.alloc_protect = mbi.AllocationProtect;
+            reg.is_unbacked_exec = is_unbacked_exec(mbi.Type, mbi.Protect);
+            reg.private_rwx = is_private_rwx(mbi.Type, mbi.Protect);
+
+            SIZE_T offset = 0;
+            SIZE_T overlap = (res->use_pattern && !res->pat.bytes.empty()) ? (res->pat.bytes.size() - 1) : 0;
+            SIZE_T prev_overlap = 0;
+            bool pe_found = false;
+
+            while (offset < region_size && !g_scan_abort) {
+                SIZE_T rem = region_size - offset;
+                SIZE_T to_read = (rem < CLI_CHUNK_SIZE) ? rem : CLI_CHUNK_SIZE;
+                chunk_hits.clear();
+
+                bool truncated = false;
+                SIZE_T bytes_read = scan_chunk_robust(proc, region_base + offset, to_read,
+                                                      res->use_pattern ? &res->pat : nullptr,
+                                                      chunk_buf, offset, chunk_hits,
+                                                      MAX_HITS_PER_REGION - reg.hits.size(),
+                                                      truncated, pe_found);
+
+                if (truncated) {
+                    reg.hits_truncated = true;
+                }
+
+                if (mbi.Type == MEM_PRIVATE && pe_found) {
+                    reg.is_pe_in_private = true;
+                }
+
+                if (bytes_read > prev_overlap) {
+                    res->total_bytes += (bytes_read - prev_overlap);
+                }
+
+                for (SIZE_T h : chunk_hits) {
+                    if (reg.hits.size() < MAX_HITS_PER_REGION) {
+                        reg.hits.push_back(h);
+                    } else {
+                        reg.hits_truncated = true;
+                        break;
+                    }
+                }
+
+                if (offset + to_read >= region_size) break;
+                if (bytes_read <= overlap) {
+                    offset += to_read;
+                    prev_overlap = 0;
+                } else {
+                    offset += (bytes_read - overlap);
+                    prev_overlap = overlap;
+                }
+            }
+
+            if (!reg.hits.empty()) {
+                res->total_hits += reg.hits.size();
+                res->regions_with_hits += 1;
+            }
+
+            res->regions.push_back(std::move(reg));
+
+            if (res->total_bytes - last_progress_bytes >= 8 * 1024 * 1024) {
+                last_progress_bytes = res->total_bytes;
+                PostMessageA(hwnd, WM_SCAN_PROGRESS,
+                             static_cast<WPARAM>(res->total_bytes / (1024 * 1024)),
+                             static_cast<LPARAM>(res->total_hits));
+            }
+        }
+
+        if (region_size == 0) break;
+        uintptr_t next = region_base + region_size;
+        if (next <= addr) break;
+        addr = next;
+    }
+
+    CloseHandle(proc);
+
+    if (g_scan_abort) {
+        delete res;
+        return 0;
+    }
+
+    res->success = true;
+    PostMessageA(hwnd, WM_SCAN_COMPLETE, TRUE, reinterpret_cast<LPARAM>(res));
+    return 0;
+}
+
+void on_scan_completed(ScanResult* res) {
+    EnableWindow(g_btn_load, TRUE);
+    EnableWindow(g_btn_search, TRUE);
+    EnableWindow(g_edit_pid, TRUE);
+    EnableWindow(g_edit_pattern, TRUE);
+
+    if (!res->success) {
+        std::string msg = "Cannot open PID " + std::to_string(res->pid) + ": " + res->error_msg;
+        if (res->error_code == ERROR_ACCESS_DENIED) {
+            msg += "\n\nRun as Administrator or target a non-protected user process.";
+        }
+        set_status("[ERROR] " + msg);
+        MessageBoxA(g_hwnd_main, msg.c_str(), "Scan Error", MB_ICONERROR);
+        return;
+    }
+
+    close_target_proc();
+    invalidate_hex_cache();
+
+    g_regions = std::move(res->regions);
+    g_current_pid = res->pid;
+    g_current_pid_label = res->pid_label;
+    g_active_pattern = res->pat;
+    g_has_pattern = res->use_pattern;
+    g_has_selection = false;
+    g_view_offset = 0;
+
+    EnableWindow(g_btn_next_hit, (g_has_pattern && res->total_hits > 0) ? TRUE : FALSE);
+
+    populate_region_list();
+
+    size_t first_hit_region = 0;
+    bool found_hit = false;
+    if (g_has_pattern) {
+        for (size_t i = 0; i < g_regions.size(); ++i) {
+            if (!g_regions[i].hits.empty()) {
+                first_hit_region = i;
+                found_hit = true;
+                break;
+            }
+        }
+    }
+
+    if (g_has_pattern && found_hit) {
+        g_hit_cursor_region = first_hit_region;
+        g_hit_cursor_index = 0;
+        SIZE_T hit_off = g_regions[first_hit_region].hits[0];
+        SIZE_T page_off = (hit_off / VIEW_PAGE_SIZE) * VIEW_PAGE_SIZE;
+        select_region_in_ui(first_hit_region, page_off, hit_off);
+    } else if (!g_visible_indices.empty()) {
+        select_region_in_ui(g_visible_indices[0], 0, static_cast<SIZE_T>(-1));
+    } else {
+        update_diff_combo();
+        display_selected_region(static_cast<SIZE_T>(-1));
+    }
+
+    double mb = static_cast<double>(res->total_bytes) / (1024.0 * 1024.0);
+    char status[256];
+    if (g_has_pattern) {
+        std::snprintf(status, sizeof(status),
+                      "PID %lu (%s): %zu regions, %.2f MB scanned | %zu hit(s) in %zu region(s) | Click any region to view hex",
+                      static_cast<unsigned long>(res->pid), res->pid_label.c_str(),
+                      g_regions.size(), mb, res->total_hits, res->regions_with_hits);
+    } else {
+        std::snprintf(status, sizeof(status),
+                      "PID %lu (%s): Loaded %zu committed regions (%.2f MB) | Click any region on the left to inspect its hex",
+                      static_cast<unsigned long>(res->pid), res->pid_label.c_str(),
+                      g_regions.size(), mb);
+    }
+    set_status(status);
+}
+
 void run_load_or_search(bool require_pattern) {
+    if (g_h_worker_thread != nullptr) {
+        DWORD exit_code = 0;
+        if (GetExitCodeThread(g_h_worker_thread, &exit_code) && exit_code == STILL_ACTIVE) {
+            set_status("Scan already in progress. Please wait...");
+            return;
+        }
+        CloseHandle(g_h_worker_thread);
+        g_h_worker_thread = nullptr;
+    }
+
     char pid_buf[64] = {};
     char pat_buf[512] = {};
     GetWindowTextA(g_edit_pid, pid_buf, sizeof(pid_buf));
@@ -1099,144 +1558,35 @@ void run_load_or_search(bool require_pattern) {
         }
     }
 
-    HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-    if (proc == nullptr) {
-        DWORD err = GetLastError();
-        std::string msg = "OpenProcess failed for PID " + std::to_string(pid) + ": " +
-                          format_win32_error(err) + " (err=" + std::to_string(err) + ")";
-        if (err == ERROR_ACCESS_DENIED) {
-            msg += "\n\nRun as Administrator or pick a non-protected user process.";
-        }
-        set_status("[ERROR] " + msg);
-        MessageBoxA(g_hwnd_main, msg.c_str(), "Cannot Open Process", MB_ICONERROR);
-        return;
-    }
-
-    set_status(use_pattern ? "Scanning process memory..." : "Loading process memory map...");
-    EnableWindow(g_btn_load, FALSE);
-    EnableWindow(g_btn_search, FALSE);
-
     close_target_proc();
     invalidate_hex_cache();
 
-    g_regions.clear();
-    g_current_pid = pid;
-    g_current_pid_label = pid_str;
-    g_active_pattern = pat;
-    g_has_pattern = use_pattern;
-    g_has_selection = false;
-    g_view_offset = 0;
+    set_status(use_pattern ? "Scanning process memory in background..." : "Loading process memory map in background...");
+    EnableWindow(g_btn_load, FALSE);
+    EnableWindow(g_btn_search, FALSE);
+    EnableWindow(g_btn_next_hit, FALSE);
+    EnableWindow(g_edit_pid, FALSE);
+    EnableWindow(g_edit_pattern, FALSE);
 
-    SIZE_T total_bytes = 0;
-    SIZE_T total_hits = 0;
-    size_t regions_with_hits = 0;
-    size_t first_hit_region = 0;
-    bool found_first_hit = false;
+    ScanTask* task = new ScanTask();
+    task->hwnd = g_hwnd_main;
+    task->pid = pid;
+    task->pid_label = pid_str;
+    task->pat = pat;
+    task->use_pattern = use_pattern;
 
-    uintptr_t addr = 0;
-    MEMORY_BASIC_INFORMATION mbi;
-    while (true) {
-        std::memset(&mbi, 0, sizeof(mbi));
-        SIZE_T q = VirtualQueryEx(proc, reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi));
-        if (q == 0) break;
-
-        uintptr_t region_base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-        SIZE_T region_size = mbi.RegionSize;
-
-        if (mbi.State == MEM_COMMIT &&
-            (mbi.Protect & PAGE_NOACCESS) == 0 &&
-            (mbi.Protect & PAGE_GUARD) == 0) {
-            RegionInfo reg;
-            reg.base = region_base;
-            reg.size = region_size;
-            reg.type = mbi.Type;
-            reg.protect = mbi.Protect;
-            reg.private_rwx = is_private_rwx(mbi.Type, mbi.Protect);
-
-            if (use_pattern) {
-                SIZE_T overlap = pat.bytes.size() - 1;
-                SIZE_T offset = 0;
-                SIZE_T prev_ov = 0;
-                std::vector<uint8_t> chunk(CLI_CHUNK_SIZE);
-                while (offset < region_size) {
-                    SIZE_T rem = region_size - offset;
-                    SIZE_T to_read = (rem < CLI_CHUNK_SIZE) ? rem : CLI_CHUNK_SIZE;
-                    SIZE_T bytes_read = 0;
-                    BOOL ok = ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(region_base + offset),
-                                                chunk.data(), to_read, &bytes_read);
-                    if (!ok && bytes_read == 0) break;
-                    if (bytes_read > prev_ov) {
-                        total_bytes += (bytes_read - prev_ov);
-                    }
-                    std::vector<size_t> hits = find_all(chunk.data(), bytes_read, pat);
-                    for (size_t i = 0; i < hits.size(); ++i) {
-                        if (reg.hits.size() < MAX_HITS_PER_REGION) {
-                            reg.hits.push_back(offset + hits[i]);
-                        } else {
-                            reg.hits_truncated = true;
-                            break;
-                        }
-                    }
-                    if (!ok || offset + bytes_read >= region_size || bytes_read <= overlap) break;
-                    offset += (bytes_read - overlap);
-                    prev_ov = overlap;
-                }
-                if (!reg.hits.empty()) {
-                    total_hits += reg.hits.size();
-                    regions_with_hits += 1;
-                    if (!found_first_hit) {
-                        first_hit_region = g_regions.size();
-                        found_first_hit = true;
-                    }
-                }
-            } else {
-                total_bytes += region_size;
-            }
-
-            g_regions.push_back(reg);
-        }
-
-        if (region_size == 0) break;
-        uintptr_t next = region_base + region_size;
-        if (next <= addr) break;
-        addr = next;
+    g_scan_abort = false;
+    g_h_worker_thread = CreateThread(nullptr, 0, ScanWorkerThread, task, 0, nullptr);
+    if (g_h_worker_thread == nullptr) {
+        DWORD err = GetLastError();
+        delete task;
+        EnableWindow(g_btn_load, TRUE);
+        EnableWindow(g_btn_search, TRUE);
+        EnableWindow(g_edit_pid, TRUE);
+        EnableWindow(g_edit_pattern, TRUE);
+        set_status("[ERROR] CreateThread failed: " + format_win32_error(err));
+        MessageBoxA(g_hwnd_main, "Failed to launch background worker thread.", "Thread Error", MB_ICONERROR);
     }
-
-    CloseHandle(proc);
-
-    EnableWindow(g_btn_load, TRUE);
-    EnableWindow(g_btn_search, TRUE);
-    EnableWindow(g_btn_next_hit, (use_pattern && total_hits > 0) ? TRUE : FALSE);
-
-    populate_region_list();
-
-    if (use_pattern && found_first_hit) {
-        g_hit_cursor_region = first_hit_region;
-        g_hit_cursor_index = 0;
-        SIZE_T hit_off = g_regions[first_hit_region].hits[0];
-        SIZE_T page_off = (hit_off / VIEW_PAGE_SIZE) * VIEW_PAGE_SIZE;
-        select_region_in_ui(first_hit_region, page_off, hit_off);
-    } else if (!g_visible_indices.empty()) {
-        select_region_in_ui(g_visible_indices[0], 0, static_cast<SIZE_T>(-1));
-    } else {
-        update_diff_combo();
-        display_selected_region(static_cast<SIZE_T>(-1));
-    }
-
-    char status[256];
-    double mb = static_cast<double>(total_bytes) / (1024.0 * 1024.0);
-    if (use_pattern) {
-        std::snprintf(status, sizeof(status),
-                      "PID %lu (%s): %zu regions, %.2f MB scanned | %zu hit(s) in %zu region(s) | Click any region to view hex",
-                      static_cast<unsigned long>(pid), pid_str.c_str(),
-                      g_regions.size(), mb, total_hits, regions_with_hits);
-    } else {
-        std::snprintf(status, sizeof(status),
-                      "PID %lu (%s): Loaded %zu committed regions (%.2f MB) | Click any region on the left to inspect its hex",
-                      static_cast<unsigned long>(pid), pid_str.c_str(),
-                      g_regions.size(), mb);
-    }
-    set_status(status);
 }
 
 void on_next_hit() {
@@ -1331,7 +1681,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
                                         x, M, 116, RH, hwnd, reinterpret_cast<HMENU>(ID_CHK_HEARTBEAT), hInst, nullptr);
 
-        HWND lbl_map = CreateWindowA("STATIC", "Memory Map (Address | Size | Type | Prot | !RWX)",
+        HWND lbl_map = CreateWindowA("STATIC", "Memory Map (Address | Size | Type | Prot | Flag: !PE/!RWX/!X)",
                                      WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
                                      M, M + RH + M, 390, 18, hwnd, nullptr, hInst, nullptr);
 
@@ -1502,6 +1852,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 
+    case WM_SCAN_PROGRESS: {
+        SIZE_T mb = static_cast<SIZE_T>(wp);
+        SIZE_T hits = static_cast<SIZE_T>(lp);
+        char status[160];
+        if (hits > 0) {
+            std::snprintf(status, sizeof(status), "Scanning process memory... %llu MB scanned, %llu hit(s)",
+                          static_cast<unsigned long long>(mb), static_cast<unsigned long long>(hits));
+        } else {
+            std::snprintf(status, sizeof(status), "Scanning process memory... %llu MB scanned",
+                          static_cast<unsigned long long>(mb));
+        }
+        set_status(status);
+        return 0;
+    }
+
+    case WM_SCAN_COMPLETE: {
+        ScanResult* res = reinterpret_cast<ScanResult*>(lp);
+        if (res != nullptr) {
+            on_scan_completed(res);
+            delete res;
+        }
+        return 0;
+    }
+
     case WM_TIMER:
         if (wp == IDT_HEARTBEAT) {
             if (g_has_selection && g_selected_region < g_regions.size()) {
@@ -1513,6 +1887,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_DESTROY:
         KillTimer(hwnd, IDT_HEARTBEAT);
+        g_scan_abort = true;
+        if (g_h_worker_thread != nullptr) {
+            WaitForSingleObject(g_h_worker_thread, 1000);
+            CloseHandle(g_h_worker_thread);
+            g_h_worker_thread = nullptr;
+        }
         close_target_proc();
         if (g_mono_font) DeleteObject(g_mono_font);
         if (g_ui_font) DeleteObject(g_ui_font);
@@ -1553,6 +1933,9 @@ int run_gui(HINSTANCE hInst, int nCmdShow) {
 // ============================================================================
 
 int main(int argc, char* argv[]) {
+    // Attempt to acquire SeDebugPrivilege so elevated runs can inspect system processes
+    enable_debug_privilege();
+
     // If no arguments or explicitly "--gui", launch interactive GUI mode
     if (argc <= 1 || (argc == 2 && std::strcmp(argv[1], "--gui") == 0)) {
         HWND console_hwnd = GetConsoleWindow();

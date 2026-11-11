@@ -13,12 +13,19 @@ Designed for defensive reverse engineering, malware analysis, and detection engi
 ## Features
 
 - **Dual-Mode Single Binary**: Automatically launches in interactive GUI mode when double-clicked, or runs as a headless CLI scanner when passed arguments in a terminal.
-- **Real-Time Memory Heartbeat**: Periodic (1s) live diff monitoring that flags modified rows and shows exact previous byte values as memory changes in running targets.
+- **Asynchronous Worker Thread Scanning**: Memory walks run on a dedicated worker thread with asynchronous progress updates (`WM_SCAN_PROGRESS` / `WM_SCAN_COMPLETE`), keeping the UI completely responsive on multi-gigabyte targets.
+- **Robust Page-Wise Read Fallback**: Never silently abandons regions on partial read errors; automatically falls back to 4 KB page-by-page reads to scan past guard pages and decommitted blocks.
+- **Advanced Malware Detection Heuristics**:
+  - `[!PE ]`: Detects injected PE / Reflective DLL headers (`MZ` + `PE\0\0`) inside `MEM_PRIVATE` memory.
+  - `[!RWX]`: Flags private executable+writable memory (`PAGE_EXECUTE_READWRITE` / `PAGE_EXECUTE_WRITECOPY`).
+  - `[!X  ]`: Flags unbacked executable code not mapped from disk images (`MEM_MAPPED` / `MEM_PRIVATE` with execution rights).
+- **Allocation Introspection**: Captures and displays `AllocationBase` and `AllocationProtect` from `MEMORY_BASIC_INFORMATION`.
+- **Automatic `SeDebugPrivilege` Acquisition**: Attempts token privilege adjustment on startup so elevated processes can inspect system services and protected targets.
+- **Real-Time Memory Heartbeat**: Periodic (1s) live diff monitoring that flags modified rows and shows exact previous byte values as memory changes in running targets, with flicker-free scroll preservation.
 - **Visual Memory Diff Timeline**: Capture point-in-time snapshots of any region (`[+ Snap]`) and compare `Live vs Snapshot` or `Snapshot vs Snapshot` with byte-aligned `old:` sub-rows.
-- **YARA-Like Pattern Scanner**: Fast sliding-window pattern scanner supporting hex bytes and `??` wildcards (e.g., `4D 5A ?? 00 03`).
-- **Suspicious Code Indicator (`[!]`)**: Automatically flags `MEM_PRIVATE` pages with `PAGE_EXECUTE_READWRITE` / `PAGE_EXECUTE_WRITECOPY` protection (common indicators of injected shellcode or unpacked payloads).
+- **SIMD-Accelerated Pattern Search**: Fast sliding-window pattern scanner using `memchr` anchor acceleration, wildcard support, all-wildcard rejection, and per-region hit caps (10k).
 - **Interactive Two-Pane Hex Viewer**:
-  - **Left Pane**: Memory Map displaying all committed pages (`Address | Size | Type | Protection | Snapshots | Hits`).
+  - **Left Pane**: Memory Map displaying all committed pages (`Address | Size | Type | Protection | Flag: !PE/!RWX/!X | Snapshots | Hits`).
   - **Right Pane**: Fast, responsive 64 KB paged hex+ASCII viewer with hit markers (`>>>`), diff markers (`CHG`), and combo markers (`!>>`).
 - **Zero Heavy Dependencies**: Pure C++ and Win32 API (`user32`, `gdi32`, `kernel32`). No heavy frameworks or runtimes needed.
 
@@ -98,14 +105,15 @@ When passed command-line arguments, Deadeye runs directly in your terminal:
    ```
    Output:
    ```text
-   [Deadeye] Scanning PID 2380 for 8-byte pattern...
-       HIT addr=0x2311C588AB0 region_base=0x2311C580000 region_size=0x34000 type=PRIVATE protect=PAGE_READWRITE
-   [!] HIT addr=0x2311C7E0000 region_base=0x2311C7E0000 region_size=0x1000 type=PRIVATE protect=PAGE_EXECUTE_READWRITE
+   [Deadeye] Scanning PID 9244 for 8-byte pattern...
+          HIT addr=0x18D104407E0 region_base=0x18D10440000 region_size=0x32000 alloc_base=0x18D10440000 type=PRIVATE protect=PAGE_READWRITE
+   [!RWX] HIT addr=0x18D10650000 region_base=0x18D10650000 region_size=0x1000 alloc_base=0x18D10650000 type=PRIVATE protect=PAGE_EXECUTE_READWRITE
+   [!PE ] HIT addr=0x18D10660100 region_base=0x18D10660000 region_size=0x1000 alloc_base=0x18D10660000 type=PRIVATE protect=PAGE_EXECUTE_READ
 
    --- Deadeye Summary ---
-   Regions scanned: 123
+   Regions scanned: 124
    Bytes scanned:   15618048
-   Total hits:      2
+   Total hits:      3
    ```
 
 3. Or load the PID in `deadeye.exe` GUI, select the `RWX!` region, check **Heartbeat (1s)**, and press `m` in `test_target.exe` to see live memory mutation diffs!
