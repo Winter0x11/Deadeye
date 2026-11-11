@@ -1,70 +1,87 @@
 // src/main.cpp
-// Deadeye - Unified Process Memory Pattern Scanner, Hex Viewer & Real-Time Diff Timeline.
+// Deadeye - Windows Process Memory Triage Scanner, Hex Viewer & Real-Time Diff Timeline.
 // Built for defensive malware analysis and detection engineering.
-// Supports both headless CLI mode and interactive GUI mode from a single executable.
-//
-// Usage:
-//   deadeye.exe                         -> Launches interactive GUI mode
-//   deadeye.exe <pid|self> "<pattern>"  -> Runs fast headless CLI scan
-//   deadeye.exe --gui                   -> Explicitly opens GUI window
-//
-// Subsystem Architecture:
-//   Built as a standard console application (/SUBSYSTEM:CONSOLE). When launched with CLI
-//   arguments, standard console output and exit codes are produced synchronously.
-//   When launched without arguments (or with --gui) from Explorer/GUI, the console window
-//   is automatically hidden via ShowWindow(SW_HIDE).
+// Pure Win32 GUI application (/SUBSYSTEM:WINDOWS, -mwindows) with Process Hacker color theme.
 //
 // Build (MinGW-w64, x64):
-//   g++ -std=c++17 -m64 -Wall -Wextra -O2 src/main.cpp -o build/deadeye.exe -lgdi32 -luser32
+//   g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 src/main.cpp -o build/deadeye.exe -mwindows -ladvapi32 -lcomdlg32 -lgdi32 -luser32
 // Build (MSVC x64):
-//   cl /std:c++17 /EHsc /W4 /O2 src/main.cpp /Fe:build/deadeye.exe /link /SUBSYSTEM:CONSOLE user32.lib gdi32.lib
+//   cl /std:c++17 /EHsc /W4 /O2 src/main.cpp /Fe:build/deadeye.exe /link /SUBSYSTEM:WINDOWS advapi32.lib comdlg32.lib user32.lib gdi32.lib
 
+#ifndef _CRT_SECURE_NO_WARNINGS
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <iostream>
 #include <string>
 #include <vector>
 #include <windows.h>
+#include <commdlg.h>
+
+#ifdef _MSC_VER
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+#endif
 
 // ============================================================================
 // 1. Constants & Core Data Structures
 // ============================================================================
 
-// CLI exit codes
-const int EXIT_HITS_FOUND  = 0;
-const int EXIT_NO_HITS     = 1;
-const int EXIT_BAD_ARGS    = 2;
-const int EXIT_OPEN_FAILED = 3;
-
 // Memory read chunk sizes
-static const SIZE_T CLI_CHUNK_SIZE      = 1024 * 1024; // 1 MB per read
+static const SIZE_T CLI_CHUNK_SIZE      = 1024 * 1024; // 1 MB per chunk read
 static const SIZE_T VIEW_PAGE_SIZE      = 64 * 1024;   // 64 KB per GUI page
 static const size_t MAX_HITS_PER_REGION = 10000;       // Max pattern matches tracked per region
 
-// Control IDs for GUI child windows
-#define ID_EDIT_PID        101
-#define ID_BTN_LOAD        102
-#define ID_EDIT_PATTERN    103
-#define ID_BTN_SEARCH      104
-#define ID_BTN_NEXT_HIT    105
-#define ID_CHK_HITS_ONLY   106
-#define ID_LIST_REGIONS    107
-#define ID_EDIT_HEX        108
-#define ID_BTN_PREV_PAGE   109
-#define ID_BTN_NEXT_PAGE   110
-#define ID_BTN_SNAP        111
-#define ID_COMBO_DIFF      112
-#define ID_BTN_CLEAR_SNAPS 113
-#define ID_CHK_HEARTBEAT   114
-#define IDT_HEARTBEAT      1001
+// Triage Severity Scoring Weights & Thresholds
+constexpr int WEIGHT_INJECTED_PE      = 50; // MZ/PE header detected in MEM_PRIVATE
+constexpr int WEIGHT_UNLINKED_MODULE  = 45; // Image region unlinked from PEB loader list
+constexpr int WEIGHT_PRIVATE_RWX      = 40; // Private memory with RWX/RXC protection
+constexpr int WEIGHT_WRITE_THEN_FLIP  = 35; // AllocationProtect writable, Protect executable
+constexpr int WEIGHT_UNBACKED_EXEC    = 25; // Executable unbacked by MEM_IMAGE
 
-// Custom window messages for background worker thread scanning
-#define WM_SCAN_PROGRESS   (WM_USER + 1)
-#define WM_SCAN_COMPLETE   (WM_USER + 2)
+constexpr int SEV_MIN_CRITICAL        = 80;
+constexpr int SEV_MIN_HIGH            = 50;
+constexpr int SEV_MIN_MEDIUM          = 25;
+constexpr int SEV_MIN_LOW             = 10;
+
+// Control IDs for GUI child windows
+#define ID_EDIT_PID           101
+#define ID_BTN_LOAD           102
+#define ID_EDIT_PATTERN       103
+#define ID_BTN_SEARCH         104
+#define ID_BTN_NEXT_HIT       105
+#define ID_CHK_HITS_ONLY      106
+#define ID_LIST_REGIONS       107
+#define ID_EDIT_HEX           108
+#define ID_BTN_PREV_PAGE      109
+#define ID_BTN_NEXT_PAGE      110
+#define ID_BTN_SNAP           111
+#define ID_COMBO_DIFF         112
+#define ID_BTN_CLEAR_SNAPS    113
+#define ID_CHK_HEARTBEAT      114
+#define ID_BTN_TRIAGE         115
+#define ID_COMBO_VIEW_MODE    116
+#define ID_COMBO_MIN_SEV      117
+#define ID_CHK_HIDE_CLEAN     118
+#define ID_BTN_EXPORT_JSON    119
+#define ID_COMBO_THEME        120
+#define IDT_HEARTBEAT         1001
+
+// Custom window messages for background worker thread scanning & triage
+#define WM_SCAN_PROGRESS      (WM_USER + 1)
+#define WM_SCAN_COMPLETE      (WM_USER + 2)
+#define WM_TRIAGE_COMPLETE    (WM_USER + 3)
 
 // Compiled byte pattern: mask[i] == 1 means exact byte match, 0 means wildcard (??).
 struct Pattern {
@@ -75,36 +92,143 @@ struct Pattern {
 // Snapshot of a memory page for timeline diffing.
 struct Snapshot {
     std::vector<uint8_t> data;
-    SIZE_T view_offset;
-    DWORD timestamp_ms;
+    SIZE_T view_offset = 0;
+    DWORD timestamp_ms = 0;
     std::string label;
 };
 
 // Metadata, detection heuristics, hit offsets, and snapshot timeline for a memory region.
 struct RegionInfo {
-    uintptr_t base;
-    SIZE_T size;
-    DWORD type;
-    DWORD protect;
+    uintptr_t base = 0;
+    SIZE_T size = 0;
+    DWORD type = 0;
+    DWORD protect = 0;
     uintptr_t alloc_base = 0;
     DWORD alloc_protect = 0;
     bool is_unbacked_exec = false;
     bool is_pe_in_private = false;
     bool private_rwx = false;
+    bool write_then_flip = false;
+    bool is_unlinked_image = false;
     std::vector<SIZE_T> hits;
     bool hits_truncated = false;
     std::vector<Snapshot> snapshots;
 };
 
-// Statistics tracked during a CLI memory walk.
-struct ScanStats {
-    SIZE_T regions_scanned;
-    SIZE_T bytes_scanned;
-    SIZE_T total_hits;
+// Triage finding for an individual region
+struct TriageFinding {
+    size_t region_index = 0;
+    uintptr_t base = 0;
+    SIZE_T size = 0;
+    uintptr_t alloc_base = 0;
+    DWORD type = 0;
+    DWORD protect = 0;
+    DWORD alloc_protect = 0;
+    int severity_score = 0;
+    std::string severity_label;        // "CRIT", "HIGH", "MED", "LOW", "CLEAN"
+    std::vector<std::string> flags;    // "INJECTED_PE", "UNLINKED_MODULE", "WRITE_THEN_FLIP", "PRIVATE_RWX", "UNBACKED_EXEC"
+    std::vector<std::string> reasons;  // Detailed explanation strings with point values
+};
+
+// Triage report for the entire process
+struct TriageReport {
+    DWORD pid = 0;
+    bool wow64_unsupported = false;
+    std::vector<TriageFinding> findings;
+};
+
+// Range of a loaded module enumerated from the PEB loader list.
+struct LoadedModuleRange {
+    uintptr_t base = 0;
+    SIZE_T size = 0;
+    std::wstring name;
+};
+
+// Application View Modes
+enum class ViewMode {
+    TriageFindings = 0,
+    MemoryMap      = 1
+};
+
+// Application Color Themes
+enum class AppTheme {
+    ProcessHackerLight = 0,
+    SystemInformerDark = 1
+};
+
+// Process Hacker Theme Colors
+struct PHThemeColors {
+    COLORREF bg_window;
+    COLORREF bg_control;
+    COLORREF text_normal;
+    COLORREF text_muted;
+
+    // Process Hacker Row Highlighting Palette
+    COLORREF row_crit_bg;
+    COLORREF row_crit_text;
+    COLORREF row_rwx_bg;
+    COLORREF row_rwx_text;
+    COLORREF row_pe_bg;
+    COLORREF row_pe_text;
+    COLORREF row_flip_bg;
+    COLORREF row_flip_text;
+    COLORREF row_unlinked_bg;
+    COLORREF row_unlinked_text;
+    COLORREF row_unbacked_bg;
+    COLORREF row_unbacked_text;
+    COLORREF row_priv_bg;
+    COLORREF row_priv_text;
+    COLORREF row_mapped_bg;
+    COLORREF row_mapped_text;
+    COLORREF row_image_bg;
+    COLORREF row_image_text;
+
+    COLORREF row_sel_bg;
+    COLORREF row_sel_text;
+};
+
+// Authentic Process Hacker Classic Light Theme
+static const PHThemeColors g_ph_light = {
+    RGB(240, 240, 240), // bg_window
+    RGB(255, 255, 255), // bg_control
+    RGB(20, 20, 20),    // text_normal
+    RGB(100, 100, 100), // text_muted
+
+    RGB(255, 180, 180), RGB(140, 0, 0),     // Crit (Process Hacker alert red)
+    RGB(255, 192, 192), RGB(150, 0, 0),     // RWX (Process Hacker salmon/red)
+    RGB(232, 208, 255), RGB(75, 0, 130),    // Injected PE (Process Hacker packed purple)
+    RGB(255, 224, 185), RGB(140, 60, 0),    // Write-then-flip (Peach / Orange)
+    RGB(232, 208, 255), RGB(75, 0, 130),    // Unlinked module (Process Hacker purple)
+    RGB(255, 245, 180), RGB(120, 80, 0),    // Unbacked exec (Light gold/yellow)
+    RGB(255, 255, 225), RGB(70, 70, 0),     // MEM_PRIVATE clean (Process Hacker own/private yellow)
+    RGB(230, 242, 255), RGB(0, 60, 120),    // MEM_MAPPED clean (Process Hacker service blue)
+    RGB(255, 255, 255), RGB(20, 20, 20),    // MEM_IMAGE clean (Pure white)
+
+    RGB(51, 153, 255),  RGB(255, 255, 255)   // Selection (Windows blue / white text)
+};
+
+// Authentic System Informer (Process Hacker 3) Dark Theme
+static const PHThemeColors g_ph_dark = {
+    RGB(30, 30, 30),    // bg_window
+    RGB(37, 37, 38),    // bg_control
+    RGB(220, 220, 220), // text_normal
+    RGB(140, 140, 140), // text_muted
+
+    RGB(75, 20, 25),    RGB(255, 140, 140), // Crit (Dark crimson)
+    RGB(70, 25, 25),    RGB(255, 150, 150), // RWX (Deep red)
+    RGB(55, 25, 65),    RGB(220, 160, 255), // Injected PE (Dark violet)
+    RGB(65, 45, 20),    RGB(255, 190, 120), // Write-then-flip (Dark amber)
+    RGB(55, 25, 65),    RGB(220, 160, 255), // Unlinked module (Dark violet)
+    RGB(60, 55, 20),    RGB(255, 230, 130), // Unbacked exec (Dark gold)
+    RGB(42, 42, 30),    RGB(240, 240, 170), // MEM_PRIVATE (Muted yellow tint)
+    RGB(25, 40, 55),    RGB(170, 210, 255), // MEM_MAPPED (Muted blue tint)
+    RGB(37, 37, 38),    RGB(220, 220, 220), // MEM_IMAGE (Neutral dark)
+
+    RGB(26, 95, 180),   RGB(255, 255, 255)  // Selection (Deep slate blue)
 };
 
 // ============================================================================
-// 2. Shared Utilities (Win32, Hex Formatting, Pattern Parser, Matcher)
+// 2. Formatting & Helper Functions
 // ============================================================================
 
 // Formats a Win32 error code into a human-readable string.
@@ -358,14 +482,6 @@ bool has_pe_header(const uint8_t* buf, size_t len) {
             buf[e_lfanew + 3] == '\0');
 }
 
-// Returns a detection marker tag for CLI output.
-std::string get_detection_marker(const RegionInfo& reg) {
-    if (reg.is_pe_in_private)  return "[!PE ]";
-    if (reg.private_rwx)       return "[!RWX]";
-    if (reg.is_unbacked_exec)  return "[!X  ]";
-    return "      ";
-}
-
 // Attempts to enable SeDebugPrivilege for inspecting elevated/service processes.
 bool enable_debug_privilege() {
     HANDLE token = nullptr;
@@ -484,21 +600,8 @@ SIZE_T scan_chunk_robust(HANDLE proc, uintptr_t chunk_addr, SIZE_T to_read,
     return total_read;
 }
 
-// ============================================================================
-// 3. CLI Subsystem
-// ============================================================================
-
-void print_cli_usage(const char* prog_name) {
-    std::cout << "Deadeye - Process Memory Pattern Scanner & Hex Diff Viewer\n"
-              << "Usage:\n"
-              << "  " << prog_name << "                         (Launch GUI viewer)\n"
-              << "  " << prog_name << " <pid|self> \"<pattern>\"    (Headless CLI scan)\n"
-              << "Example:\n"
-              << "  " << prog_name << " 1234 \"4D 5A ?? 00 03\"\n"
-              << "Exit codes: 0=hits found, 1=no hits, 2=bad args, 3=OpenProcess failed\n";
-}
-
-bool parse_pid_arg(const std::string& arg, DWORD& out_pid) {
+// Parses a numeric PID or 'self' string.
+bool parse_pid_string(const std::string& arg, DWORD& out_pid) {
     if (arg == "self") {
         out_pid = GetCurrentProcessId();
         return true;
@@ -517,185 +620,359 @@ bool parse_pid_arg(const std::string& arg, DWORD& out_pid) {
     return true;
 }
 
-void scan_region_cli(HANDLE proc, const MEMORY_BASIC_INFORMATION& mbi, const Pattern& pat, ScanStats& stats) {
-    uintptr_t region_base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-    SIZE_T region_size = mbi.RegionSize;
-    SIZE_T overlap = pat.bytes.size() - 1;
-    SIZE_T offset = 0;
-    SIZE_T prev_overlap = 0;
-    size_t region_hits = 0;
-    bool hits_capped = false;
-    bool pe_found = false;
+// Returns true if allocation was writable and current protection is executable (write-then-flip).
+bool is_write_then_flip(DWORD alloc_protect, DWORD current_protect) {
+    DWORD a_base = alloc_protect & 0xFF;
+    DWORD c_base = current_protect & 0xFF;
 
-    stats.regions_scanned += 1;
-    std::vector<uint8_t> buf(CLI_CHUNK_SIZE);
-    std::vector<SIZE_T> chunk_hits;
+    bool was_writable = (a_base == PAGE_READWRITE || a_base == PAGE_WRITECOPY);
+    bool now_exec = (c_base == PAGE_EXECUTE ||
+                     c_base == PAGE_EXECUTE_READ ||
+                     c_base == PAGE_EXECUTE_READWRITE ||
+                     c_base == PAGE_EXECUTE_WRITECOPY);
 
-    RegionInfo reg;
-    reg.base = region_base;
-    reg.size = region_size;
-    reg.type = mbi.Type;
-    reg.protect = mbi.Protect;
-    reg.alloc_base = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
-    reg.alloc_protect = mbi.AllocationProtect;
-    reg.is_unbacked_exec = is_unbacked_exec(mbi.Type, mbi.Protect);
-    reg.private_rwx = is_private_rwx(mbi.Type, mbi.Protect);
-
-    while (offset < region_size) {
-        SIZE_T remaining = region_size - offset;
-        SIZE_T to_read = (remaining < CLI_CHUNK_SIZE) ? remaining : CLI_CHUNK_SIZE;
-        chunk_hits.clear();
-
-        bool truncated = false;
-        SIZE_T bytes_read = scan_chunk_robust(proc, region_base + offset, to_read,
-                                              &pat, buf, offset, chunk_hits,
-                                              MAX_HITS_PER_REGION - region_hits,
-                                              truncated, pe_found);
-
-        if (mbi.Type == MEM_PRIVATE && pe_found) {
-            reg.is_pe_in_private = true;
-        }
-
-        if (bytes_read > prev_overlap) {
-            stats.bytes_scanned += (bytes_read - prev_overlap);
-        }
-
-        for (SIZE_T h : chunk_hits) {
-            if (region_hits < MAX_HITS_PER_REGION) {
-                uintptr_t hit_addr = region_base + h;
-                std::string marker = get_detection_marker(reg);
-                std::cout << marker << " HIT addr=" << to_hex_string(hit_addr)
-                          << " region_base=" << to_hex_string(region_base)
-                          << " region_size=" << to_hex_string(region_size)
-                          << " alloc_base=" << to_hex_string(reg.alloc_base)
-                          << " type=" << type_full(mbi.Type)
-                          << " protect=" << prot_full(mbi.Protect) << "\n";
-                stats.total_hits += 1;
-                region_hits += 1;
-            } else if (!hits_capped) {
-                hits_capped = true;
-                std::cerr << "[WARN] Region at " << to_hex_string(region_base)
-                          << " exceeded limit of " << MAX_HITS_PER_REGION
-                          << " hits. Truncating further output for this region.\n";
-                break;
-            }
-        }
-
-        if (offset + to_read >= region_size) break;
-        if (bytes_read <= overlap) {
-            offset += to_read;
-            prev_overlap = 0;
-        } else {
-            offset += (bytes_read - overlap);
-            prev_overlap = overlap;
-        }
-    }
+    return was_writable && now_exec;
 }
 
-int run_cli(int argc, char* argv[]) {
-    if (argc < 3) {
-        print_cli_usage(argv[0]);
-        return EXIT_BAD_ARGS;
+typedef NTSTATUS(NTAPI* pfnNtQueryInformationProcess)(
+    HANDLE, ULONG, PVOID, ULONG, PULONG
+);
+
+// Traverses target process PEB loader list (InLoadOrderModuleList) on x64.
+// If target is WOW64 (32-bit on 64-bit Windows), reports out_wow64 = true and returns false.
+bool query_peb_modules_x64(HANDLE proc, std::vector<LoadedModuleRange>& out_modules, bool& out_wow64) {
+    out_modules.clear();
+    out_wow64 = false;
+
+    BOOL is_wow64 = FALSE;
+    if (IsWow64Process(proc, &is_wow64) && is_wow64) {
+        out_wow64 = true;
+        return false;
     }
 
-    DWORD pid = 0;
-    if (!parse_pid_arg(argv[1], pid)) {
-        std::cout << "[ERROR] Invalid PID: '" << argv[1] << "'\n";
-        print_cli_usage(argv[0]);
-        return EXIT_BAD_ARGS;
+    HMODULE h_ntdll = GetModuleHandleA("ntdll.dll");
+    if (h_ntdll == nullptr) return false;
+
+    pfnNtQueryInformationProcess pfnQIP = reinterpret_cast<pfnNtQueryInformationProcess>(
+        reinterpret_cast<void*>(GetProcAddress(h_ntdll, "NtQueryInformationProcess"))
+    );
+    if (pfnQIP == nullptr) return false;
+
+    struct {
+        PVOID ExitStatus;
+        PVOID PebBaseAddress;
+        PVOID AffinityMask;
+        PVOID BasePriority;
+        ULONG_PTR UniqueProcessId;
+        PVOID InheritedFromUniqueProcessId;
+    } pbi = {};
+
+    ULONG ret_len = 0;
+    NTSTATUS status = pfnQIP(proc, 0, &pbi, sizeof(pbi), &ret_len);
+    if (status != 0 || pbi.PebBaseAddress == nullptr) {
+        return false;
     }
 
-    Pattern pat;
-    std::string pat_err;
-    if (!parse_pattern(argv[2], pat, pat_err)) {
-        std::cout << "[ERROR] " << pat_err << "\n";
-        print_cli_usage(argv[0]);
-        return EXIT_BAD_ARGS;
+    uintptr_t peb_addr = reinterpret_cast<uintptr_t>(pbi.PebBaseAddress);
+    uintptr_t ldr_addr = 0;
+    SIZE_T bytes_read = 0;
+    if (!ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(peb_addr + 0x18),
+                           &ldr_addr, sizeof(ldr_addr), &bytes_read) || ldr_addr == 0) {
+        return false;
     }
 
-    HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-    if (proc == nullptr) {
-        DWORD err = GetLastError();
-        std::cout << "[ERROR] OpenProcess failed for PID " << pid << ": "
-                  << format_win32_error(err) << " (err=" << err << ")\n";
-        if (err == ERROR_ACCESS_DENIED) {
-            std::cout << "        Access denied: the target may be a Protected Process (PPL),\n"
-                      << "        running elevated, or require Administrator/SeDebugPrivilege.\n";
+    uintptr_t head = ldr_addr + 0x10;
+    uintptr_t curr = 0;
+    if (!ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(head),
+                           &curr, sizeof(curr), &bytes_read) || curr == 0 || curr == head) {
+        return false;
+    }
+
+    size_t count = 0;
+    while (curr != head && count < 500) {
+        uintptr_t flink = 0;
+        uintptr_t dll_base = 0;
+        ULONG size_of_image = 0;
+        USHORT name_len = 0;
+        uintptr_t name_buf_ptr = 0;
+
+        if (!ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(curr), &flink, sizeof(flink), &bytes_read)) break;
+        ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(curr + 0x30), &dll_base, sizeof(dll_base), &bytes_read);
+        ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(curr + 0x40), &size_of_image, sizeof(size_of_image), &bytes_read);
+        ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(curr + 0x58), &name_len, sizeof(name_len), &bytes_read);
+        ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(curr + 0x60), &name_buf_ptr, sizeof(name_buf_ptr), &bytes_read);
+
+        if (dll_base != 0) {
+            LoadedModuleRange mod;
+            mod.base = dll_base;
+            mod.size = size_of_image;
+            if (name_buf_ptr != 0 && name_len > 0 && name_len < 512) {
+                std::vector<wchar_t> wbuf(name_len / 2 + 1, 0);
+                ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(name_buf_ptr),
+                                  wbuf.data(), name_len, &bytes_read);
+                mod.name = wbuf.data();
+            }
+            out_modules.push_back(mod);
         }
-        return EXIT_OPEN_FAILED;
+
+        curr = flink;
+        count++;
     }
 
-    std::cout << "[Deadeye] Scanning PID " << pid << " for " << pat.bytes.size() << "-byte pattern...\n";
+    return !out_modules.empty();
+}
 
-    ScanStats stats;
-    stats.regions_scanned = 0;
-    stats.bytes_scanned = 0;
-    stats.total_hits = 0;
+// Queries all committed virtual memory regions for the target process.
+// UI-independent core function.
+bool query_process_regions(HANDLE proc, std::vector<RegionInfo>& out_regions, std::string& err_msg) {
+    out_regions.clear();
+    err_msg.clear();
 
     uintptr_t addr = 0;
     MEMORY_BASIC_INFORMATION mbi;
+
     while (true) {
         std::memset(&mbi, 0, sizeof(mbi));
-        SIZE_T queried = VirtualQueryEx(proc, reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi));
-        if (queried == 0) {
+        SIZE_T q = VirtualQueryEx(proc, reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi));
+        if (q == 0) {
             DWORD err = GetLastError();
-            if (err == ERROR_INVALID_PARAMETER) break;
-            std::cerr << "[WARN] VirtualQueryEx failed at " << to_hex_string(addr)
-                      << ": " << format_win32_error(err) << " (err=" << err << ")\n";
+            if (err != ERROR_INVALID_PARAMETER && out_regions.empty()) {
+                err_msg = format_win32_error(err);
+                return false;
+            }
             break;
         }
 
         uintptr_t region_base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
         SIZE_T region_size = mbi.RegionSize;
-        if (mbi.State == MEM_COMMIT && (mbi.Protect & PAGE_NOACCESS) == 0 && (mbi.Protect & PAGE_GUARD) == 0) {
-            scan_region_cli(proc, mbi, pat, stats);
+
+        if (mbi.State == MEM_COMMIT &&
+            (mbi.Protect & PAGE_NOACCESS) == 0 &&
+            (mbi.Protect & PAGE_GUARD) == 0) {
+
+            RegionInfo reg;
+            reg.base = region_base;
+            reg.size = region_size;
+            reg.type = mbi.Type;
+            reg.protect = mbi.Protect;
+            reg.alloc_base = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
+            reg.alloc_protect = mbi.AllocationProtect;
+            reg.is_unbacked_exec = is_unbacked_exec(mbi.Type, mbi.Protect);
+            reg.private_rwx = is_private_rwx(mbi.Type, mbi.Protect);
+            reg.write_then_flip = is_write_then_flip(mbi.AllocationProtect, mbi.Protect);
+
+            out_regions.push_back(reg);
         }
 
         if (region_size == 0) break;
-        uintptr_t next_addr = region_base + region_size;
-        if (next_addr <= addr) break;
-        addr = next_addr;
+        uintptr_t next = region_base + region_size;
+        if (next <= addr) break;
+        addr = next;
     }
 
-    CloseHandle(proc);
+    return true;
+}
 
-    std::cout << "\n--- Deadeye Summary ---\n"
-              << "Regions scanned: " << stats.regions_scanned << "\n"
-              << "Bytes scanned:   " << stats.bytes_scanned << "\n"
-              << "Total hits:      " << stats.total_hits << "\n";
+// Evaluates defensive triage heuristics against process memory regions.
+// UI-independent core function.
+TriageReport run_process_triage(HANDLE proc, DWORD pid, std::vector<RegionInfo>& regions,
+                                volatile bool* abort_flag,
+                                void (*progress_cb)(SIZE_T current, SIZE_T total, void* user_data),
+                                void* user_data) {
+    TriageReport report;
+    report.pid = pid;
 
-    return (stats.total_hits > 0) ? EXIT_HITS_FOUND : EXIT_NO_HITS;
+    std::vector<LoadedModuleRange> peb_modules;
+    bool peb_ok = query_peb_modules_x64(proc, peb_modules, report.wow64_unsupported);
+
+    std::vector<uint8_t> header_buf(4096);
+    SIZE_T total_regions = regions.size();
+
+    for (size_t i = 0; i < regions.size(); ++i) {
+        if (abort_flag != nullptr && *abort_flag) break;
+
+        RegionInfo& reg = regions[i];
+
+        // Check for injected PE header in MEM_PRIVATE regions
+        if (reg.type == MEM_PRIVATE) {
+            SIZE_T to_read = (reg.size < 4096) ? reg.size : 4096;
+            SIZE_T bytes_read = 0;
+            if (ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(reg.base),
+                                  header_buf.data(), to_read, &bytes_read)) {
+                if (has_pe_header(header_buf.data(), bytes_read)) {
+                    reg.is_pe_in_private = true;
+                }
+            }
+        }
+
+        // Check for unlinked MEM_IMAGE allocations (missing from PEB loader list)
+        if (!report.wow64_unsupported && peb_ok && reg.type == MEM_IMAGE && reg.base == reg.alloc_base) {
+            bool in_peb = false;
+            for (const auto& mod : peb_modules) {
+                if (mod.base == reg.base) {
+                    in_peb = true;
+                    break;
+                }
+            }
+            if (!in_peb) {
+                reg.is_unlinked_image = true;
+            }
+        }
+
+        // Calculate additive triage severity score
+        TriageFinding finding;
+        finding.region_index = i;
+        finding.base = reg.base;
+        finding.size = reg.size;
+        finding.alloc_base = reg.alloc_base;
+        finding.type = reg.type;
+        finding.protect = reg.protect;
+        finding.alloc_protect = reg.alloc_protect;
+        finding.severity_score = 0;
+
+        if (reg.is_pe_in_private) {
+            finding.severity_score += WEIGHT_INJECTED_PE;
+            finding.flags.push_back("INJECTED_PE");
+            finding.reasons.push_back("Injected PE/Reflective DLL header in private memory (+" +
+                                     std::to_string(WEIGHT_INJECTED_PE) + ")");
+        }
+        if (reg.is_unlinked_image) {
+            finding.severity_score += WEIGHT_UNLINKED_MODULE;
+            finding.flags.push_back("UNLINKED_MODULE");
+            finding.reasons.push_back("Image allocation unlinked from PEB loader list (+" +
+                                     std::to_string(WEIGHT_UNLINKED_MODULE) + ")");
+        }
+        if (reg.private_rwx) {
+            finding.severity_score += WEIGHT_PRIVATE_RWX;
+            finding.flags.push_back("PRIVATE_RWX");
+            finding.reasons.push_back("Private memory with RWX/RXC protection (+" +
+                                     std::to_string(WEIGHT_PRIVATE_RWX) + ")");
+        }
+        if (reg.write_then_flip) {
+            finding.severity_score += WEIGHT_WRITE_THEN_FLIP;
+            finding.flags.push_back("WRITE_THEN_FLIP");
+            finding.reasons.push_back("Write-then-flip: allocated writable, currently executable (+" +
+                                     std::to_string(WEIGHT_WRITE_THEN_FLIP) + ")");
+        }
+        if (reg.is_unbacked_exec) {
+            finding.severity_score += WEIGHT_UNBACKED_EXEC;
+            finding.flags.push_back("UNBACKED_EXEC");
+            finding.reasons.push_back("Executable memory not backed by a disk image (+" +
+                                     std::to_string(WEIGHT_UNBACKED_EXEC) + ")");
+        }
+
+        if (finding.severity_score >= SEV_MIN_CRITICAL) finding.severity_label = "CRIT";
+        else if (finding.severity_score >= SEV_MIN_HIGH) finding.severity_label = "HIGH";
+        else if (finding.severity_score >= SEV_MIN_MEDIUM) finding.severity_label = "MED";
+        else if (finding.severity_score >= SEV_MIN_LOW) finding.severity_label = "LOW";
+        else finding.severity_label = "CLEAN";
+
+        report.findings.push_back(finding);
+
+        if (progress_cb != nullptr && (i % 20 == 0 || i + 1 == total_regions)) {
+            progress_cb(i + 1, total_regions, user_data);
+        }
+    }
+
+    // Sort findings by severity score descending (highest threat first)
+    std::stable_sort(report.findings.begin(), report.findings.end(),
+                     [](const TriageFinding& a, const TriageFinding& b) {
+                         return a.severity_score > b.severity_score;
+                     });
+
+    return report;
+}
+
+// Serializes a TriageReport into valid JSON.
+// UI-independent core function.
+std::string export_triage_json(const TriageReport& report) {
+    std::string json;
+    json.reserve(report.findings.size() * 512 + 256);
+    json += "{\n";
+    json += "  \"pid\": " + std::to_string(report.pid) + ",\n";
+    json += "  \"wow64_unsupported\": " + std::string(report.wow64_unsupported ? "true" : "false") + ",\n";
+    json += "  \"findings_count\": " + std::to_string(report.findings.size()) + ",\n";
+    json += "  \"findings\": [\n";
+
+    for (size_t i = 0; i < report.findings.size(); ++i) {
+        const TriageFinding& f = report.findings[i];
+        json += "    {\n";
+        json += "      \"base\": \"" + to_hex_string(f.base) + "\",\n";
+        json += "      \"size\": " + std::to_string(f.size) + ",\n";
+        json += "      \"alloc_base\": \"" + to_hex_string(f.alloc_base) + "\",\n";
+        json += "      \"type\": \"" + type_full(f.type) + "\",\n";
+        json += "      \"protect\": \"" + prot_full(f.protect) + "\",\n";
+        json += "      \"alloc_protect\": \"" + prot_full(f.alloc_protect) + "\",\n";
+        json += "      \"severity_score\": " + std::to_string(f.severity_score) + ",\n";
+        json += "      \"severity_label\": \"" + f.severity_label + "\",\n";
+
+        json += "      \"flags\": [";
+        for (size_t k = 0; k < f.flags.size(); ++k) {
+            json += "\"" + f.flags[k] + "\"" + (k + 1 < f.flags.size() ? ", " : "");
+        }
+        json += "],\n";
+
+        json += "      \"reasons\": [\n";
+        for (size_t k = 0; k < f.reasons.size(); ++k) {
+            json += "        \"" + f.reasons[k] + "\"" + (k + 1 < f.reasons.size() ? ",\n" : "\n");
+        }
+        json += "      ]\n";
+        json += "    }" + std::string(i + 1 < report.findings.size() ? ",\n" : "\n");
+    }
+
+    json += "  ]\n";
+    json += "}\n";
+    return json;
 }
 
 // ============================================================================
-// 4. GUI Subsystem (Memory Map, Hex Viewer, Heartbeat Diff Timeline)
+// 3. GUI Subsystem (Process Hacker Theme, Owner-Draw, Memory Hex Viewer)
 // ============================================================================
 
-static HWND g_hwnd_main       = nullptr;
-static HWND g_edit_pid        = nullptr;
-static HWND g_btn_load        = nullptr;
-static HWND g_edit_pattern    = nullptr;
-static HWND g_btn_search      = nullptr;
-static HWND g_btn_next_hit    = nullptr;
-static HWND g_chk_hits_only   = nullptr;
-static HWND g_chk_heartbeat   = nullptr;
-static HWND g_list_regions    = nullptr;
-static HWND g_lbl_hex_info    = nullptr;
-static HWND g_btn_prev_page   = nullptr;
-static HWND g_btn_next_page   = nullptr;
-static HWND g_btn_snap        = nullptr;
-static HWND g_combo_diff      = nullptr;
-static HWND g_btn_clear_snaps = nullptr;
-static HWND g_edit_hex        = nullptr;
-static HWND g_lbl_status      = nullptr;
-static HFONT g_mono_font      = nullptr;
-static HFONT g_ui_font        = nullptr;
+static HWND g_hwnd_main          = nullptr;
+static HWND g_edit_pid           = nullptr;
+static HWND g_btn_load           = nullptr;
+static HWND g_btn_triage         = nullptr;
+static HWND g_edit_pattern       = nullptr;
+static HWND g_btn_search         = nullptr;
+static HWND g_btn_next_hit       = nullptr;
+static HWND g_chk_hits_only      = nullptr;
+static HWND g_chk_heartbeat      = nullptr;
+static HWND g_combo_theme        = nullptr;
+
+static HWND g_combo_view_mode    = nullptr;
+static HWND g_combo_min_sev      = nullptr;
+static HWND g_chk_hide_clean     = nullptr;
+static HWND g_btn_export_json    = nullptr;
+
+static HWND g_list_regions       = nullptr;
+static HWND g_lbl_hex_info       = nullptr;
+static HWND g_btn_prev_page      = nullptr;
+static HWND g_btn_next_page      = nullptr;
+static HWND g_btn_snap           = nullptr;
+static HWND g_combo_diff         = nullptr;
+static HWND g_btn_clear_snaps    = nullptr;
+static HWND g_edit_hex           = nullptr;
+static HWND g_lbl_triage_reasons = nullptr;
+static HWND g_lbl_status         = nullptr;
+
+static HFONT g_mono_font         = nullptr;
+static HFONT g_ui_font           = nullptr;
+static HFONT g_ui_font_bold      = nullptr;
+static HBRUSH g_br_window        = nullptr;
+static HBRUSH g_br_control       = nullptr;
+
+static AppTheme g_theme          = AppTheme::ProcessHackerLight;
+static ViewMode g_view_mode      = ViewMode::TriageFindings;
+static int g_min_sev_filter      = 0;
+static bool g_hide_clean         = false;
 
 static DWORD g_current_pid = 0;
 static std::string g_current_pid_label;
 static Pattern g_active_pattern;
 static bool g_has_pattern = false;
 static std::vector<RegionInfo> g_regions;
+static TriageReport g_triage_report;
 static std::vector<size_t> g_visible_indices;
 static size_t g_selected_region = 0;
 static bool g_has_selection = false;
@@ -733,6 +1010,18 @@ void invalidate_hex_cache() {
 
 void set_status(const std::string& text) {
     SetWindowTextA(g_lbl_status, text.c_str());
+}
+
+const PHThemeColors& get_current_theme() {
+    return (g_theme == AppTheme::ProcessHackerLight) ? g_ph_light : g_ph_dark;
+}
+
+void update_theme_brushes() {
+    if (g_br_window)  DeleteObject(g_br_window);
+    if (g_br_control) DeleteObject(g_br_control);
+    const PHThemeColors& tc = get_current_theme();
+    g_br_window  = CreateSolidBrush(tc.bg_window);
+    g_br_control = CreateSolidBrush(tc.bg_control);
 }
 
 struct DiffPair {
@@ -884,7 +1173,7 @@ std::string build_hex_dump(const uint8_t* buf, size_t buf_len, uintptr_t view_ad
         out += "\r\n";
         line_counter++;
 
-        // Sub-row for changed bytes
+        // Sub-row for changed bytes in diff timeline
         if (row_has_diff && ref_buf != nullptr) {
             out += "        old:          ";
             for (size_t i = rs; i < rs + 16; ++i) {
@@ -914,6 +1203,7 @@ std::string build_hex_dump(const uint8_t* buf, size_t buf_len, uintptr_t view_ad
 
 void display_selected_region(SIZE_T focus_offset);
 void populate_region_list();
+void update_triage_details_label(size_t reg_idx);
 
 void update_diff_combo() {
     SendMessageA(g_combo_diff, CB_RESETCONTENT, 0, 0);
@@ -1105,7 +1395,6 @@ void display_selected_region(SIZE_T focus_offset) {
 
     if (dp.active) {
         if (dp.cmp_data != nullptr) {
-            // Snapshot vs Snapshot diff
             display_view_offset = dp.cmp_view_offset;
             display_addr = reg.base + display_view_offset;
             if (dp.ref_view_offset != dp.cmp_view_offset) {
@@ -1115,7 +1404,6 @@ void display_selected_region(SIZE_T focus_offset) {
                 ref_len = dp.ref_data->size();
             }
         } else {
-            // Live vs Snapshot diff
             if (dp.ref_view_offset == g_view_offset) {
                 ref_ptr = dp.ref_data->data();
                 ref_len = dp.ref_data->size();
@@ -1212,6 +1500,35 @@ void display_selected_region(SIZE_T focus_offset) {
     }
 }
 
+void update_triage_details_label(size_t reg_idx) {
+    if (reg_idx >= g_regions.size()) {
+        SetWindowTextA(g_lbl_triage_reasons, "Details: Ready.");
+        return;
+    }
+    const RegionInfo& reg = g_regions[reg_idx];
+
+    const TriageFinding* match = nullptr;
+    for (const auto& f : g_triage_report.findings) {
+        if (f.region_index == reg_idx) {
+            match = &f;
+            break;
+        }
+    }
+
+    if (match != nullptr && !match->reasons.empty()) {
+        std::string text = "Details [" + match->severity_label + " " + std::to_string(match->severity_score) + "]: ";
+        for (size_t i = 0; i < match->reasons.size(); ++i) {
+            text += match->reasons[i];
+            if (i + 1 < match->reasons.size()) text += " | ";
+        }
+        SetWindowTextA(g_lbl_triage_reasons, text.c_str());
+    } else {
+        std::string text = "Details [CLEAN 0]: Normal " + type_full(reg.type) + " memory (" +
+                           prot_full(reg.protect) + "), AllocBase " + to_hex_string(reg.alloc_base);
+        SetWindowTextA(g_lbl_triage_reasons, text.c_str());
+    }
+}
+
 void populate_region_list() {
     SendMessageA(g_list_regions, WM_SETREDRAW, FALSE, 0);
     SendMessageA(g_list_regions, LB_RESETCONTENT, 0, 0);
@@ -1219,44 +1536,103 @@ void populate_region_list() {
 
     bool hits_only = (SendMessageA(g_chk_hits_only, BM_GETCHECK, 0, 0) == BST_CHECKED);
 
-    for (size_t i = 0; i < g_regions.size(); ++i) {
-        const RegionInfo& r = g_regions[i];
-        if (hits_only && r.hits.empty()) {
-            continue;
-        }
+    if (g_view_mode == ViewMode::TriageFindings) {
+        for (size_t i = 0; i < g_triage_report.findings.size(); ++i) {
+            const TriageFinding& f = g_triage_report.findings[i];
+            if (f.region_index >= g_regions.size()) continue;
+            const RegionInfo& r = g_regions[f.region_index];
 
-        char row[192];
-        std::string tag;
-        if (!r.hits.empty()) {
-            char hbuf[48];
-            if (r.hits_truncated) {
-                std::snprintf(hbuf, sizeof(hbuf), " [%zu+ hits (capped)]", r.hits.size());
-            } else {
-                std::snprintf(hbuf, sizeof(hbuf), " [%zu hit%s]", r.hits.size(), r.hits.size() == 1 ? "" : "s");
+            if (f.severity_score < g_min_sev_filter) continue;
+            if (g_hide_clean && f.severity_score == 0) continue;
+            if (hits_only && r.hits.empty()) continue;
+
+            char sev_badge[32];
+            std::snprintf(sev_badge, sizeof(sev_badge), "[%-4s %3d]", f.severity_label.c_str(), f.severity_score);
+
+            std::string flg_str;
+            for (const auto& flg : f.flags) {
+                if (flg == "INJECTED_PE") flg_str += "!PE ";
+                else if (flg == "UNLINKED_MODULE") flg_str += "!UNL ";
+                else if (flg == "PRIVATE_RWX") flg_str += "!RWX ";
+                else if (flg == "WRITE_THEN_FLIP") flg_str += "!FLIP ";
+                else if (flg == "UNBACKED_EXEC") flg_str += "!X ";
             }
-            tag += hbuf;
+            if (flg_str.empty()) flg_str = "      ";
+            while (flg_str.size() < 14) flg_str.push_back(' ');
+
+            std::string tag;
+            if (!r.hits.empty()) {
+                tag += " [" + std::to_string(r.hits.size()) + "h]";
+            }
+            if (!r.snapshots.empty()) {
+                tag += " (" + std::to_string(r.snapshots.size()) + "s)";
+            }
+
+            char row[256];
+            std::snprintf(row, sizeof(row), "%-11s %-14s %016llX %s %-4s %-4s%s",
+                          sev_badge, flg_str.c_str(),
+                          static_cast<unsigned long long>(f.base),
+                          fmt_size_short(f.size).c_str(),
+                          type_short(f.type).c_str(),
+                          prot_short(f.protect).c_str(),
+                          tag.c_str());
+
+            SendMessageA(g_list_regions, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(row));
+            g_visible_indices.push_back(f.region_index);
         }
-        if (!r.snapshots.empty()) {
-            char sbuf[32];
-            std::snprintf(sbuf, sizeof(sbuf), " (%zu snap%s)", r.snapshots.size(), r.snapshots.size() == 1 ? "" : "s");
-            tag += sbuf;
+    } else {
+        // ViewMode::MemoryMap
+        for (size_t i = 0; i < g_regions.size(); ++i) {
+            const RegionInfo& r = g_regions[i];
+            if (hits_only && r.hits.empty()) continue;
+
+            // Find severity for filtering in map mode
+            int sev = 0;
+            for (const auto& f : g_triage_report.findings) {
+                if (f.region_index == i) {
+                    sev = f.severity_score;
+                    break;
+                }
+            }
+
+            if (sev < g_min_sev_filter) continue;
+            if (g_hide_clean && sev == 0) continue;
+
+            char row[256];
+            std::string tag;
+            if (!r.hits.empty()) {
+                char hbuf[48];
+                if (r.hits_truncated) {
+                    std::snprintf(hbuf, sizeof(hbuf), " [%zu+ hits (capped)]", r.hits.size());
+                } else {
+                    std::snprintf(hbuf, sizeof(hbuf), " [%zu hit%s]", r.hits.size(), r.hits.size() == 1 ? "" : "s");
+                }
+                tag += hbuf;
+            }
+            if (!r.snapshots.empty()) {
+                char sbuf[32];
+                std::snprintf(sbuf, sizeof(sbuf), " (%zu snap%s)", r.snapshots.size(), r.snapshots.size() == 1 ? "" : "s");
+                tag += sbuf;
+            }
+
+            std::string flag = "    ";
+            if (r.is_pe_in_private) flag = "!PE ";
+            else if (r.private_rwx) flag = "!RWX";
+            else if (r.write_then_flip) flag = "!FLP";
+            else if (r.is_unlinked_image) flag = "!UNL";
+            else if (r.is_unbacked_exec) flag = "!X  ";
+
+            std::snprintf(row, sizeof(row), "%016llX %s %s %s %s%s",
+                          static_cast<unsigned long long>(r.base),
+                          fmt_size_short(r.size).c_str(),
+                          type_short(r.type).c_str(),
+                          prot_short(r.protect).c_str(),
+                          flag.c_str(),
+                          tag.c_str());
+
+            SendMessageA(g_list_regions, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(row));
+            g_visible_indices.push_back(i);
         }
-
-        std::string flag = "    ";
-        if (r.is_pe_in_private) flag = "!PE ";
-        else if (r.private_rwx) flag = "!RWX";
-        else if (r.is_unbacked_exec) flag = "!X  ";
-
-        std::snprintf(row, sizeof(row), "%016llX %s %s %s %s%s",
-                      static_cast<unsigned long long>(r.base),
-                      fmt_size_short(r.size).c_str(),
-                      type_short(r.type).c_str(),
-                      prot_short(r.protect).c_str(),
-                      flag.c_str(),
-                      tag.c_str());
-
-        SendMessageA(g_list_regions, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(row));
-        g_visible_indices.push_back(i);
     }
 
     SendMessageA(g_list_regions, WM_SETREDRAW, TRUE, 0);
@@ -1277,17 +1653,87 @@ void select_region_in_ui(size_t region_idx, SIZE_T view_offset, SIZE_T focus_off
     update_diff_combo();
     invalidate_hex_cache();
     display_selected_region(focus_offset);
+    update_triage_details_label(region_idx);
 }
 
-struct ScanTask {
+// Process Hacker Item Drawing Handler
+void draw_region_list_item(DRAWITEMSTRUCT* dis) {
+    if (dis->itemID == static_cast<UINT>(-1)) return;
+    size_t vis_idx = static_cast<size_t>(dis->itemID);
+    if (vis_idx >= g_visible_indices.size()) return;
+
+    size_t reg_idx = g_visible_indices[vis_idx];
+    if (reg_idx >= g_regions.size()) return;
+    const RegionInfo& reg = g_regions[reg_idx];
+
+    const PHThemeColors& tc = get_current_theme();
+    bool is_selected = (dis->itemState & ODS_SELECTED) != 0;
+
+    COLORREF bg_color = tc.row_image_bg;
+    COLORREF text_color = tc.row_image_text;
+
+    // Apply authentic Process Hacker highlight colors based on region threat indicators
+    if (reg.is_pe_in_private) {
+        bg_color = tc.row_pe_bg;
+        text_color = tc.row_pe_text;
+    } else if (reg.private_rwx) {
+        bg_color = tc.row_rwx_bg;
+        text_color = tc.row_rwx_text;
+    } else if (reg.write_then_flip) {
+        bg_color = tc.row_flip_bg;
+        text_color = tc.row_flip_text;
+    } else if (reg.is_unlinked_image) {
+        bg_color = tc.row_unlinked_bg;
+        text_color = tc.row_unlinked_text;
+    } else if (reg.is_unbacked_exec) {
+        bg_color = tc.row_unbacked_bg;
+        text_color = tc.row_unbacked_text;
+    } else if (reg.type == MEM_PRIVATE) {
+        bg_color = tc.row_priv_bg;
+        text_color = tc.row_priv_text;
+    } else if (reg.type == MEM_MAPPED) {
+        bg_color = tc.row_mapped_bg;
+        text_color = tc.row_mapped_text;
+    }
+
+    if (is_selected) {
+        bg_color = tc.row_sel_bg;
+        text_color = tc.row_sel_text;
+    }
+
+    HDC hdc = dis->hDC;
+    HBRUSH hbr = CreateSolidBrush(bg_color);
+    FillRect(hdc, &dis->rcItem, hbr);
+    DeleteObject(hbr);
+
+    char buf[256] = {};
+    SendMessageA(dis->hwndItem, LB_GETTEXT, dis->itemID, reinterpret_cast<LPARAM>(buf));
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, text_color);
+    SelectObject(hdc, g_mono_font);
+
+    RECT text_rc = dis->rcItem;
+    text_rc.left += 6; // Process Hacker left padding
+    DrawTextA(hdc, buf, -1, &text_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+}
+
+enum class WorkerTaskType {
+    MemoryMapScan = 0,
+    Triage        = 1
+};
+
+struct WorkerTask {
     HWND hwnd;
     DWORD pid;
     std::string pid_label;
     Pattern pat;
     bool use_pattern;
+    WorkerTaskType task_type;
 };
 
-struct ScanResult {
+struct WorkerResult {
+    WorkerTaskType task_type;
     DWORD pid;
     std::string pid_label;
     Pattern pat;
@@ -1296,6 +1742,7 @@ struct ScanResult {
     DWORD error_code;
     std::string error_msg;
     std::vector<RegionInfo> regions;
+    TriageReport report;
     SIZE_T total_bytes;
     SIZE_T total_hits;
     size_t regions_with_hits;
@@ -1304,9 +1751,10 @@ struct ScanResult {
 static HANDLE g_h_worker_thread = nullptr;
 static volatile bool g_scan_abort = false;
 
-DWORD WINAPI ScanWorkerThread(LPVOID param) {
-    ScanTask* task = reinterpret_cast<ScanTask*>(param);
-    ScanResult* res = new ScanResult();
+DWORD WINAPI WorkerThreadProc(LPVOID param) {
+    WorkerTask* task = reinterpret_cast<WorkerTask*>(param);
+    WorkerResult* res = new WorkerResult();
+    res->task_type = task->task_type;
     res->pid = task->pid;
     res->pid_label = task->pid_label;
     res->pat = task->pat;
@@ -1324,10 +1772,40 @@ DWORD WINAPI ScanWorkerThread(LPVOID param) {
     if (proc == nullptr) {
         res->error_code = GetLastError();
         res->error_msg = format_win32_error(res->error_code);
-        PostMessageA(hwnd, WM_SCAN_COMPLETE, FALSE, reinterpret_cast<LPARAM>(res));
+        PostMessageA(hwnd, (res->task_type == WorkerTaskType::Triage) ? WM_TRIAGE_COMPLETE : WM_SCAN_COMPLETE,
+                     FALSE, reinterpret_cast<LPARAM>(res));
         return 0;
     }
 
+    if (res->task_type == WorkerTaskType::Triage) {
+        std::string err;
+        if (!query_process_regions(proc, res->regions, err)) {
+            res->error_code = GetLastError();
+            res->error_msg = err.empty() ? format_win32_error(res->error_code) : err;
+            CloseHandle(proc);
+            PostMessageA(hwnd, WM_TRIAGE_COMPLETE, FALSE, reinterpret_cast<LPARAM>(res));
+            return 0;
+        }
+
+        auto triage_cb = [](SIZE_T cur, SIZE_T tot, void* u) {
+            HWND h = reinterpret_cast<HWND>(u);
+            PostMessageA(h, WM_SCAN_PROGRESS, cur, tot);
+        };
+
+        res->report = run_process_triage(proc, res->pid, res->regions, &g_scan_abort, triage_cb, hwnd);
+        CloseHandle(proc);
+
+        if (g_scan_abort) {
+            delete res;
+            return 0;
+        }
+
+        res->success = true;
+        PostMessageA(hwnd, WM_TRIAGE_COMPLETE, TRUE, reinterpret_cast<LPARAM>(res));
+        return 0;
+    }
+
+    // MemoryMapScan (Load / Search)
     std::vector<uint8_t> chunk_buf(CLI_CHUNK_SIZE);
     std::vector<SIZE_T> chunk_hits;
     uintptr_t addr = 0;
@@ -1355,6 +1833,7 @@ DWORD WINAPI ScanWorkerThread(LPVOID param) {
             reg.alloc_protect = mbi.AllocationProtect;
             reg.is_unbacked_exec = is_unbacked_exec(mbi.Type, mbi.Protect);
             reg.private_rwx = is_private_rwx(mbi.Type, mbi.Protect);
+            reg.write_then_flip = is_write_then_flip(mbi.AllocationProtect, mbi.Protect);
 
             SIZE_T offset = 0;
             SIZE_T overlap = (res->use_pattern && !res->pat.bytes.empty()) ? (res->pat.bytes.size() - 1) : 0;
@@ -1425,6 +1904,11 @@ DWORD WINAPI ScanWorkerThread(LPVOID param) {
         addr = next;
     }
 
+    if (!g_scan_abort) {
+        // Automatically evaluate triage findings on the loaded regions
+        res->report = run_process_triage(proc, res->pid, res->regions, &g_scan_abort, nullptr, nullptr);
+    }
+
     CloseHandle(proc);
 
     if (g_scan_abort) {
@@ -1437,19 +1921,24 @@ DWORD WINAPI ScanWorkerThread(LPVOID param) {
     return 0;
 }
 
-void on_scan_completed(ScanResult* res) {
-    EnableWindow(g_btn_load, TRUE);
-    EnableWindow(g_btn_search, TRUE);
-    EnableWindow(g_edit_pid, TRUE);
-    EnableWindow(g_edit_pattern, TRUE);
+void enable_ui_controls(BOOL enable) {
+    EnableWindow(g_btn_load, enable);
+    EnableWindow(g_btn_triage, enable);
+    EnableWindow(g_btn_search, enable);
+    EnableWindow(g_edit_pid, enable);
+    EnableWindow(g_edit_pattern, enable);
+}
+
+void on_worker_completed(WorkerResult* res) {
+    enable_ui_controls(TRUE);
 
     if (!res->success) {
         std::string msg = "Cannot open PID " + std::to_string(res->pid) + ": " + res->error_msg;
         if (res->error_code == ERROR_ACCESS_DENIED) {
-            msg += "\n\nRun as Administrator or target a non-protected user process.";
+            msg += "\n\nRun elevated or inspect a non-protected process.";
         }
         set_status("[ERROR] " + msg);
-        MessageBoxA(g_hwnd_main, msg.c_str(), "Scan Error", MB_ICONERROR);
+        MessageBoxA(g_hwnd_main, msg.c_str(), "Deadeye Scanner", MB_ICONERROR);
         return;
     }
 
@@ -1457,6 +1946,7 @@ void on_scan_completed(ScanResult* res) {
     invalidate_hex_cache();
 
     g_regions = std::move(res->regions);
+    g_triage_report = std::move(res->report);
     g_current_pid = res->pid;
     g_current_pid_label = res->pid_label;
     g_active_pattern = res->pat;
@@ -1466,54 +1956,59 @@ void on_scan_completed(ScanResult* res) {
 
     EnableWindow(g_btn_next_hit, (g_has_pattern && res->total_hits > 0) ? TRUE : FALSE);
 
-    populate_region_list();
-
-    size_t first_hit_region = 0;
-    bool found_hit = false;
-    if (g_has_pattern) {
-        for (size_t i = 0; i < g_regions.size(); ++i) {
-            if (!g_regions[i].hits.empty()) {
-                first_hit_region = i;
-                found_hit = true;
-                break;
-            }
-        }
+    if (res->task_type == WorkerTaskType::Triage) {
+        g_view_mode = ViewMode::TriageFindings;
+        SendMessageA(g_combo_view_mode, CB_SETCURSEL, 0, 0);
     }
 
-    if (g_has_pattern && found_hit) {
-        g_hit_cursor_region = first_hit_region;
-        g_hit_cursor_index = 0;
-        SIZE_T hit_off = g_regions[first_hit_region].hits[0];
-        SIZE_T page_off = (hit_off / VIEW_PAGE_SIZE) * VIEW_PAGE_SIZE;
-        select_region_in_ui(first_hit_region, page_off, hit_off);
-    } else if (!g_visible_indices.empty()) {
+    populate_region_list();
+
+    // Select the first finding or region
+    if (!g_visible_indices.empty()) {
         select_region_in_ui(g_visible_indices[0], 0, static_cast<SIZE_T>(-1));
     } else {
         update_diff_combo();
         display_selected_region(static_cast<SIZE_T>(-1));
+        SetWindowTextA(g_lbl_triage_reasons, "Details: Ready.");
+    }
+
+    // Calculate threat breakdown
+    size_t crit = 0, high = 0, med = 0, low = 0;
+    for (const auto& f : g_triage_report.findings) {
+        if (f.severity_label == "CRIT") crit++;
+        else if (f.severity_label == "HIGH") high++;
+        else if (f.severity_label == "MED") med++;
+        else if (f.severity_label == "LOW") low++;
     }
 
     double mb = static_cast<double>(res->total_bytes) / (1024.0 * 1024.0);
-    char status[256];
-    if (g_has_pattern) {
+    char status[320];
+    if (res->task_type == WorkerTaskType::Triage) {
         std::snprintf(status, sizeof(status),
-                      "PID %lu (%s): %zu regions, %.2f MB scanned | %zu hit(s) in %zu region(s) | Click any region to view hex",
+                      "Triage complete for PID %lu (%s): %zu regions | Threats: %zu CRIT, %zu HIGH, %zu MED, %zu LOW%s",
                       static_cast<unsigned long>(res->pid), res->pid_label.c_str(),
-                      g_regions.size(), mb, res->total_hits, res->regions_with_hits);
+                      g_regions.size(), crit, high, med, low,
+                      res->report.wow64_unsupported ? " (WOW64: PEB unlinked check unsupported)" : "");
+    } else if (g_has_pattern) {
+        std::snprintf(status, sizeof(status),
+                      "PID %lu (%s): %zu regions, %.2f MB scanned | %zu hit(s) in %zu region(s) | Triage: %zu Suspicious",
+                      static_cast<unsigned long>(res->pid), res->pid_label.c_str(),
+                      g_regions.size(), mb, res->total_hits, res->regions_with_hits,
+                      crit + high + med);
     } else {
         std::snprintf(status, sizeof(status),
-                      "PID %lu (%s): Loaded %zu committed regions (%.2f MB) | Click any region on the left to inspect its hex",
+                      "PID %lu (%s): Loaded %zu committed regions (%.2f MB) | Triage: %zu Suspicious (%zu CRIT, %zu HIGH)",
                       static_cast<unsigned long>(res->pid), res->pid_label.c_str(),
-                      g_regions.size(), mb);
+                      g_regions.size(), mb, crit + high + med, crit, high);
     }
     set_status(status);
 }
 
-void run_load_or_search(bool require_pattern) {
+void start_worker_task(WorkerTaskType task_type, bool require_pattern) {
     if (g_h_worker_thread != nullptr) {
         DWORD exit_code = 0;
         if (GetExitCodeThread(g_h_worker_thread, &exit_code) && exit_code == STILL_ACTIVE) {
-            set_status("Scan already in progress. Please wait...");
+            set_status("Operation already in progress. Please wait...");
             return;
         }
         CloseHandle(g_h_worker_thread);
@@ -1529,8 +2024,8 @@ void run_load_or_search(bool require_pattern) {
     std::string pat_str(pat_buf);
 
     DWORD pid = 0;
-    if (!parse_pid_arg(pid_str, pid)) {
-        MessageBoxA(g_hwnd_main, "Enter a numeric PID or 'self'.", "Invalid PID", MB_ICONWARNING);
+    if (!parse_pid_string(pid_str, pid)) {
+        MessageBoxA(g_hwnd_main, "Enter a valid numeric PID or 'self'.", "Invalid Target PID", MB_ICONWARNING);
         return;
     }
 
@@ -1543,13 +2038,13 @@ void run_load_or_search(bool require_pattern) {
     }
 
     if (require_pattern && trim_empty) {
-        MessageBoxA(g_hwnd_main, "Enter a hex pattern to search (e.g. '4D 5A ?? 00'), or click 'Load' to view memory without searching.",
+        MessageBoxA(g_hwnd_main, "Enter a hex pattern to search (e.g. '4D 5A ?? 00'), or click 'Load' / 'Triage'.",
                     "Pattern Required", MB_ICONINFORMATION);
         return;
     }
 
     Pattern pat;
-    bool use_pattern = !trim_empty;
+    bool use_pattern = !trim_empty && (task_type == WorkerTaskType::MemoryMapScan);
     if (use_pattern) {
         std::string err;
         if (!parse_pattern(pat_str, pat, err)) {
@@ -1560,30 +2055,29 @@ void run_load_or_search(bool require_pattern) {
 
     close_target_proc();
     invalidate_hex_cache();
-
-    set_status(use_pattern ? "Scanning process memory in background..." : "Loading process memory map in background...");
-    EnableWindow(g_btn_load, FALSE);
-    EnableWindow(g_btn_search, FALSE);
+    enable_ui_controls(FALSE);
     EnableWindow(g_btn_next_hit, FALSE);
-    EnableWindow(g_edit_pid, FALSE);
-    EnableWindow(g_edit_pattern, FALSE);
 
-    ScanTask* task = new ScanTask();
+    if (task_type == WorkerTaskType::Triage) {
+        set_status("Triaging process memory in background...");
+    } else {
+        set_status(use_pattern ? "Scanning process memory in background..." : "Loading process memory map in background...");
+    }
+
+    WorkerTask* task = new WorkerTask();
     task->hwnd = g_hwnd_main;
     task->pid = pid;
     task->pid_label = pid_str;
     task->pat = pat;
     task->use_pattern = use_pattern;
+    task->task_type = task_type;
 
     g_scan_abort = false;
-    g_h_worker_thread = CreateThread(nullptr, 0, ScanWorkerThread, task, 0, nullptr);
+    g_h_worker_thread = CreateThread(nullptr, 0, WorkerThreadProc, task, 0, nullptr);
     if (g_h_worker_thread == nullptr) {
         DWORD err = GetLastError();
         delete task;
-        EnableWindow(g_btn_load, TRUE);
-        EnableWindow(g_btn_search, TRUE);
-        EnableWindow(g_edit_pid, TRUE);
-        EnableWindow(g_edit_pattern, TRUE);
+        enable_ui_controls(TRUE);
         set_status("[ERROR] CreateThread failed: " + format_win32_error(err));
         MessageBoxA(g_hwnd_main, "Failed to launch background worker thread.", "Thread Error", MB_ICONERROR);
     }
@@ -1623,154 +2117,301 @@ void on_next_hit() {
     set_status(status);
 }
 
+void on_export_json() {
+    if (g_triage_report.findings.empty() && g_regions.empty()) {
+        MessageBoxA(g_hwnd_main, "Please Load or Triage a target process before exporting findings.",
+                    "No Data", MB_ICONINFORMATION);
+        return;
+    }
+
+    if (g_triage_report.findings.empty()) {
+        HANDLE proc = get_or_open_target_proc(g_current_pid);
+        if (proc != nullptr) {
+            g_triage_report = run_process_triage(proc, g_current_pid, g_regions, nullptr, nullptr, nullptr);
+        }
+    }
+
+    char filename_buf[MAX_PATH] = {};
+    std::snprintf(filename_buf, sizeof(filename_buf), "deadeye_triage_pid_%lu.json",
+                  static_cast<unsigned long>(g_current_pid));
+
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_hwnd_main;
+    ofn.lpstrFilter = "JSON Files (*.json)\0*.json\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFile = filename_buf;
+    ofn.nMaxFile = sizeof(filename_buf);
+    ofn.lpstrTitle = "Export Triage Report (JSON)";
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    ofn.lpstrDefExt = "json";
+
+    if (GetSaveFileNameA(&ofn)) {
+        std::string json_data = export_triage_json(g_triage_report);
+        FILE* fp = std::fopen(filename_buf, "wb");
+        if (fp != nullptr) {
+            std::fwrite(json_data.data(), 1, json_data.size(), fp);
+            std::fclose(fp);
+            char status[320];
+            std::snprintf(status, sizeof(status), "Exported %zu triage findings to %s",
+                          g_triage_report.findings.size(), filename_buf);
+            set_status(status);
+        } else {
+            MessageBoxA(g_hwnd_main, "Failed to write JSON file to chosen location.",
+                        "Export Error", MB_ICONERROR);
+        }
+    }
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
         g_hwnd_main = hwnd;
         HINSTANCE hInst = GetModuleHandleA(nullptr);
 
-        g_ui_font = CreateFontA(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        g_ui_font = CreateFontA(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                 CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
-        g_mono_font = CreateFontA(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        g_ui_font_bold = CreateFontA(15, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+                                     DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                     CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+        g_mono_font = CreateFontA(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                   CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+
+        update_theme_brushes();
 
         const int M = 8, RH = 24;
         int x = M;
 
+        // Row 1: Top Bar
         HWND lbl_pid = CreateWindowA("STATIC", "PID:", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
                                      x, M, 28, RH, hwnd, nullptr, hInst, nullptr);
-        x += 32;
+        x += 30;
 
         g_edit_pid = CreateWindowA("EDIT", "self",
                                    WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
-                                   x, M, 80, RH, hwnd, reinterpret_cast<HMENU>(ID_EDIT_PID), hInst, nullptr);
-        x += 86;
+                                   x, M, 64, RH, hwnd, reinterpret_cast<HMENU>(ID_EDIT_PID), hInst, nullptr);
+        x += 68;
 
         g_btn_load = CreateWindowA("BUTTON", "Load",
                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                   x, M, 60, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_LOAD), hInst, nullptr);
-        x += 72;
+                                   x, M, 52, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_LOAD), hInst, nullptr);
+        x += 56;
 
-        HWND lbl_pat = CreateWindowA("STATIC", "Search Hex (optional):", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-                                     x, M, 134, RH, hwnd, nullptr, hInst, nullptr);
-        x += 138;
+        g_btn_triage = CreateWindowA("BUTTON", "Triage",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                                     x, M, 62, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_TRIAGE), hInst, nullptr);
+        x += 68;
+
+        HWND lbl_pat = CreateWindowA("STATIC", "Search Hex:", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
+                                     x, M, 76, RH, hwnd, nullptr, hInst, nullptr);
+        x += 78;
 
         g_edit_pattern = CreateWindowA("EDIT", "",
                                        WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
-                                       x, M, 280, RH, hwnd, reinterpret_cast<HMENU>(ID_EDIT_PATTERN), hInst, nullptr);
-        x += 286;
+                                       x, M, 220, RH, hwnd, reinterpret_cast<HMENU>(ID_EDIT_PATTERN), hInst, nullptr);
+        x += 224;
 
         g_btn_search = CreateWindowA("BUTTON", "Search",
-                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                                     x, M, 68, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_SEARCH), hInst, nullptr);
-        x += 74;
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                     x, M, 58, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_SEARCH), hInst, nullptr);
+        x += 62;
 
         g_btn_next_hit = CreateWindowA("BUTTON", "Next Hit",
                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | WS_DISABLED,
-                                       x, M, 74, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_NEXT_HIT), hInst, nullptr);
-        x += 82;
+                                       x, M, 66, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_NEXT_HIT), hInst, nullptr);
+        x += 70;
 
         g_chk_hits_only = CreateWindowA("BUTTON", "Hits only",
                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                                        x, M, 84, RH, hwnd, reinterpret_cast<HMENU>(ID_CHK_HITS_ONLY), hInst, nullptr);
-        x += 88;
+                                        x, M, 78, RH, hwnd, reinterpret_cast<HMENU>(ID_CHK_HITS_ONLY), hInst, nullptr);
+        x += 82;
 
         g_chk_heartbeat = CreateWindowA("BUTTON", "Heartbeat (1s)",
                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                                        x, M, 116, RH, hwnd, reinterpret_cast<HMENU>(ID_CHK_HEARTBEAT), hInst, nullptr);
+                                        x, M, 110, RH, hwnd, reinterpret_cast<HMENU>(ID_CHK_HEARTBEAT), hInst, nullptr);
+        x += 114;
 
-        HWND lbl_map = CreateWindowA("STATIC", "Memory Map (Address | Size | Type | Prot | Flag: !PE/!RWX/!X)",
-                                     WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-                                     M, M + RH + M, 390, 18, hwnd, nullptr, hInst, nullptr);
+        g_combo_theme = CreateWindowA("COMBOBOX", "",
+                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                                      x, M, 150, 100, hwnd, reinterpret_cast<HMENU>(ID_COMBO_THEME), hInst, nullptr);
+        SendMessageA(g_combo_theme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Theme: PH Classic Light"));
+        SendMessageA(g_combo_theme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Theme: PH Dark Mode"));
+        SendMessageA(g_combo_theme, CB_SETCURSEL, 0, 0);
 
+        // Row 2: Filter Bar (Left side) & Hex Timeline Bar (Right side)
+        int r2_y = M + RH + 6;
+
+        g_combo_view_mode = CreateWindowA("COMBOBOX", "",
+                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                                          M, r2_y, 148, 120, hwnd, reinterpret_cast<HMENU>(ID_COMBO_VIEW_MODE), hInst, nullptr);
+        SendMessageA(g_combo_view_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("View: Triage Findings"));
+        SendMessageA(g_combo_view_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("View: Memory Map"));
+        SendMessageA(g_combo_view_mode, CB_SETCURSEL, 0, 0);
+
+        g_combo_min_sev = CreateWindowA("COMBOBOX", "",
+                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                                        M + 152, r2_y, 102, 140, hwnd, reinterpret_cast<HMENU>(ID_COMBO_MIN_SEV), hInst, nullptr);
+        SendMessageA(g_combo_min_sev, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Min: All (0+)"));
+        SendMessageA(g_combo_min_sev, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Min: Low (10+)"));
+        SendMessageA(g_combo_min_sev, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Min: Med (25+)"));
+        SendMessageA(g_combo_min_sev, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Min: High (50+)"));
+        SendMessageA(g_combo_min_sev, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Min: Crit (80+)"));
+        SendMessageA(g_combo_min_sev, CB_SETCURSEL, 0, 0);
+
+        g_chk_hide_clean = CreateWindowA("BUTTON", "Hide clean",
+                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                         M + 258, r2_y, 84, RH, hwnd, reinterpret_cast<HMENU>(ID_CHK_HIDE_CLEAN), hInst, nullptr);
+
+        g_btn_export_json = CreateWindowA("BUTTON", "Export JSON",
+                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                          M + 346, r2_y, 88, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_EXPORT_JSON), hInst, nullptr);
+
+        // Right side timeline header controls
         g_lbl_hex_info = CreateWindowA("STATIC", "Hex View",
                                        WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE | SS_ENDELLIPSIS,
-                                       406, M + RH + M, 500, 18, hwnd, nullptr, hInst, nullptr);
-
-        g_btn_prev_page = CreateWindowA("BUTTON", "< Prev 64K",
-                                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
-                                        0, 0, 76, 20, hwnd, reinterpret_cast<HMENU>(ID_BTN_PREV_PAGE), hInst, nullptr);
-        g_btn_next_page = CreateWindowA("BUTTON", "Next 64K >",
-                                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
-                                        0, 0, 76, 20, hwnd, reinterpret_cast<HMENU>(ID_BTN_NEXT_PAGE), hInst, nullptr);
+                                       442, r2_y, 300, RH, hwnd, nullptr, hInst, nullptr);
 
         g_btn_snap = CreateWindowA("BUTTON", "+ Snap",
                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
-                                   0, 0, 72, 22, hwnd, reinterpret_cast<HMENU>(ID_BTN_SNAP), hInst, nullptr);
+                                   0, 0, 68, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_SNAP), hInst, nullptr);
         g_combo_diff = CreateWindowA("COMBOBOX", "",
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL | WS_DISABLED,
-                                     0, 0, 146, 160, hwnd, reinterpret_cast<HMENU>(ID_COMBO_DIFF), hInst, nullptr);
+                                     0, 0, 142, 160, hwnd, reinterpret_cast<HMENU>(ID_COMBO_DIFF), hInst, nullptr);
         g_btn_clear_snaps = CreateWindowA("BUTTON", "Clear",
                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
-                                          0, 0, 52, 22, hwnd, reinterpret_cast<HMENU>(ID_BTN_CLEAR_SNAPS), hInst, nullptr);
+                                          0, 0, 50, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_CLEAR_SNAPS), hInst, nullptr);
+        g_btn_prev_page = CreateWindowA("BUTTON", "< Prev 64K",
+                                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
+                                        0, 0, 74, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_PREV_PAGE), hInst, nullptr);
+        g_btn_next_page = CreateWindowA("BUTTON", "Next 64K >",
+                                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
+                                        0, 0, 74, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_NEXT_PAGE), hInst, nullptr);
 
+        // Main Panes: Left Owner-Drawn ListBox & Right Hex Edit View
         g_list_regions = CreateWindowA("LISTBOX", "",
                                        WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | WS_HSCROLL |
-                                       WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
-                                       M, 60, 390, 400, hwnd, reinterpret_cast<HMENU>(ID_LIST_REGIONS), hInst, nullptr);
+                                       WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
+                                       M, 66, 434, 400, hwnd, reinterpret_cast<HMENU>(ID_LIST_REGIONS), hInst, nullptr);
 
         g_edit_hex = CreateWindowA("EDIT", "",
                                    WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | WS_HSCROLL |
                                    WS_TABSTOP | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
-                                   406, 60, 500, 400, hwnd, reinterpret_cast<HMENU>(ID_EDIT_HEX), hInst, nullptr);
+                                   442, 66, 500, 400, hwnd, reinterpret_cast<HMENU>(ID_EDIT_HEX), hInst, nullptr);
         SendMessageA(g_edit_hex, EM_SETLIMITTEXT, 0, 0);
+
+        // Details label and Status bar
+        g_lbl_triage_reasons = CreateWindowA("STATIC", "Details: Ready.",
+                                             WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE | SS_ENDELLIPSIS,
+                                             M, 0, 800, 18, hwnd, nullptr, hInst, nullptr);
 
         g_lbl_status = CreateWindowA("STATIC", "Ready.",
                                      WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE | SS_ENDELLIPSIS,
                                      M, 0, 800, 18, hwnd, nullptr, hInst, nullptr);
 
         HWND ui_items[] = {
-            lbl_pid, g_edit_pid, g_btn_load, lbl_pat, g_edit_pattern, g_btn_search,
-            g_btn_next_hit, g_chk_hits_only, g_chk_heartbeat, lbl_map, g_lbl_hex_info,
-            g_btn_snap, g_combo_diff, g_btn_clear_snaps,
-            g_btn_prev_page, g_btn_next_page, g_lbl_status
+            lbl_pid, g_edit_pid, g_btn_load, g_btn_triage, lbl_pat, g_edit_pattern, g_btn_search,
+            g_btn_next_hit, g_chk_hits_only, g_chk_heartbeat, g_combo_theme,
+            g_combo_view_mode, g_combo_min_sev, g_chk_hide_clean, g_btn_export_json,
+            g_lbl_hex_info, g_btn_snap, g_combo_diff, g_btn_clear_snaps,
+            g_btn_prev_page, g_btn_next_page, g_lbl_triage_reasons, g_lbl_status
         };
         for (size_t i = 0; i < sizeof(ui_items) / sizeof(ui_items[0]); ++i) {
             SendMessageA(ui_items[i], WM_SETFONT, reinterpret_cast<WPARAM>(g_ui_font), TRUE);
         }
-        SendMessageA(g_list_regions, WM_SETFONT, reinterpret_cast<WPARAM>(g_mono_font), TRUE);
         SendMessageA(g_edit_hex, WM_SETFONT, reinterpret_cast<WPARAM>(g_mono_font), TRUE);
 
-        PostMessageA(hwnd, WM_COMMAND, ID_BTN_LOAD, 0);
+        PostMessageA(hwnd, WM_COMMAND, ID_BTN_TRIAGE, 0);
         return 0;
+    }
+
+    case WM_MEASUREITEM: {
+        MEASUREITEMSTRUCT* mis = reinterpret_cast<MEASUREITEMSTRUCT*>(lp);
+        if (mis->CtlID == ID_LIST_REGIONS) {
+            mis->itemHeight = 20; // Process Hacker row height
+            return TRUE;
+        }
+        break;
+    }
+
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lp);
+        if (dis->CtlID == ID_LIST_REGIONS) {
+            draw_region_list_item(dis);
+            return TRUE;
+        }
+        break;
+    }
+
+    case WM_CTLCOLOREDIT: {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        const PHThemeColors& tc = get_current_theme();
+        SetTextColor(hdc, tc.text_normal);
+        SetBkColor(hdc, tc.bg_control);
+        return reinterpret_cast<INT_PTR>(g_br_control);
+    }
+
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        const PHThemeColors& tc = get_current_theme();
+        SetTextColor(hdc, tc.text_normal);
+        SetBkColor(hdc, tc.bg_window);
+        return reinterpret_cast<INT_PTR>(g_br_window);
+    }
+
+    case WM_CTLCOLORLISTBOX: {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        const PHThemeColors& tc = get_current_theme();
+        SetTextColor(hdc, tc.text_normal);
+        SetBkColor(hdc, tc.bg_control);
+        return reinterpret_cast<INT_PTR>(g_br_control);
+    }
+
+    case WM_ERASEBKGND: {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, g_br_window);
+        return 1;
     }
 
     case WM_SIZE: {
         int w = LOWORD(lp);
         int h = HIWORD(lp);
         const int M = 8, RH = 24;
-        int list_w = 390;
-        if (w < 750) list_w = w / 3;
+
+        int list_w = 434;
+        if (w < 880) list_w = w / 2 - M;
 
         int right_x = M + list_w + M;
         int right_w = w - right_x - M;
         if (right_w < 120) right_w = 120;
 
-        int hdr_y = M + RH + M;
-        int pane_top = hdr_y + 24;
-        int pane_h = h - pane_top - 28;
+        int r2_y = M + RH + 6;
+        int pane_top = r2_y + RH + 6;
+        int pane_h = h - pane_top - 46;
         if (pane_h < 60) pane_h = 60;
 
         int cur_r = w - M;
         int btn_next_x = cur_r - 74; cur_r -= 78;
         int btn_prev_x = cur_r - 74; cur_r -= 78;
-        int btn_clr_x  = cur_r - 52; cur_r -= 56;
-        int combo_x    = cur_r - 146; cur_r -= 150;
-        int btn_snap_x = cur_r - 72; cur_r -= 76;
+        int btn_clr_x  = cur_r - 50; cur_r -= 54;
+        int combo_x    = cur_r - 142; cur_r -= 146;
+        int btn_snap_x = cur_r - 68; cur_r -= 72;
         int info_w     = btn_snap_x - right_x - 6;
         if (info_w < 50) info_w = 50;
 
-        MoveWindow(g_lbl_hex_info, right_x, hdr_y + 2, info_w, 18, TRUE);
-        MoveWindow(g_btn_snap, btn_snap_x, hdr_y - 1, 72, 22, TRUE);
-        MoveWindow(g_combo_diff, combo_x, hdr_y - 1, 146, 160, TRUE);
-        MoveWindow(g_btn_clear_snaps, btn_clr_x, hdr_y - 1, 52, 22, TRUE);
-        MoveWindow(g_btn_prev_page, btn_prev_x, hdr_y - 1, 74, 22, TRUE);
-        MoveWindow(g_btn_next_page, btn_next_x, hdr_y - 1, 74, 22, TRUE);
+        MoveWindow(g_lbl_hex_info, right_x, r2_y, info_w, RH, TRUE);
+        MoveWindow(g_btn_snap, btn_snap_x, r2_y, 68, RH, TRUE);
+        MoveWindow(g_combo_diff, combo_x, r2_y, 142, 160, TRUE);
+        MoveWindow(g_btn_clear_snaps, btn_clr_x, r2_y, 50, RH, TRUE);
+        MoveWindow(g_btn_prev_page, btn_prev_x, r2_y, 74, RH, TRUE);
+        MoveWindow(g_btn_next_page, btn_next_x, r2_y, 74, RH, TRUE);
 
         MoveWindow(g_list_regions, M, pane_top, list_w, pane_h, TRUE);
         MoveWindow(g_edit_hex, right_x, pane_top, right_w, pane_h, TRUE);
+
+        MoveWindow(g_lbl_triage_reasons, M, h - 42, (w > M * 2) ? w - M * 2 : 10, 18, TRUE);
         MoveWindow(g_lbl_status, M, h - 22, (w > M * 2) ? w - M * 2 : 10, 18, TRUE);
         return 0;
     }
@@ -1780,15 +2421,51 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int code = HIWORD(wp);
 
         if (id == ID_BTN_LOAD) {
-            run_load_or_search(false);
+            start_worker_task(WorkerTaskType::MemoryMapScan, false);
+        } else if (id == ID_BTN_TRIAGE) {
+            start_worker_task(WorkerTaskType::Triage, false);
         } else if (id == ID_BTN_SEARCH || id == IDOK) {
             if (GetFocus() == g_edit_pid) {
-                run_load_or_search(false);
+                start_worker_task(WorkerTaskType::Triage, false);
             } else {
-                run_load_or_search(true);
+                start_worker_task(WorkerTaskType::MemoryMapScan, true);
             }
         } else if (id == ID_BTN_NEXT_HIT) {
             on_next_hit();
+        } else if (id == ID_BTN_EXPORT_JSON) {
+            on_export_json();
+        } else if (id == ID_COMBO_VIEW_MODE && code == CBN_SELCHANGE) {
+            LRESULT sel = SendMessageA(g_combo_view_mode, CB_GETCURSEL, 0, 0);
+            g_view_mode = (sel == 1) ? ViewMode::MemoryMap : ViewMode::TriageFindings;
+            populate_region_list();
+            if (!g_visible_indices.empty()) {
+                select_region_in_ui(g_visible_indices[0], 0, static_cast<SIZE_T>(-1));
+            } else {
+                g_has_selection = false;
+                update_diff_combo();
+                display_selected_region(static_cast<SIZE_T>(-1));
+                SetWindowTextA(g_lbl_triage_reasons, "Details: Ready.");
+            }
+        } else if (id == ID_COMBO_MIN_SEV && code == CBN_SELCHANGE) {
+            LRESULT sel = SendMessageA(g_combo_min_sev, CB_GETCURSEL, 0, 0);
+            if (sel == 1) g_min_sev_filter = SEV_MIN_LOW;
+            else if (sel == 2) g_min_sev_filter = SEV_MIN_MEDIUM;
+            else if (sel == 3) g_min_sev_filter = SEV_MIN_HIGH;
+            else if (sel == 4) g_min_sev_filter = SEV_MIN_CRITICAL;
+            else g_min_sev_filter = 0;
+            populate_region_list();
+        } else if (id == ID_CHK_HIDE_CLEAN) {
+            g_hide_clean = (SendMessageA(g_chk_hide_clean, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            populate_region_list();
+        } else if (id == ID_COMBO_THEME && code == CBN_SELCHANGE) {
+            LRESULT sel = SendMessageA(g_combo_theme, CB_GETCURSEL, 0, 0);
+            g_theme = (sel == 1) ? AppTheme::SystemInformerDark : AppTheme::ProcessHackerLight;
+            update_theme_brushes();
+            InvalidateRect(hwnd, nullptr, TRUE);
+            InvalidateRect(g_list_regions, nullptr, TRUE);
+            InvalidateRect(g_edit_hex, nullptr, TRUE);
+            InvalidateRect(g_lbl_triage_reasons, nullptr, TRUE);
+            InvalidateRect(g_lbl_status, nullptr, TRUE);
         } else if (id == ID_CHK_HITS_ONLY) {
             populate_region_list();
             if (!g_visible_indices.empty()) {
@@ -1812,6 +2489,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_has_selection = true;
                 g_view_offset = page_off;
                 display_selected_region(first_hit);
+                update_triage_details_label(reg_idx);
             }
         } else if (id == ID_BTN_PREV_PAGE) {
             if (g_has_selection && g_view_offset >= VIEW_PAGE_SIZE) {
@@ -1853,24 +2531,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_SCAN_PROGRESS: {
-        SIZE_T mb = static_cast<SIZE_T>(wp);
-        SIZE_T hits = static_cast<SIZE_T>(lp);
+        SIZE_T cur = static_cast<SIZE_T>(wp);
+        SIZE_T tot = static_cast<SIZE_T>(lp);
         char status[160];
-        if (hits > 0) {
-            std::snprintf(status, sizeof(status), "Scanning process memory... %llu MB scanned, %llu hit(s)",
-                          static_cast<unsigned long long>(mb), static_cast<unsigned long long>(hits));
+        if (tot > 0) {
+            std::snprintf(status, sizeof(status), "Evaluating process memory... %llu / %llu regions analyzed",
+                          static_cast<unsigned long long>(cur), static_cast<unsigned long long>(tot));
         } else {
             std::snprintf(status, sizeof(status), "Scanning process memory... %llu MB scanned",
-                          static_cast<unsigned long long>(mb));
+                          static_cast<unsigned long long>(cur));
         }
         set_status(status);
         return 0;
     }
 
-    case WM_SCAN_COMPLETE: {
-        ScanResult* res = reinterpret_cast<ScanResult*>(lp);
+    case WM_SCAN_COMPLETE:
+    case WM_TRIAGE_COMPLETE: {
+        WorkerResult* res = reinterpret_cast<WorkerResult*>(lp);
         if (res != nullptr) {
-            on_scan_completed(res);
+            on_worker_completed(res);
             delete res;
         }
         return 0;
@@ -1894,8 +2573,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_h_worker_thread = nullptr;
         }
         close_target_proc();
-        if (g_mono_font) DeleteObject(g_mono_font);
-        if (g_ui_font) DeleteObject(g_ui_font);
+        if (g_mono_font)    DeleteObject(g_mono_font);
+        if (g_ui_font)      DeleteObject(g_ui_font);
+        if (g_ui_font_bold) DeleteObject(g_ui_font_bold);
+        if (g_br_window)    DeleteObject(g_br_window);
+        if (g_br_control)   DeleteObject(g_br_control);
         PostQuitMessage(0);
         return 0;
     }
@@ -1906,15 +2588,15 @@ int run_gui(HINSTANCE hInst, int nCmdShow) {
     WNDCLASSA wc = {};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
-    wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+    wc.hbrBackground = nullptr;
     wc.lpszClassName = "DeadeyeHexViewer";
     wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
     wc.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
     RegisterClassA(&wc);
 
-    HWND hwnd = CreateWindowA("DeadeyeHexViewer", "Deadeye - Memory Hex Viewer & Diff Timeline",
+    HWND hwnd = CreateWindowA("DeadeyeHexViewer", "Deadeye - Process Memory Triage Scanner & Hex Timeline",
                               WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
-                              1160, 720, nullptr, nullptr, hInst, nullptr);
+                              1220, 740, nullptr, nullptr, hInst, nullptr);
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
@@ -1929,27 +2611,15 @@ int run_gui(HINSTANCE hInst, int nCmdShow) {
 }
 
 // ============================================================================
-// 5. Unified Entry Point (CLI vs GUI Dispatcher)
+// 4. Pure Windows Subsystem Entry Point
 // ============================================================================
 
-int main(int argc, char* argv[]) {
-    // Attempt to acquire SeDebugPrivilege so elevated runs can inspect system processes
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    (void)hPrevInstance;
+    (void)lpCmdLine;
+
+    // Acquire SeDebugPrivilege so elevated runs can inspect system services
     enable_debug_privilege();
 
-    // If no arguments or explicitly "--gui", launch interactive GUI mode
-    if (argc <= 1 || (argc == 2 && std::strcmp(argv[1], "--gui") == 0)) {
-        HWND console_hwnd = GetConsoleWindow();
-        if (console_hwnd != nullptr) {
-            DWORD proc_list[2] = {};
-            DWORD proc_count = GetConsoleProcessList(proc_list, 2);
-            // Hide the console only if it was spawned solely for this process (e.g. from Explorer)
-            if (proc_count <= 1) {
-                ShowWindow(console_hwnd, SW_HIDE);
-            }
-        }
-        return run_gui(GetModuleHandleA(nullptr), SW_SHOW);
-    }
-
-    // Otherwise, run in high-performance headless CLI scanner mode
-    return run_cli(argc, argv);
+    return run_gui(hInstance, nCmdShow);
 }

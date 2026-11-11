@@ -1,33 +1,71 @@
-# Deadeye 
+# Deadeye
 
-**Deadeye** is a unified, lightweight, high-performance Windows process memory pattern scanner, interactive hex viewer, and real-time memory diff timeline built in modern C++ and native Win32.
+**Deadeye** is a high-performance Windows process memory triage scanner, interactive hex viewer, and real-time diff timeline built in modern C++17 and native Win32.
 
-Designed for defensive reverse engineering, malware analysis, and detection engineering, Deadeye lets you inspect memory layouts, search for signatures with wildcards, flag suspicious `PRIVATE RWX` regions, and monitor live memory changes in real-time without pausing or attaching a debugger to the target.
+Designed for defensive reverse engineering, malware analysis, and detection engineering, Deadeye brings **Process Hacker**-style color-coded visual triage directly to your desktop. It automatically flags suspicious memory conditions (such as private RWX regions, write-then-flip executable memory, reflective DLL/PE headers in private heap/stack pages, and unlinked modules), monitors live memory mutations in real time without pausing or attaching a debugger, and exports valid JSON reports for automation.
 
 ---
 
+## Process Hacker Visual Styling & Color Scheme
 
+Deadeye incorporates the authentic color-coding and highlighting language of **Process Hacker** / **System Informer** to give analysts instant visual situational awareness:
+
+| Condition / Region Type | Process Hacker Light Theme | Dark Mode (System Informer) | Significance |
+|:---|:---|:---|:---|
+| **Critical Threat / Injected PE** | `#FFB4B4` (Alert Red) | `#4B1419` (Dark Crimson) | Injected PE / Reflective DLL header (`MZ`/`PE`) in private memory |
+| **Private RWX Memory** | `#FFC0C0` (Salmon / Red Alert) | `#461919` (Deep Red) | Memory allocated as `MEM_PRIVATE` with `PAGE_EXECUTE_READWRITE` |
+| **Write-then-Flip** | `#FFE0B9` (Peach / Orange) | `#412D14` (Dark Amber) | Allocated writable (`PAGE_READWRITE`), flipped to executable (`PAGE_EXECUTE_READ`) |
+| **Unlinked Module** | `#E8D0FF` (Packed Purple) | `#371941` (Dark Violet) | `MEM_IMAGE` allocation unlinked/hidden from PEB loader list |
+| **Unbacked Executable** | `#FFF5B4` (Light Gold) | `#3C3714` (Dark Gold) | Executable pages not backed by a disk image (`MEM_MAPPED` / `MEM_PRIVATE`) |
+| **Private Memory (Clean)** | `#FFFFE1` (PH Own/Private Yellow) | `#2A2A1E` (Muted Amber) | Standard heap, stack, or private data |
+| **Mapped Memory (Clean)** | `#E6F2FF` (PH Service Blue) | `#192837` (Muted Slate) | File-mapped section or shared memory |
+| **Image Memory (Clean)** | `#FFFFFF` (Pure White) | `#252526` (Neutral Dark) | Standard on-disk binary or loaded DLL image |
+| **Active Selection** | `#3399FF` (Windows Blue) | `#1A5FB4` (Deep Slate Blue) | Currently focused row |
+
+A built-in theme switcher (`Theme: PH Classic Light` / `Theme: PH Dark Mode`) lets you toggle between classic Process Hacker light and modern System Informer dark mode on the fly.
+
+---
+
+## Defensive Triage Heuristics & Additive Scoring
+
+Deadeye inspects target processes in a background worker thread and computes an **additive threat severity score** for every committed memory region based on weighted heuristics:
+
+| Detection Rule | Additive Weight | Description |
+|:---|:---:|:---|
+| `INJECTED_PE` | **+50** | Valid DOS (`MZ`) and NT (`PE\0\0`) headers detected within `MEM_PRIVATE` pages (indicative of reflective DLL loading, process hollowing, or unhooking stubs). |
+| `UNLINKED_MODULE` | **+45** | Committed `MEM_IMAGE` allocation whose base address is missing from the 64-bit PEB loader list (`InLoadOrderModuleList`), indicating module unlinking/DKOM evasion. *(Reported as unsupported on 32-bit WOW64 targets instead of guessing).* |
+| `PRIVATE_RWX` | **+40** | Region marked `MEM_PRIVATE` with `PAGE_EXECUTE_READWRITE` or `PAGE_EXECUTE_WRITECOPY` protection. |
+| `WRITE_THEN_FLIP` | **+35** | `AllocationProtect` was non-executable writable (`PAGE_READWRITE` / `PAGE_WRITECOPY`), but current `Protect` is executable (`PAGE_EXECUTE` / `PAGE_EXECUTE_READ`). Common malware staging pattern. |
+| `UNBACKED_EXEC` | **+25** | Executable memory not backed by a verified disk image (`MEM_MAPPED` or `MEM_PRIVATE` with execution rights). |
+
+### Severity Bands
+- **CRITICAL (`CRIT`)**: Score &ge; **80**
+- **HIGH (`HIGH`)**: Score &ge; **50**
+- **MEDIUM (`MED`)**: Score &ge; **25**
+- **LOW (`LOW`)**: Score &ge; **10**
+- **CLEAN (`CLEAN`)**: Score = **0**
 
 ---
 
 ## Features
 
-- **Dual-Mode Single Binary**: Automatically launches in interactive GUI mode when double-clicked, or runs as a headless CLI scanner when passed arguments in a terminal.
-- **Asynchronous Worker Thread Scanning**: Memory walks run on a dedicated worker thread with asynchronous progress updates (`WM_SCAN_PROGRESS` / `WM_SCAN_COMPLETE`), keeping the UI completely responsive on multi-gigabyte targets.
+- **Pure Windows Subsystem Application**: Built strictly as a native GUI binary (`/SUBSYSTEM:WINDOWS`, `-mwindows`). No console flashing on launch, no command-line baggage.
+- **UI-Independent Core Engine**: All memory walks, pattern scanning, and defensive triage evaluations take a process handle and return plain structs (`TriageReport`, `TriageFinding`, `RegionInfo`), keeping core logic fully decoupled from presentation.
+- **Two Flexible View Modes**:
+  - **Triage Findings**: Displays all evaluated regions sorted strictly by threat severity descending (`[SEV SCORE] FLAGS ADDRESS SIZE TYPE PROT`).
+  - **Memory Map**: Full linear address walk showing all committed pages with hit badges, snapshot counters, and detection flags.
+- **Threat Filters**:
+  - **Min Severity**: Filter by `All (0+)`, `Low (10+)`, `Med (25+)`, `High (50+)`, or `Crit (80+)`.
+  - **Hide Clean**: Instantly collapse benign regions to focus exclusively on anomalies.
+  - **Hits Only**: Show only regions containing pattern match hits.
+- **Finding Details Line**: Displays the exact point-scored breakdown and reasons for the selected finding (e.g. `Details [CRIT 110]: Injected PE/Reflective DLL (+50) | Write-then-flip (+35) | Unbacked Exec (+25)`).
+- **Export Valid JSON**: Export full findings to a file chosen via standard Windows Save Dialog (`GetSaveFileNameA`), including `base`, `size`, `alloc_base`, `type`, `protect`, `alloc_protect`, `flags`, `severity_score`, `severity_label`, and `reasons`.
+- **Real-Time Memory Heartbeat (1s)**: Periodic live diff monitoring that highlights modified bytes with aligned `old:` sub-rows without scrolling resets or flicker.
+- **Visual Memory Diff Timeline**: Capture point-in-time snapshots (`[+ Snap]`) and compare `Live vs Snapshot` or `Snapshot vs Snapshot`.
+- **SIMD-Accelerated Pattern Search**: Fast sliding-window pattern scanner using `memchr` anchor acceleration, wildcard support (`??`), all-wildcard rejection, and per-region hit caps (10,000).
 - **Robust Page-Wise Read Fallback**: Never silently abandons regions on partial read errors; automatically falls back to 4 KB page-by-page reads to scan past guard pages and decommitted blocks.
-- **Advanced Malware Detection Heuristics**:
-  - `[!PE ]`: Detects injected PE / Reflective DLL headers (`MZ` + `PE\0\0`) inside `MEM_PRIVATE` memory.
-  - `[!RWX]`: Flags private executable+writable memory (`PAGE_EXECUTE_READWRITE` / `PAGE_EXECUTE_WRITECOPY`).
-  - `[!X  ]`: Flags unbacked executable code not mapped from disk images (`MEM_MAPPED` / `MEM_PRIVATE` with execution rights).
-- **Allocation Introspection**: Captures and displays `AllocationBase` and `AllocationProtect` from `MEMORY_BASIC_INFORMATION`.
 - **Automatic `SeDebugPrivilege` Acquisition**: Attempts token privilege adjustment on startup so elevated processes can inspect system services and protected targets.
-- **Real-Time Memory Heartbeat**: Periodic (1s) live diff monitoring that flags modified rows and shows exact previous byte values as memory changes in running targets, with flicker-free scroll preservation.
-- **Visual Memory Diff Timeline**: Capture point-in-time snapshots of any region (`[+ Snap]`) and compare `Live vs Snapshot` or `Snapshot vs Snapshot` with byte-aligned `old:` sub-rows.
-- **SIMD-Accelerated Pattern Search**: Fast sliding-window pattern scanner using `memchr` anchor acceleration, wildcard support, all-wildcard rejection, and per-region hit caps (10k).
-- **Interactive Two-Pane Hex Viewer**:
-  - **Left Pane**: Memory Map displaying all committed pages (`Address | Size | Type | Protection | Flag: !PE/!RWX/!X | Snapshots | Hits`).
-  - **Right Pane**: Fast, responsive 64 KB paged hex+ASCII viewer with hit markers (`>>>`), diff markers (`CHG`), and combo markers (`!>>`).
-- **Zero Heavy Dependencies**: Pure C++ and Win32 API (`user32`, `gdi32`, `kernel32`). No heavy frameworks or runtimes needed.
+- **Zero Third-Party Dependencies**: Pure C++17 and standard Win32 API (`user32`, `gdi32`, `advapi32`, `comdlg32`).
 
 ---
 
@@ -35,85 +73,60 @@ Designed for defensive reverse engineering, malware analysis, and detection engi
 
 ### Requirements
 - **OS**: Windows 10 or 11 (x64)
-- **Compiler**: MinGW-w64 (`g++`) or MSVC (`cl`)
+- **Compiler**: MinGW-w64 (`g++`) or MSVC (`cl.exe`)
 
 ### Build with MinGW-w64 (GCC)
 ```powershell
 # Create build directory
 if (-not (Test-Path build)) { New-Item -ItemType Directory -Path build }
 
-# Compile unified Deadeye (CLI + GUI)
-g++ -std=c++17 -m64 -Wall -Wextra -O2 src/main.cpp -o build/deadeye.exe -lgdi32 -luser32
+# Compile Deadeye GUI (pure Windows subsystem, zero warnings)
+g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 src/main.cpp -o build/deadeye.exe -mwindows -ladvapi32 -lcomdlg32 -lgdi32 -luser32
 
 # Compile the test target
 g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 src/test_target.cpp -o build/test_target.exe
 ```
 
-### Build with MSVC (Visual Studio x64 Native Tools)
+### Build with MSVC (Visual Studio Developer Command Prompt)
 ```bat
 if not exist build mkdir build
-cl /std:c++17 /EHsc /W4 /O2 src/main.cpp /Fe:build/deadeye.exe /link /SUBSYSTEM:CONSOLE user32.lib gdi32.lib
-cl /std:c++17 /EHsc /W4 /O2 src/test_target.cpp /Fe:build/test_target.exe
+
+REM Compile Deadeye GUI (/W4, pure Windows subsystem, zero warnings)
+cl /std:c++17 /EHsc /W4 /O2 src/main.cpp /Fe:build/deadeye.exe /Fo:build/ /link /SUBSYSTEM:WINDOWS
+
+REM Compile the test target
+cl /std:c++17 /EHsc /W4 /O2 src/test_target.cpp /Fe:build/test_target.exe /Fo:build/
 ```
 
 ---
 
-## Quick Start
+## Manual Test Checklist
 
-### 1. Interactive GUI Mode
-Double-click `build/deadeye.exe` or run:
-```powershell
-.\build\deadeye.exe
-```
-- By default, it inspects `self` and displays its memory map immediately.
-- Enter any process PID and click **Load** to inspect another application.
-- Click **`+ Snap`** to capture a baseline snapshot.
-- Check **`Heartbeat (1s)`** to watch memory changes pulse in real time with aligned `old:` byte annotations.
-- Optionally enter a hex pattern (e.g. `4D 5A 90 00` or `DE AD ?? EF`) and click **Search** to highlight matches.
+Use the included `test_target.exe` tool to verify each defensive triage condition inside Deadeye:
 
-### 2. Headless CLI Scanner Mode
-When passed command-line arguments, Deadeye runs directly in your terminal:
-```powershell
-# Scan another process
-.\build\deadeye.exe <pid> "4D 5A ?? 00 03"
+| Test Mode | Test Command | Simulated Condition | Expected Triage Flags | Expected Severity | Process Hacker Color |
+|:---:|:---|:---|:---|:---:|:---|
+| **1** | `.\build\test_target.exe 1` | `VirtualAlloc(PAGE_EXECUTE_READWRITE)` | `PRIVATE_RWX`, `UNBACKED_EXEC` | **65 (HIGH)** | Salmon / Red alert (`#FFC0C0`) |
+| **2** | `.\build\test_target.exe 2` | `VirtualAlloc(PAGE_READWRITE)` &rarr; `VirtualProtect(PAGE_EXECUTE_READ)` | `WRITE_THEN_FLIP`, `UNBACKED_EXEC` | **60 (HIGH)** | Peach / Orange (`#FFE0B9`) |
+| **3** | `.\build\test_target.exe 3` | Private memory containing `MZ` & `PE\0\0` headers | `INJECTED_PE`, `WRITE_THEN_FLIP`, `UNBACKED_EXEC` | **110 (CRIT)** | Alert Red (`#FFB4B4`) |
+| **4** | `.\build\test_target.exe 4` | `LoadLibraryA("version.dll")` & unlinked from PEB `InLoadOrderModuleList` | `UNLINKED_MODULE` | **45 (MED)** | Packed Purple (`#E8D0FF`) |
+| **All** | `.\build\test_target.exe all` | Simulates all 4 conditions simultaneously | Multiple rows matching above | **45 to 110** | Multi-colored Process Hacker palette |
 
-# Scan the scanner's own process
-.\build\deadeye.exe self "4D 5A 90 00"
-```
-
-#### Exit Codes
-| Code | Meaning |
-|:---:|---|
-| `0` | Hits found |
-| `1` | No hits found |
-| `2` | Bad CLI arguments or invalid pattern |
-| `3` | `OpenProcess` failure (access denied / invalid PID) |
-
----
-
-## Testing with `test_target`
-
-1. Start the included test target in a terminal:
+### Verification Steps:
+1. Launch `test_target.exe`:
    ```powershell
-   .\build\test_target.exe
+   .\build\test_target.exe all
    ```
-   It prints its PID, addresses of both heap and `VirtualAlloc` RWX buffers, and waits for commands.
-
-2. In another terminal, run the CLI scanner:
+   Note the printed target PID (e.g. `9244`).
+2. Launch `deadeye.exe`:
    ```powershell
-   .\build\deadeye.exe <PID> "DE AD ?? EF 13 37 ?? FE"
+   .\build\deadeye.exe
    ```
-   Output:
-   ```text
-   [Deadeye] Scanning PID 9244 for 8-byte pattern...
-          HIT addr=0x18D104407E0 region_base=0x18D10440000 region_size=0x32000 alloc_base=0x18D10440000 type=PRIVATE protect=PAGE_READWRITE
-   [!RWX] HIT addr=0x18D10650000 region_base=0x18D10650000 region_size=0x1000 alloc_base=0x18D10650000 type=PRIVATE protect=PAGE_EXECUTE_READWRITE
-   [!PE ] HIT addr=0x18D10660100 region_base=0x18D10660000 region_size=0x1000 alloc_base=0x18D10660000 type=PRIVATE protect=PAGE_EXECUTE_READ
-
-   --- Deadeye Summary ---
-   Regions scanned: 124
-   Bytes scanned:   15618048
-   Total hits:      3
-   ```
-
-3. Or load the PID in `deadeye.exe` GUI, select the `RWX!` region, check **Heartbeat (1s)**, and press `m` in `test_target.exe` to see live memory mutation diffs!
+3. In Deadeye:
+   - Enter the target PID in the `PID:` box and click **Triage**.
+   - Verify that the left pane populates with the findings list sorted by threat severity.
+   - Verify that the injected PE finding is at the top with `[CRIT 110]` highlighted in red/purple.
+   - Click each row and verify that the hex viewer jumps directly to the corresponding base address.
+   - Verify that the **Details** line at the bottom displays the exact additive scoring explanation for each finding.
+   - Select the `RWX` row, check **Heartbeat (1s)**, and press `m` in `test_target.exe` to observe live memory diffs annotated in real time.
+   - Click **Export JSON**, save to a file, and verify the structured JSON output.
