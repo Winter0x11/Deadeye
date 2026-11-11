@@ -468,6 +468,34 @@ static SIZE_T g_view_offset = 0;
 static size_t g_hit_cursor_region = 0;
 static size_t g_hit_cursor_index = 0;
 
+static HANDLE g_target_proc = nullptr;
+static std::string g_last_hex_dump;
+static std::string g_last_hex_info;
+
+void close_target_proc() {
+    if (g_target_proc != nullptr) {
+        CloseHandle(g_target_proc);
+        g_target_proc = nullptr;
+    }
+}
+
+HANDLE get_or_open_target_proc(DWORD pid) {
+    if (g_target_proc != nullptr) {
+        DWORD exit_code = 0;
+        if (g_current_pid == pid && GetExitCodeProcess(g_target_proc, &exit_code) && exit_code == STILL_ACTIVE) {
+            return g_target_proc;
+        }
+        close_target_proc();
+    }
+    g_target_proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    return g_target_proc;
+}
+
+void invalidate_hex_cache() {
+    g_last_hex_dump.clear();
+    g_last_hex_info.clear();
+}
+
 void set_status(const std::string& text) {
     SetWindowTextA(g_lbl_status, text.c_str());
 }
@@ -703,7 +731,7 @@ void on_take_snapshot() {
     SIZE_T remaining = reg.size - g_view_offset;
     SIZE_T to_read = (remaining < VIEW_PAGE_SIZE) ? remaining : VIEW_PAGE_SIZE;
 
-    HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, g_current_pid);
+    HANDLE proc = get_or_open_target_proc(g_current_pid);
     if (proc == nullptr) {
         DWORD err = GetLastError();
         set_status("[ERROR] OpenProcess failed: " + format_win32_error(err));
@@ -716,7 +744,6 @@ void on_take_snapshot() {
     BOOL ok = ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(reg.base + g_view_offset),
                                 snap.data.data(), to_read, &bytes_read);
     DWORD read_err = ok ? 0 : GetLastError();
-    CloseHandle(proc);
 
     if (bytes_read == 0) {
         set_status("[ERROR] Could not capture snapshot: " + format_win32_error(read_err));
@@ -738,6 +765,7 @@ void on_take_snapshot() {
     snap.label = label_buf;
 
     reg.snapshots.push_back(snap);
+    invalidate_hex_cache();
     update_diff_combo();
     populate_region_list();
     for (size_t vis = 0; vis < g_visible_indices.size(); ++vis) {
@@ -762,6 +790,7 @@ void on_clear_snapshots() {
     RegionInfo& reg = g_regions[g_selected_region];
     size_t count = reg.snapshots.size();
     reg.snapshots.clear();
+    invalidate_hex_cache();
     update_diff_combo();
     populate_region_list();
     for (size_t vis = 0; vis < g_visible_indices.size(); ++vis) {
@@ -781,6 +810,8 @@ void display_selected_region(SIZE_T focus_offset) {
     if (!g_has_selection || g_selected_region >= g_regions.size()) {
         SetWindowTextA(g_lbl_hex_info, "Hex View: (no region selected)");
         SetWindowTextA(g_edit_hex, "");
+        g_last_hex_info.clear();
+        g_last_hex_dump.clear();
         EnableWindow(g_btn_prev_page, FALSE);
         EnableWindow(g_btn_next_page, FALSE);
         return;
@@ -807,11 +838,12 @@ void display_selected_region(SIZE_T focus_offset) {
         buf = *dp.cmp_data;
         bytes_read = buf.size();
     } else {
-        HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, g_current_pid);
+        HANDLE proc = get_or_open_target_proc(g_current_pid);
         if (proc == nullptr) {
             DWORD err = GetLastError();
             std::string msg = "[ERROR] OpenProcess failed: " + format_win32_error(err) + "\r\n";
             SetWindowTextA(g_edit_hex, msg.c_str());
+            g_last_hex_dump = msg;
             return;
         }
 
@@ -819,12 +851,12 @@ void display_selected_region(SIZE_T focus_offset) {
         ok = ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(reg.base + g_view_offset),
                                buf.data(), to_read, &bytes_read);
         read_err = ok ? 0 : GetLastError();
-        CloseHandle(proc);
 
         if (bytes_read == 0) {
             std::string msg = "[WARN] ReadProcessMemory failed at 0x" + fmt_addr(reg.base + g_view_offset) +
                               ": " + format_win32_error(read_err) + "\r\n";
             SetWindowTextA(g_edit_hex, msg.c_str());
+            g_last_hex_dump = msg;
             return;
         }
         buf.resize(bytes_read);
@@ -888,14 +920,30 @@ void display_selected_region(SIZE_T focus_offset) {
                       static_cast<unsigned long long>(g_view_offset + to_read),
                       static_cast<unsigned long long>(reg.size));
     }
-    SetWindowTextA(g_lbl_hex_info, info);
 
-    SetWindowTextA(g_edit_hex, dump.c_str());
-    if (focus_line > 3) {
-        SendMessageA(g_edit_hex, EM_LINESCROLL, 0, static_cast<LPARAM>(focus_line - 3));
-    } else {
-        SendMessageA(g_edit_hex, EM_SETSEL, 0, 0);
-        SendMessageA(g_edit_hex, EM_SCROLLCARET, 0, 0);
+    if (g_last_hex_info != info) {
+        SetWindowTextA(g_lbl_hex_info, info);
+        g_last_hex_info = info;
+    }
+
+    if (g_last_hex_dump != dump) {
+        int first_line = static_cast<int>(SendMessageA(g_edit_hex, EM_GETFIRSTVISIBLELINE, 0, 0));
+        SendMessageA(g_edit_hex, WM_SETREDRAW, FALSE, 0);
+        SetWindowTextA(g_edit_hex, dump.c_str());
+        if (focus_line > 3) {
+            SendMessageA(g_edit_hex, EM_LINESCROLL, 0, static_cast<LPARAM>(focus_line - 3));
+        } else if (first_line > 0) {
+            SendMessageA(g_edit_hex, EM_LINESCROLL, 0, static_cast<LPARAM>(first_line));
+        } else {
+            SendMessageA(g_edit_hex, EM_SETSEL, 0, 0);
+            SendMessageA(g_edit_hex, EM_SCROLLCARET, 0, 0);
+        }
+        SendMessageA(g_edit_hex, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(g_edit_hex, nullptr, TRUE);
+        g_last_hex_dump = dump;
+    } else if (focus_line > 3) {
+        int cur = static_cast<int>(SendMessageA(g_edit_hex, EM_GETFIRSTVISIBLELINE, 0, 0));
+        SendMessageA(g_edit_hex, EM_LINESCROLL, 0, static_cast<LPARAM>((focus_line - 3) - cur));
     }
 }
 
@@ -953,6 +1001,7 @@ void select_region_in_ui(size_t region_idx, SIZE_T view_offset, SIZE_T focus_off
         }
     }
     update_diff_combo();
+    invalidate_hex_cache();
     display_selected_region(focus_offset);
 }
 
@@ -1008,6 +1057,9 @@ void run_load_or_search(bool require_pattern) {
     set_status(use_pattern ? "Scanning process memory..." : "Loading process memory map...");
     EnableWindow(g_btn_load, FALSE);
     EnableWindow(g_btn_search, FALSE);
+
+    close_target_proc();
+    invalidate_hex_cache();
 
     g_regions.clear();
     g_current_pid = pid;
@@ -1351,14 +1403,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (id == ID_BTN_PREV_PAGE) {
             if (g_has_selection && g_view_offset >= VIEW_PAGE_SIZE) {
                 g_view_offset -= VIEW_PAGE_SIZE;
-                update_diff_combo();
+                invalidate_hex_cache();
                 display_selected_region(static_cast<SIZE_T>(-1));
             }
         } else if (id == ID_BTN_NEXT_PAGE) {
             if (g_has_selection && g_selected_region < g_regions.size() &&
                 g_view_offset + VIEW_PAGE_SIZE < g_regions[g_selected_region].size) {
                 g_view_offset += VIEW_PAGE_SIZE;
-                update_diff_combo();
+                invalidate_hex_cache();
                 display_selected_region(static_cast<SIZE_T>(-1));
             }
         } else if (id == ID_BTN_SNAP) {
@@ -1366,6 +1418,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (id == ID_BTN_CLEAR_SNAPS) {
             on_clear_snapshots();
         } else if (id == ID_COMBO_DIFF && code == CBN_SELCHANGE) {
+            invalidate_hex_cache();
             display_selected_region(static_cast<SIZE_T>(-1));
         } else if (id == ID_CHK_HEARTBEAT) {
             bool checked = (SendMessageA(g_chk_heartbeat, BM_GETCHECK, 0, 0) == BST_CHECKED);
@@ -1397,6 +1450,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_DESTROY:
         KillTimer(hwnd, IDT_HEARTBEAT);
+        close_target_proc();
         if (g_mono_font) DeleteObject(g_mono_font);
         if (g_ui_font) DeleteObject(g_ui_font);
         PostQuitMessage(0);
