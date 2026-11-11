@@ -6,26 +6,6 @@ Designed for defensive reverse engineering, malware analysis, and detection engi
 
 ---
 
-## Visual Memory Highlighting & Color Scheme
-
-Deadeye provides an intuitive, high-contrast visual highlighting palette to give analysts instant situational awareness:
-
-| Condition / Region Type | Light Theme | Dark Theme | Significance |
-|:---|:---|:---|:---|
-| **Critical Threat / Injected PE** | `#FFB4B4` (Alert Red) | `#4B1419` (Dark Crimson) | Injected PE / Reflective DLL header (`MZ`/`PE`) in private memory |
-| **Private RWX Memory** | `#FFC0C0` (Salmon / Red Alert) | `#461919` (Deep Red) | Memory allocated as `MEM_PRIVATE` with `PAGE_EXECUTE_READWRITE` |
-| **Write-then-Flip** | `#FFE0B9` (Peach / Orange) | `#412D14` (Dark Amber) | Allocated writable (`PAGE_READWRITE`), flipped to executable (`PAGE_EXECUTE_READ`) |
-| **Unlinked Module** | `#E8D0FF` (Packed Purple) | `#371941` (Dark Violet) | `MEM_IMAGE` allocation unlinked/hidden from PEB loader list |
-| **Unbacked Executable** | `#FFF5B4` (Light Gold) | `#3C3714` (Dark Gold) | Executable pages not backed by a disk image (`MEM_MAPPED` / `MEM_PRIVATE`) |
-| **Private Memory (Clean)** | `#FFFFE1` (Warm Yellow) | `#2A2A1E` (Muted Amber) | Standard heap, stack, or private data |
-| **Mapped Memory (Clean)** | `#E6F2FF` (Sky Blue) | `#192837` (Muted Slate) | File-mapped section or shared memory |
-| **Image Memory (Clean)** | `#FFFFFF` (Pure White) | `#252526` (Neutral Dark) | Standard on-disk binary or loaded DLL image |
-| **Active Selection** | `#3399FF` (Windows Blue) | `#1A5FB4` (Deep Slate Blue) | Currently focused row |
-
-A built-in theme switcher (`Theme: Light Mode` / `Theme: Dark Mode`) lets you toggle between light and dark visual themes on the fly.
-
----
-
 ## Defensive Triage Heuristics & Additive Scoring
 
 Deadeye inspects target processes in a background worker thread and computes an **additive threat severity score** for every committed memory region based on weighted heuristics:
