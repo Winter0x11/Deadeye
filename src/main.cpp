@@ -3542,8 +3542,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         else if (id == IDM_HELP_HEURISTICS)
         {
             std::string info =
-                "Deadeye Defensive Triage Heuristics & Scoring Guide\n"
-                "====================================================\n\n"
+                
                 "[+50] INJECTED_PE:\n"
                 "   MZ/PE header detected inside committed MEM_PRIVATE pages.\n"
                 "   (Reflective DLL injection, process hollowing, unhooking)\n\n"
@@ -3668,7 +3667,7 @@ int run_gui(HINSTANCE hInst, int nCmdShow)
     wc.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
     RegisterClassA(&wc);
 
-    HWND hwnd = CreateWindowA("DeadeyeHexViewer", "Deadeye - Process Memory Triage Scanner & Hex Timeline",
+    HWND hwnd = CreateWindowA("DeadeyeHexViewer", "Deadeye ",
                               WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                               1220, 740, nullptr, nullptr, hInst, nullptr);
     ShowWindow(hwnd, nCmdShow);

@@ -188,13 +188,13 @@ int main(int argc, char *argv[])
 
     DWORD pid = GetCurrentProcessId();
 
-    std::cout << "========================================================\n"
+    std::cout 
               << " Deadeye Defensive Triage Test Target\n"
-              << "========================================================\n"
+              
               << "PID: " << pid << "\n\n";
 
     std::cout << "Active Conditions & Expected Triage Findings:\n";
-    std::cout << "--------------------------------------------------------\n";
+
     if (rwx_buf != nullptr)
     {
         std::cout << "[1] Private RWX:\n"
