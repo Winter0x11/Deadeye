@@ -50,6 +50,11 @@ Deadeye inspects target processes in a background worker thread and computes an 
 ## Features
 
 - **Pure Windows Subsystem Application**: Built strictly as a native GUI binary (`/SUBSYSTEM:WINDOWS`, `-mwindows`). No console flashing on launch, no command-line baggage.
+- **Modern Fluent / Process Hacker UI**:
+  - **Sleek Rounded Pushbuttons**: Custom double-buffered button engine with smooth rounded borders (6px radius) and seamless parent corner blending.
+  - **Interactive Hover & Click States**: Real-time cursor state changes (`IDC_HAND`), mouse tracking (`TrackMouseEvent` / `WM_MOUSELEAVE`), tactile 1px pressed offsets, and high-visibility keyboard focus rings.
+  - **Visual CTA Hierarchy**: Cobalt Azure Primary button for **Triage**, Emerald Green Accent for **Export JSON**, and clean modern Card buttons for search and navigation.
+  - **High-DPI & Common Controls v6**: Embedded application manifest with Microsoft Common-Controls 6.0.0.0 dependency and PerMonitorV2 DPI awareness for crystal-clear typography on high-resolution displays.
 - **UI-Independent Core Engine**: All memory walks, pattern scanning, and defensive triage evaluations take a process handle and return plain structs (`TriageReport`, `TriageFinding`, `RegionInfo`), keeping core logic fully decoupled from presentation.
 - **Two Flexible View Modes**:
   - **Triage Findings**: Displays all evaluated regions sorted strictly by threat severity descending (`[SEV SCORE] FLAGS ADDRESS SIZE TYPE PROT`).
@@ -65,23 +70,32 @@ Deadeye inspects target processes in a background worker thread and computes an 
 - **SIMD-Accelerated Pattern Search**: Fast sliding-window pattern scanner using `memchr` anchor acceleration, wildcard support (`??`), all-wildcard rejection, and per-region hit caps (10,000).
 - **Robust Page-Wise Read Fallback**: Never silently abandons regions on partial read errors; automatically falls back to 4 KB page-by-page reads to scan past guard pages and decommitted blocks.
 - **Automatic `SeDebugPrivilege` Acquisition**: Attempts token privilege adjustment on startup so elevated processes can inspect system services and protected targets.
-- **Zero Third-Party Dependencies**: Pure C++17 and standard Win32 API (`user32`, `gdi32`, `advapi32`, `comdlg32`).
+- **Zero Third-Party Dependencies**: Pure C++17 and standard Win32 API (`user32`, `gdi32`, `advapi32`, `comctl32`, `comdlg32`).
 
 ---
 
 ## Building
 
+### Repository
+```powershell
+git clone https://github.com/Winter0x11/Deadeye.git
+cd Deadeye
+```
+
 ### Requirements
 - **OS**: Windows 10 or 11 (x64)
-- **Compiler**: MinGW-w64 (`g++`) or MSVC (`cl.exe`)
+- **Compiler**: MinGW-w64 (`g++` & `windres`) or MSVC (`cl.exe`)
 
 ### Build with MinGW-w64 (GCC)
 ```powershell
 # Create build directory
 if (-not (Test-Path build)) { New-Item -ItemType Directory -Path build }
 
+# Compile Windows resources & Common-Controls v6 / DPI manifest
+windres src/deadeye.rc -O coff -o build/deadeye_res.o
+
 # Compile Deadeye GUI (pure Windows subsystem, zero warnings)
-g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 src/main.cpp -o build/deadeye.exe -mwindows -ladvapi32 -lcomdlg32 -lgdi32 -luser32
+g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 src/main.cpp build/deadeye_res.o -o build/deadeye.exe -mwindows -ladvapi32 -lcomctl32 -lcomdlg32 -lgdi32 -luser32
 
 # Compile the test target
 g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 src/test_target.cpp -o build/test_target.exe
