@@ -35,8 +35,9 @@ const int EXIT_BAD_ARGS    = 2;
 const int EXIT_OPEN_FAILED = 3;
 
 // Memory read chunk sizes
-static const SIZE_T CLI_CHUNK_SIZE  = 1024 * 1024; // 1 MB per read
-static const SIZE_T VIEW_PAGE_SIZE  = 64 * 1024;   // 64 KB per GUI page
+static const SIZE_T CLI_CHUNK_SIZE      = 1024 * 1024; // 1 MB per read
+static const SIZE_T VIEW_PAGE_SIZE      = 64 * 1024;   // 64 KB per GUI page
+static const size_t MAX_HITS_PER_REGION = 10000;       // Max pattern matches tracked per region
 
 // Control IDs for GUI child windows
 #define ID_EDIT_PID        101
@@ -77,6 +78,7 @@ struct RegionInfo {
     DWORD protect;
     bool private_rwx;
     std::vector<SIZE_T> hits;
+    bool hits_truncated = false;
     std::vector<Snapshot> snapshots;
 };
 
@@ -192,10 +194,22 @@ bool parse_pattern(const std::string& input, Pattern& out, std::string& err) {
         err = "Pattern is empty.";
         return false;
     }
+
+    bool has_literal = false;
+    for (size_t k = 0; k < out.mask.size(); ++k) {
+        if (out.mask[k] != 0) {
+            has_literal = true;
+            break;
+        }
+    }
+    if (!has_literal) {
+        err = "Pattern cannot consist only of wildcards (must contain at least one literal hex byte).";
+        return false;
+    }
     return true;
 }
 
-// Searches buf[0..len) using a naive sliding window and returns match offsets.
+// Searches buf[0..len) using SIMD-accelerated memchr anchored on the first literal byte.
 std::vector<size_t> find_all(const uint8_t* buf, size_t len, const Pattern& p) {
     std::vector<size_t> hits;
     size_t pl = p.bytes.size();
@@ -203,7 +217,32 @@ std::vector<size_t> find_all(const uint8_t* buf, size_t len, const Pattern& p) {
         return hits;
     }
 
-    for (size_t i = 0; i <= len - pl; ++i) {
+    size_t first_lit = 0;
+    bool has_lit = false;
+    for (size_t k = 0; k < pl; ++k) {
+        if (p.mask[k] != 0) {
+            first_lit = k;
+            has_lit = true;
+            break;
+        }
+    }
+
+    if (!has_lit) {
+        return hits;
+    }
+
+    uint8_t target_byte = p.bytes[first_lit];
+    size_t max_start = len - pl;
+    size_t i = 0;
+
+    while (i <= max_start) {
+        const void* found = std::memchr(buf + i + first_lit, target_byte, (max_start - i) + 1);
+        if (found == nullptr) {
+            break;
+        }
+
+        i = static_cast<size_t>((static_cast<const uint8_t*>(found) - buf) - first_lit);
+
         bool ok = true;
         for (size_t j = 0; j < pl; ++j) {
             if (p.mask[j] != 0 && buf[i + j] != p.bytes[j]) {
@@ -214,6 +253,7 @@ std::vector<size_t> find_all(const uint8_t* buf, size_t len, const Pattern& p) {
         if (ok) {
             hits.push_back(i);
         }
+        ++i;
     }
     return hits;
 }
@@ -316,20 +356,22 @@ void scan_region_cli(HANDLE proc, const MEMORY_BASIC_INFORMATION& mbi, const Pat
     SIZE_T overlap = pat.bytes.size() - 1;
     SIZE_T offset = 0;
     SIZE_T prev_overlap = 0;
+    size_t region_hits = 0;
+    bool hits_capped = false;
 
     stats.regions_scanned += 1;
+    std::vector<uint8_t> buf(CLI_CHUNK_SIZE);
 
     while (offset < region_size) {
         SIZE_T remaining = region_size - offset;
         SIZE_T to_read = (remaining < CLI_CHUNK_SIZE) ? remaining : CLI_CHUNK_SIZE;
-        std::vector<uint8_t> buf(to_read);
         SIZE_T bytes_read = 0;
 
         BOOL ok = ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(region_base + offset),
                                     buf.data(), to_read, &bytes_read);
         if (!ok) {
             DWORD err = GetLastError();
-            std::cout << "[WARN] ReadProcessMemory failed at " << to_hex_string(region_base + offset)
+            std::cerr << "[WARN] ReadProcessMemory failed at " << to_hex_string(region_base + offset)
                       << " (read " << bytes_read << "/" << to_read << " bytes): "
                       << format_win32_error(err) << " (err=" << err << ")\n";
         }
@@ -341,14 +383,23 @@ void scan_region_cli(HANDLE proc, const MEMORY_BASIC_INFORMATION& mbi, const Pat
 
         std::vector<size_t> hits = find_all(buf.data(), bytes_read, pat);
         for (size_t i = 0; i < hits.size(); ++i) {
-            uintptr_t hit_addr = region_base + offset + hits[i];
-            std::string marker = is_private_rwx(mbi.Type, mbi.Protect) ? "[!] " : "    ";
-            std::cout << marker << "HIT addr=" << to_hex_string(hit_addr)
-                      << " region_base=" << to_hex_string(region_base)
-                      << " region_size=" << to_hex_string(region_size)
-                      << " type=" << type_full(mbi.Type)
-                      << " protect=" << prot_full(mbi.Protect) << "\n";
-            stats.total_hits += 1;
+            if (region_hits < MAX_HITS_PER_REGION) {
+                uintptr_t hit_addr = region_base + offset + hits[i];
+                std::string marker = is_private_rwx(mbi.Type, mbi.Protect) ? "[!] " : "    ";
+                std::cout << marker << "HIT addr=" << to_hex_string(hit_addr)
+                          << " region_base=" << to_hex_string(region_base)
+                          << " region_size=" << to_hex_string(region_size)
+                          << " type=" << type_full(mbi.Type)
+                          << " protect=" << prot_full(mbi.Protect) << "\n";
+                stats.total_hits += 1;
+                region_hits += 1;
+            } else if (!hits_capped) {
+                hits_capped = true;
+                std::cerr << "[WARN] Region at " << to_hex_string(region_base)
+                          << " exceeded limit of " << MAX_HITS_PER_REGION
+                          << " hits. Truncating further output for this region.\n";
+                break;
+            }
         }
 
         if (!ok || offset + bytes_read >= region_size || bytes_read <= overlap) break;
@@ -405,7 +456,7 @@ int run_cli(int argc, char* argv[]) {
         if (queried == 0) {
             DWORD err = GetLastError();
             if (err == ERROR_INVALID_PARAMETER) break;
-            std::cout << "[WARN] VirtualQueryEx failed at " << to_hex_string(addr)
+            std::cerr << "[WARN] VirtualQueryEx failed at " << to_hex_string(addr)
                       << ": " << format_win32_error(err) << " (err=" << err << ")\n";
             break;
         }
@@ -963,8 +1014,12 @@ void populate_region_list() {
         char row[160];
         std::string tag;
         if (!r.hits.empty()) {
-            char hbuf[32];
-            std::snprintf(hbuf, sizeof(hbuf), " [%zu hit%s]", r.hits.size(), r.hits.size() == 1 ? "" : "s");
+            char hbuf[48];
+            if (r.hits_truncated) {
+                std::snprintf(hbuf, sizeof(hbuf), " [%zu+ hits (capped)]", r.hits.size());
+            } else {
+                std::snprintf(hbuf, sizeof(hbuf), " [%zu hit%s]", r.hits.size(), r.hits.size() == 1 ? "" : "s");
+            }
             tag += hbuf;
         }
         if (!r.snapshots.empty()) {
@@ -1028,11 +1083,14 @@ void run_load_or_search(bool require_pattern) {
         }
     }
 
+    if (require_pattern && trim_empty) {
+        MessageBoxA(g_hwnd_main, "Enter a hex pattern to search (e.g. '4D 5A ?? 00'), or click 'Load' to view memory without searching.",
+                    "Pattern Required", MB_ICONINFORMATION);
+        return;
+    }
+
     Pattern pat;
     bool use_pattern = !trim_empty;
-    if (require_pattern && !use_pattern) {
-        use_pattern = false;
-    }
     if (use_pattern) {
         std::string err;
         if (!parse_pattern(pat_str, pat, err)) {
@@ -1099,10 +1157,10 @@ void run_load_or_search(bool require_pattern) {
                 SIZE_T overlap = pat.bytes.size() - 1;
                 SIZE_T offset = 0;
                 SIZE_T prev_ov = 0;
+                std::vector<uint8_t> chunk(CLI_CHUNK_SIZE);
                 while (offset < region_size) {
                     SIZE_T rem = region_size - offset;
                     SIZE_T to_read = (rem < CLI_CHUNK_SIZE) ? rem : CLI_CHUNK_SIZE;
-                    std::vector<uint8_t> chunk(to_read);
                     SIZE_T bytes_read = 0;
                     BOOL ok = ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(region_base + offset),
                                                 chunk.data(), to_read, &bytes_read);
@@ -1112,7 +1170,12 @@ void run_load_or_search(bool require_pattern) {
                     }
                     std::vector<size_t> hits = find_all(chunk.data(), bytes_read, pat);
                     for (size_t i = 0; i < hits.size(); ++i) {
-                        reg.hits.push_back(offset + hits[i]);
+                        if (reg.hits.size() < MAX_HITS_PER_REGION) {
+                            reg.hits.push_back(offset + hits[i]);
+                        } else {
+                            reg.hits_truncated = true;
+                            break;
+                        }
                     }
                     if (!ok || offset + bytes_read >= region_size || bytes_read <= overlap) break;
                     offset += (bytes_read - overlap);
