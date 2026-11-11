@@ -1,5 +1,5 @@
-// scanner_gui.cpp
-// Interactive Win32 Memory Map & Hex Viewer + Pattern Scanner.
+// Deadeye - Interactive Win32 Memory Map, Hex Viewer & Real-Time Diff Timeline.
+// Built for defensive malware analysis and detection engineering.
 // Opens a target process (defaulting to "self" on startup), lists every
 // committed virtual memory region on the left, and displays a full 16-byte
 // hex+ASCII dump of the selected region on the right (64 KB per page).
@@ -1277,12 +1277,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
-    wc.lpszClassName = "MemHexViewer";
+    wc.lpszClassName = "DeadeyeHexViewer";
     wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
     wc.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
     RegisterClassA(&wc);
 
-    HWND hwnd = CreateWindowA("MemHexViewer", "Memory Hex Viewer & Pattern Scanner",
+    HWND hwnd = CreateWindowA("DeadeyeHexViewer", "Deadeye - Memory Hex Viewer & Diff Timeline",
                               WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                               1160, 720, nullptr, nullptr, hInst, nullptr);
     ShowWindow(hwnd, nCmdShow);

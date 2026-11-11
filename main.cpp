@@ -1,3 +1,4 @@
+// Deadeye - Windows Process Memory Pattern Scanner
 #include <cctype>
 #include <cerrno>
 #include <cstdint>
@@ -315,7 +316,8 @@ bool parse_pid(const std::string& arg, DWORD& out_pid) {
 
 // Prints CLI usage instructions and exit code meanings when arguments are invalid.
 void print_usage(const char* prog_name) {
-    std::cout << "Usage: " << prog_name << " <pid|self> \"<hex pattern>\"\n"
+    std::cout << "Deadeye - Process Memory Pattern Scanner\n"
+              << "Usage: " << prog_name << " <pid|self> \"<hex pattern>\"\n"
               << "Example: " << prog_name << " 1234 \"4D 5A ?? 00 03\"\n"
               << "Exit codes: 0=hits found, 1=no hits, 2=bad args, 3=OpenProcess failed\n";
 }
@@ -357,7 +359,7 @@ int main(int argc, char* argv[]) {
         return EXIT_OPEN_FAILED;
     }
 
-    std::cout << "Scanning PID " << pid << " for " << pat.bytes.size() << "-byte pattern...\n";
+    std::cout << "[Deadeye] Scanning PID " << pid << " for " << pat.bytes.size() << "-byte pattern...\n";
 
     ScanStats stats;
     stats.regions_scanned = 0;
@@ -374,7 +376,7 @@ int main(int argc, char* argv[]) {
                   << " (err=" << err << ")\n";
     }
 
-    std::cout << "\n--- Summary ---\n"
+    std::cout << "\n--- Deadeye Summary ---\n"
               << "Regions scanned: " << stats.regions_scanned << "\n"
               << "Bytes scanned:   " << stats.bytes_scanned << "\n"
               << "Total hits:      " << stats.total_hits << "\n";
