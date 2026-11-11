@@ -30,8 +30,11 @@
 #define ID_CHK_HITS_ONLY  106
 #define ID_LIST_REGIONS   107
 #define ID_EDIT_HEX       108
-#define ID_BTN_PREV_PAGE  109
-#define ID_BTN_NEXT_PAGE  110
+#define ID_BTN_PREV_PAGE   109
+#define ID_BTN_NEXT_PAGE   110
+#define ID_BTN_SNAP        111
+#define ID_COMBO_DIFF      112
+#define ID_BTN_CLEAR_SNAPS 113
 
 // Display 64 KB (4096 rows) per page so huge regions stay fast and responsive.
 static const SIZE_T VIEW_PAGE_SIZE = 64 * 1024;
@@ -44,7 +47,15 @@ struct Pattern {
     std::vector<uint8_t> mask;
 };
 
-// Metadata and hit offsets for one committed region in the target process.
+// Snapshot of a memory page for timeline diffing.
+struct Snapshot {
+    std::vector<uint8_t> data;
+    SIZE_T view_offset;
+    DWORD timestamp_ms;
+    std::string label;
+};
+
+// Metadata, hit offsets, and snapshot timeline for one committed region.
 struct RegionInfo {
     uintptr_t base;
     SIZE_T size;
@@ -52,6 +63,7 @@ struct RegionInfo {
     DWORD protect;
     bool private_rwx;
     std::vector<SIZE_T> hits;
+    std::vector<Snapshot> snapshots;
 };
 
 // Global UI handles and current scan state.
@@ -66,6 +78,9 @@ static HWND g_list_regions = nullptr;
 static HWND g_lbl_hex_info = nullptr;
 static HWND g_btn_prev_page = nullptr;
 static HWND g_btn_next_page = nullptr;
+static HWND g_btn_snap = nullptr;
+static HWND g_combo_diff = nullptr;
+static HWND g_btn_clear_snaps = nullptr;
 static HWND g_edit_hex = nullptr;
 static HWND g_lbl_status = nullptr;
 static HFONT g_mono_font = nullptr;
@@ -362,6 +377,124 @@ std::string build_hex_dump(const uint8_t* buf, size_t buf_len, uintptr_t view_ad
     return out;
 }
 
+void display_selected_region(SIZE_T focus_offset);
+
+// Updates the diff selection combo box based on snapshots of the active region.
+void update_diff_combo() {
+    SendMessageA(g_combo_diff, CB_RESETCONTENT, 0, 0);
+    SendMessageA(g_combo_diff, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Diff: Off (Normal)"));
+
+    if (!g_has_selection || g_selected_region >= g_regions.size()) {
+        SendMessageA(g_combo_diff, CB_SETCURSEL, 0, 0);
+        EnableWindow(g_btn_snap, FALSE);
+        EnableWindow(g_combo_diff, FALSE);
+        EnableWindow(g_btn_clear_snaps, FALSE);
+        return;
+    }
+
+    EnableWindow(g_btn_snap, TRUE);
+    const RegionInfo& reg = g_regions[g_selected_region];
+
+    if (reg.snapshots.empty()) {
+        SendMessageA(g_combo_diff, CB_SETCURSEL, 0, 0);
+        EnableWindow(g_combo_diff, FALSE);
+        EnableWindow(g_btn_clear_snaps, FALSE);
+        return;
+    }
+
+    EnableWindow(g_combo_diff, TRUE);
+    EnableWindow(g_btn_clear_snaps, TRUE);
+
+    for (size_t i = 0; i < reg.snapshots.size(); ++i) {
+        std::string item = "Live vs " + reg.snapshots[i].label;
+        SendMessageA(g_combo_diff, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.c_str()));
+    }
+
+    if (reg.snapshots.size() >= 2) {
+        for (size_t i = 0; i + 1 < reg.snapshots.size(); ++i) {
+            std::string item = reg.snapshots[i].label + " vs " + reg.snapshots[i + 1].label;
+            SendMessageA(g_combo_diff, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item.c_str()));
+        }
+    }
+
+    // Default to comparing Live vs the most recent snapshot.
+    LRESULT count = SendMessageA(g_combo_diff, CB_GETCOUNT, 0, 0);
+    WPARAM sel = (reg.snapshots.size() > 0) ? static_cast<WPARAM>(reg.snapshots.size()) : 0;
+    if (sel >= static_cast<WPARAM>(count)) sel = 0;
+    SendMessageA(g_combo_diff, CB_SETCURSEL, sel, 0);
+}
+
+// Captures a snapshot of the current 64 KB page for timeline diffing.
+void on_take_snapshot() {
+    if (!g_has_selection || g_selected_region >= g_regions.size()) return;
+    RegionInfo& reg = g_regions[g_selected_region];
+
+    if (g_view_offset >= reg.size) g_view_offset = 0;
+    SIZE_T remaining = reg.size - g_view_offset;
+    SIZE_T to_read = (remaining < VIEW_PAGE_SIZE) ? remaining : VIEW_PAGE_SIZE;
+
+    HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, g_current_pid);
+    if (proc == nullptr) {
+        DWORD err = GetLastError();
+        set_status("[ERROR] OpenProcess failed: " + format_win32_error(err));
+        return;
+    }
+
+    Snapshot snap;
+    snap.data.resize(to_read);
+    SIZE_T bytes_read = 0;
+    BOOL ok = ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(reg.base + g_view_offset),
+                                snap.data.data(), to_read, &bytes_read);
+    DWORD read_err = ok ? 0 : GetLastError();
+    CloseHandle(proc);
+
+    if (bytes_read == 0) {
+        set_status("[ERROR] Could not capture snapshot: " + format_win32_error(read_err));
+        return;
+    }
+    snap.data.resize(bytes_read);
+    snap.view_offset = g_view_offset;
+    snap.timestamp_ms = GetTickCount();
+
+    size_t snap_num = reg.snapshots.size() + 1;
+    char label_buf[64];
+    if (reg.snapshots.empty()) {
+        std::snprintf(label_buf, sizeof(label_buf), "Snap #%zu (0.0s)", snap_num);
+    } else {
+        DWORD elapsed_ms = snap.timestamp_ms - reg.snapshots[0].timestamp_ms;
+        double sec = static_cast<double>(elapsed_ms) / 1000.0;
+        std::snprintf(label_buf, sizeof(label_buf), "Snap #%zu (+%.1fs)", snap_num, sec);
+    }
+    snap.label = label_buf;
+
+    reg.snapshots.push_back(snap);
+    update_diff_combo();
+
+    char status[192];
+    std::snprintf(status, sizeof(status),
+                  "Captured %s for region 0x%016llX (%zu bytes) | %zu snapshot(s) in timeline",
+                  snap.label.c_str(),
+                  static_cast<unsigned long long>(reg.base + g_view_offset),
+                  bytes_read, reg.snapshots.size());
+    set_status(status);
+
+    display_selected_region(static_cast<SIZE_T>(-1));
+}
+
+// Clears all snapshots stored for the currently active region.
+void on_clear_snapshots() {
+    if (!g_has_selection || g_selected_region >= g_regions.size()) return;
+    RegionInfo& reg = g_regions[g_selected_region];
+    size_t count = reg.snapshots.size();
+    reg.snapshots.clear();
+    update_diff_combo();
+    display_selected_region(static_cast<SIZE_T>(-1));
+
+    char status[128];
+    std::snprintf(status, sizeof(status), "Cleared %zu snapshot(s) for current region.", count);
+    set_status(status);
+}
+
 // Reads up to VIEW_PAGE_SIZE bytes of the selected region at g_view_offset
 // and renders its hex+ASCII dump into g_edit_hex, scrolling to focus_offset.
 void display_selected_region(SIZE_T focus_offset) {
@@ -499,6 +632,7 @@ void select_region_in_ui(size_t region_idx, SIZE_T view_offset, SIZE_T focus_off
             break;
         }
     }
+    update_diff_combo();
     display_selected_region(focus_offset);
 }
 
@@ -659,6 +793,7 @@ void run_load_or_search(bool require_pattern) {
     } else if (!g_visible_indices.empty()) {
         select_region_in_ui(g_visible_indices[0], 0, static_cast<SIZE_T>(-1));
     } else {
+        update_diff_combo();
         display_selected_region(static_cast<SIZE_T>(-1));
     }
 
@@ -783,6 +918,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
                                         0, 0, 76, 20, hwnd, reinterpret_cast<HMENU>(ID_BTN_NEXT_PAGE), hInst, nullptr);
 
+        g_btn_snap = CreateWindowA("BUTTON", "+ Snap",
+                                   WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
+                                   0, 0, 72, 22, hwnd, reinterpret_cast<HMENU>(ID_BTN_SNAP), hInst, nullptr);
+        g_combo_diff = CreateWindowA("COMBOBOX", "",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL | WS_DISABLED,
+                                     0, 0, 146, 160, hwnd, reinterpret_cast<HMENU>(ID_COMBO_DIFF), hInst, nullptr);
+        g_btn_clear_snaps = CreateWindowA("BUTTON", "Clear",
+                                          WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
+                                          0, 0, 52, 22, hwnd, reinterpret_cast<HMENU>(ID_BTN_CLEAR_SNAPS), hInst, nullptr);
+
         g_list_regions = CreateWindowA("LISTBOX", "",
                                        WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | WS_HSCROLL |
                                        WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
@@ -802,6 +947,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HWND ui_items[] = {
             lbl_pid, g_edit_pid, g_btn_load, lbl_pat, g_edit_pattern, g_btn_search,
             g_btn_next_hit, g_chk_hits_only, lbl_map, g_lbl_hex_info,
+            g_btn_snap, g_combo_diff, g_btn_clear_snaps,
             g_btn_prev_page, g_btn_next_page, g_lbl_status
         };
         for (size_t i = 0; i < sizeof(ui_items) / sizeof(ui_items[0]); ++i) {
@@ -827,13 +973,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (right_w < 120) right_w = 120;
 
         int hdr_y = M + RH + M;
-        int pane_top = hdr_y + 22;
+        int pane_top = hdr_y + 24;
         int pane_h = h - pane_top - 28;
         if (pane_h < 60) pane_h = 60;
 
-        MoveWindow(g_lbl_hex_info, right_x, hdr_y, (right_w > 165) ? right_w - 165 : 20, 18, TRUE);
-        MoveWindow(g_btn_prev_page, w - M - 156, hdr_y - 1, 76, 20, TRUE);
-        MoveWindow(g_btn_next_page, w - M - 76, hdr_y - 1, 76, 20, TRUE);
+        int cur_r = w - M;
+        int btn_next_x = cur_r - 74; cur_r -= 78;
+        int btn_prev_x = cur_r - 74; cur_r -= 78;
+        int btn_clr_x  = cur_r - 52; cur_r -= 56;
+        int combo_x    = cur_r - 146; cur_r -= 150;
+        int btn_snap_x = cur_r - 72; cur_r -= 76;
+        int info_w     = btn_snap_x - right_x - 6;
+        if (info_w < 50) info_w = 50;
+
+        MoveWindow(g_lbl_hex_info, right_x, hdr_y + 2, info_w, 18, TRUE);
+        MoveWindow(g_btn_snap, btn_snap_x, hdr_y - 1, 72, 22, TRUE);
+        MoveWindow(g_combo_diff, combo_x, hdr_y - 1, 146, 160, TRUE);
+        MoveWindow(g_btn_clear_snaps, btn_clr_x, hdr_y - 1, 52, 22, TRUE);
+        MoveWindow(g_btn_prev_page, btn_prev_x, hdr_y - 1, 74, 22, TRUE);
+        MoveWindow(g_btn_next_page, btn_next_x, hdr_y - 1, 74, 22, TRUE);
+
         MoveWindow(g_list_regions, M, pane_top, list_w, pane_h, TRUE);
         MoveWindow(g_edit_hex, right_x, pane_top, right_w, pane_h, TRUE);
         MoveWindow(g_lbl_status, M, h - 22, (w > M * 2) ? w - M * 2 : 10, 18, TRUE);
@@ -860,6 +1019,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 select_region_in_ui(g_visible_indices[0], 0, static_cast<SIZE_T>(-1));
             } else {
                 g_has_selection = false;
+                update_diff_combo();
                 display_selected_region(static_cast<SIZE_T>(-1));
             }
         } else if (id == ID_LIST_REGIONS && code == LBN_SELCHANGE) {
@@ -880,14 +1040,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (id == ID_BTN_PREV_PAGE) {
             if (g_has_selection && g_view_offset >= VIEW_PAGE_SIZE) {
                 g_view_offset -= VIEW_PAGE_SIZE;
+                update_diff_combo();
                 display_selected_region(static_cast<SIZE_T>(-1));
             }
         } else if (id == ID_BTN_NEXT_PAGE) {
             if (g_has_selection && g_selected_region < g_regions.size() &&
                 g_view_offset + VIEW_PAGE_SIZE < g_regions[g_selected_region].size) {
                 g_view_offset += VIEW_PAGE_SIZE;
+                update_diff_combo();
                 display_selected_region(static_cast<SIZE_T>(-1));
             }
+        } else if (id == ID_BTN_SNAP) {
+            on_take_snapshot();
+        } else if (id == ID_BTN_CLEAR_SNAPS) {
+            on_clear_snapshots();
+        } else if (id == ID_COMBO_DIFF && code == CBN_SELCHANGE) {
+            display_selected_region(static_cast<SIZE_T>(-1));
         }
         return 0;
     }
