@@ -72,8 +72,22 @@ int main() {
     std::cout << "Heap buffer: " << ptr_to_hex(heap_buf.data()) << " (PRIVATE, RW)\n";
     std::cout << "RWX buffer:  " << ptr_to_hex(rwx_buf) << " (PRIVATE, PAGE_EXECUTE_READWRITE)\n";
     std::cout << "Pattern:     DE AD BE EF 13 37 CA FE\n";
-    std::cout << "Press Enter to exit...\n";
-    std::cin.get();
+    std::cout << "Commands: enter 'm' to mutate bytes, or press Enter/q to quit...\n";
+    std::string line;
+    uint32_t counter = 1;
+    while (std::getline(std::cin, line)) {
+        if (line == "q" || line.empty()) {
+            break;
+        }
+        if (line == "m") {
+            uint8_t* rwx_bytes = reinterpret_cast<uint8_t*>(rwx_buf);
+            rwx_bytes[4] = static_cast<uint8_t>(rwx_bytes[4] ^ 0xAA);
+            rwx_bytes[5] = static_cast<uint8_t>(counter & 0xFF);
+            heap_buf[0] = static_cast<uint8_t>(heap_buf[0] + 1);
+            counter++;
+            std::cout << "[*] Mutated memory (iteration " << counter - 1 << "). Type 'm' to mutate again, Enter to quit:\n";
+        }
+    }
 
     // Release the VirtualAlloc region back to the OS before exiting.
     VirtualFree(rwx_buf, 0, MEM_RELEASE);

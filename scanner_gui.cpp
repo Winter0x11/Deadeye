@@ -300,11 +300,18 @@ bool parse_pid_text(const std::string& arg, DWORD& out_pid) {
 }
 
 // Formats a full hex+ASCII dump for buf[0..buf_len), marking matched rows
-// with ">>>" and returning the line number of focus_offset (or -1 if none).
+// with ">>>", diff rows with "CHG" (and "!>>" if both), and printing an
+// aligned "old:" sub-row under any row with modified bytes.
 std::string build_hex_dump(const uint8_t* buf, size_t buf_len, uintptr_t view_addr,
                            const std::vector<SIZE_T>& region_hits, SIZE_T view_offset,
-                           size_t pat_len, SIZE_T focus_offset, int& out_focus_line) {
+                           size_t pat_len, SIZE_T focus_offset, int& out_focus_line,
+                           const uint8_t* ref_buf, size_t ref_len, bool diff_active,
+                           size_t& out_chg_bytes, size_t& out_new_bytes, size_t& out_zeroed_bytes) {
     out_focus_line = -1;
+    out_chg_bytes = 0;
+    out_new_bytes = 0;
+    out_zeroed_bytes = 0;
+
     if (buf_len == 0) {
         return "(No readable bytes in this page)\r\n";
     }
@@ -325,30 +332,56 @@ std::string build_hex_dump(const uint8_t* buf, size_t buf_len, uintptr_t view_ad
     }
 
     std::string out;
-    out.reserve(buf_len * 5 + 256);
+    out.reserve(buf_len * 6 + 256);
     out += "    Address           00 01 02 03 04 05 06 07  08 09 0A 0B 0C 0D 0E 0F  0123456789ABCDEF\r\n";
     out += "    ----------------  -----------------------  -----------------------  ----------------\r\n";
 
     size_t num_rows = (buf_len + 15) / 16;
+    int line_counter = 2; // header lines
+
     for (size_t row = 0; row < num_rows; ++row) {
         size_t rs = row * 16;
         size_t re = rs + 16;
         if (re > buf_len) re = buf_len;
 
         bool row_has_hit = false;
+        bool row_has_diff = false;
+
         for (size_t i = rs; i < re; ++i) {
             if (hit_byte[i] != 0) {
                 row_has_hit = true;
-                break;
+            }
+            if (diff_active && ref_buf != nullptr) {
+                if (i < ref_len) {
+                    if (buf[i] != ref_buf[i]) {
+                        row_has_diff = true;
+                        out_chg_bytes++;
+                        if (ref_buf[i] == 0 && buf[i] != 0) out_new_bytes++;
+                        else if (ref_buf[i] != 0 && buf[i] == 0) out_zeroed_bytes++;
+                    }
+                } else {
+                    row_has_diff = true;
+                    out_chg_bytes++;
+                    if (buf[i] != 0) out_new_bytes++;
+                }
             }
         }
 
         if (focus_offset != static_cast<SIZE_T>(-1) &&
             focus_offset >= view_offset + rs && focus_offset < view_offset + re) {
-            out_focus_line = static_cast<int>(row + 2);
+            out_focus_line = line_counter;
         }
 
-        out += row_has_hit ? ">>> " : "    ";
+        if (row_has_hit && row_has_diff) {
+            out += "!>> ";
+        } else if (row_has_diff) {
+            out += "CHG ";
+        } else if (row_has_hit) {
+            out += ">>> ";
+        } else {
+            out += "    ";
+        }
+
         out += fmt_addr(view_addr + rs);
         out += "  ";
 
@@ -373,6 +406,32 @@ std::string build_hex_dump(const uint8_t* buf, size_t buf_len, uintptr_t view_ad
             }
         }
         out += "\r\n";
+        line_counter++;
+
+        // Render aligned diff sub-row if any byte in this row changed.
+        if (row_has_diff && ref_buf != nullptr) {
+            out += "        old:          ";
+            for (size_t i = rs; i < rs + 16; ++i) {
+                if (i == rs + 8) out += " ";
+                if (i < re && i < ref_len && buf[i] != ref_buf[i]) {
+                    std::snprintf(hx, sizeof(hx), "%02X ", ref_buf[i]);
+                    out += hx;
+                } else {
+                    out += "   ";
+                }
+            }
+            out += " ";
+            for (size_t i = rs; i < rs + 16; ++i) {
+                if (i < re && i < ref_len && buf[i] != ref_buf[i]) {
+                    uint8_t b = ref_buf[i];
+                    out += (b >= 0x20 && b < 0x7F) ? static_cast<char>(b) : '.';
+                } else {
+                    out += ' ';
+                }
+            }
+            out += "\r\n";
+            line_counter++;
+        }
     }
     return out;
 }
@@ -495,6 +554,51 @@ void on_clear_snapshots() {
     set_status(status);
 }
 
+// Describes the active pair of buffers for memory timeline comparison.
+struct DiffPair {
+    bool active;
+    std::string title;
+    const std::vector<uint8_t>* ref_data;
+    const std::vector<uint8_t>* cmp_data;
+    SIZE_T ref_view_offset;
+    SIZE_T cmp_view_offset;
+};
+
+// Resolves which snapshots/live buffers are being compared from the combo selection.
+DiffPair get_active_diff_pair() {
+    DiffPair dp = { false, "", nullptr, nullptr, 0, 0 };
+    if (!g_has_selection || g_selected_region >= g_regions.size()) return dp;
+    const RegionInfo& reg = g_regions[g_selected_region];
+    if (reg.snapshots.empty()) return dp;
+
+    LRESULT sel = SendMessageA(g_combo_diff, CB_GETCURSEL, 0, 0);
+    if (sel <= 0 || sel == CB_ERR) return dp;
+
+    size_t snap_count = reg.snapshots.size();
+    if (static_cast<size_t>(sel) <= snap_count) {
+        size_t idx = static_cast<size_t>(sel - 1);
+        dp.active = true;
+        dp.title = "Live vs " + reg.snapshots[idx].label;
+        dp.ref_data = &reg.snapshots[idx].data;
+        dp.cmp_data = nullptr; // live
+        dp.ref_view_offset = reg.snapshots[idx].view_offset;
+        dp.cmp_view_offset = g_view_offset;
+        return dp;
+    }
+
+    size_t pair_idx = static_cast<size_t>(sel - 1 - snap_count);
+    if (pair_idx + 1 < snap_count) {
+        dp.active = true;
+        dp.title = reg.snapshots[pair_idx].label + " vs " + reg.snapshots[pair_idx + 1].label;
+        dp.ref_data = &reg.snapshots[pair_idx].data;
+        dp.cmp_data = &reg.snapshots[pair_idx + 1].data;
+        dp.ref_view_offset = reg.snapshots[pair_idx].view_offset;
+        dp.cmp_view_offset = reg.snapshots[pair_idx + 1].view_offset;
+        return dp;
+    }
+    return dp;
+}
+
 // Reads up to VIEW_PAGE_SIZE bytes of the selected region at g_view_offset
 // and renders its hex+ASCII dump into g_edit_hex, scrolling to focus_offset.
 void display_selected_region(SIZE_T focus_offset) {
@@ -515,57 +619,103 @@ void display_selected_region(SIZE_T focus_offset) {
     SIZE_T remaining = reg.size - g_view_offset;
     SIZE_T to_read = (remaining < VIEW_PAGE_SIZE) ? remaining : VIEW_PAGE_SIZE;
 
-    char info[256];
-    std::snprintf(info, sizeof(info),
-                  "Region %zu/%zu | Base 0x%016llX | %s | %s%s | Showing 0x%llX..0x%llX of 0x%llX",
-                  g_selected_region + 1, g_regions.size(),
-                  static_cast<unsigned long long>(reg.base),
-                  type_full(reg.type).c_str(),
-                  prot_full(reg.protect).c_str(),
-                  reg.private_rwx ? " [!]" : "",
-                  static_cast<unsigned long long>(g_view_offset),
-                  static_cast<unsigned long long>(g_view_offset + to_read),
-                  static_cast<unsigned long long>(reg.size));
-    // Update the hex pane header bar with region metadata and page bounds.
-    SetWindowTextA(g_lbl_hex_info, info);
-
     EnableWindow(g_btn_prev_page, g_view_offset > 0 ? TRUE : FALSE);
     EnableWindow(g_btn_next_page, (g_view_offset + to_read < reg.size) ? TRUE : FALSE);
 
-    // Open the target process briefly to read the requested 64 KB page live.
-    HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, g_current_pid);
-    if (proc == nullptr) {
-        DWORD err = GetLastError();
-        std::string msg = "[ERROR] OpenProcess failed: " + format_win32_error(err) + "\r\n";
-        SetWindowTextA(g_edit_hex, msg.c_str());
-        return;
+    DiffPair dp = get_active_diff_pair();
+    std::vector<uint8_t> buf;
+    SIZE_T bytes_read = 0;
+    BOOL ok = TRUE;
+    DWORD read_err = 0;
+
+    if (dp.active && dp.cmp_data != nullptr) {
+        // Snapshot A vs Snapshot B: use stored snapshot bytes
+        buf = *dp.cmp_data;
+        bytes_read = buf.size();
+    } else {
+        // Live memory read
+        HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, g_current_pid);
+        if (proc == nullptr) {
+            DWORD err = GetLastError();
+            std::string msg = "[ERROR] OpenProcess failed: " + format_win32_error(err) + "\r\n";
+            SetWindowTextA(g_edit_hex, msg.c_str());
+            return;
+        }
+
+        buf.resize(to_read);
+        ok = ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(reg.base + g_view_offset),
+                               buf.data(), to_read, &bytes_read);
+        read_err = ok ? 0 : GetLastError();
+        CloseHandle(proc);
+
+        if (bytes_read == 0) {
+            std::string msg = "[WARN] ReadProcessMemory failed at 0x" + fmt_addr(reg.base + g_view_offset) +
+                              ": " + format_win32_error(read_err) + "\r\n";
+            SetWindowTextA(g_edit_hex, msg.c_str());
+            return;
+        }
+        buf.resize(bytes_read);
     }
 
-    std::vector<uint8_t> buf(to_read);
-    SIZE_T bytes_read = 0;
-    // Copy the target region page into local memory for hex formatting.
-    BOOL ok = ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(reg.base + g_view_offset),
-                                buf.data(), to_read, &bytes_read);
-    DWORD read_err = ok ? 0 : GetLastError();
-    // Close the process handle right after reading the page.
-    CloseHandle(proc);
-
-    if (bytes_read == 0) {
-        std::string msg = "[WARN] ReadProcessMemory failed at 0x" + fmt_addr(reg.base + g_view_offset) +
-                          ": " + format_win32_error(read_err) + "\r\n";
-        SetWindowTextA(g_edit_hex, msg.c_str());
-        return;
+    const uint8_t* ref_ptr = nullptr;
+    size_t ref_len = 0;
+    bool offset_mismatch = false;
+    if (dp.active && dp.ref_data != nullptr) {
+        if (dp.ref_view_offset == g_view_offset) {
+            ref_ptr = dp.ref_data->data();
+            ref_len = dp.ref_data->size();
+        } else {
+            offset_mismatch = true;
+        }
     }
 
     int focus_line = -1;
+    size_t chg_bytes = 0, new_bytes = 0, zeroed_bytes = 0;
     std::string dump = build_hex_dump(buf.data(), bytes_read, reg.base + g_view_offset,
                                       reg.hits, g_view_offset, g_active_pattern.bytes.size(),
-                                      focus_offset, focus_line);
+                                      focus_offset, focus_line,
+                                      ref_ptr, ref_len, dp.active && !offset_mismatch,
+                                      chg_bytes, new_bytes, zeroed_bytes);
+
+    if (offset_mismatch) {
+        char warn_note[192];
+        std::snprintf(warn_note, sizeof(warn_note),
+                      "[Note: Selected snapshot belongs to offset 0x%llX; current page is 0x%llX. Page alignment required for diff.]\r\n\r\n",
+                      static_cast<unsigned long long>(dp.ref_view_offset),
+                      static_cast<unsigned long long>(g_view_offset));
+        dump = warn_note + dump;
+        if (focus_line >= 0) focus_line += 2;
+    }
+
     if (!ok) {
         dump = "[WARN] Partial read (" + std::to_string(bytes_read) + "/" + std::to_string(to_read) +
                " bytes): " + format_win32_error(read_err) + "\r\n\r\n" + dump;
         if (focus_line >= 0) focus_line += 2;
     }
+
+    char info[320];
+    if (dp.active && !offset_mismatch) {
+        std::snprintf(info, sizeof(info),
+                      "Region %zu/%zu | Base 0x%016llX | %s | %s%s | Diff [%s]: %zu chg (%zu new, %zu wiped)",
+                      g_selected_region + 1, g_regions.size(),
+                      static_cast<unsigned long long>(reg.base),
+                      type_full(reg.type).c_str(),
+                      prot_full(reg.protect).c_str(),
+                      reg.private_rwx ? " [!]" : "",
+                      dp.title.c_str(), chg_bytes, new_bytes, zeroed_bytes);
+    } else {
+        std::snprintf(info, sizeof(info),
+                      "Region %zu/%zu | Base 0x%016llX | %s | %s%s | Showing 0x%llX..0x%llX of 0x%llX",
+                      g_selected_region + 1, g_regions.size(),
+                      static_cast<unsigned long long>(reg.base),
+                      type_full(reg.type).c_str(),
+                      prot_full(reg.protect).c_str(),
+                      reg.private_rwx ? " [!]" : "",
+                      static_cast<unsigned long long>(g_view_offset),
+                      static_cast<unsigned long long>(g_view_offset + to_read),
+                      static_cast<unsigned long long>(reg.size));
+    }
+    SetWindowTextA(g_lbl_hex_info, info);
 
     // Replace the hex box contents in one call and reset scroll to top or hit row.
     SetWindowTextA(g_edit_hex, dump.c_str());
