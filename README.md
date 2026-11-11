@@ -1,4 +1,4 @@
-# Deadeye 🎯
+# Deadeye 
 
 **Deadeye** is a unified, lightweight, high-performance Windows process memory pattern scanner, interactive hex viewer, and real-time memory diff timeline built in modern C++ and native Win32.
 
@@ -6,23 +6,11 @@ Designed for defensive reverse engineering, malware analysis, and detection engi
 
 ---
 
-## 📁 Project Structure
 
-```text
-Deadeye/
-├── build/                 # Output directory for compiled binaries (gitignored)
-│   ├── deadeye.exe        # Unified executable (CLI + GUI)
-│   └── test_target.exe    # Test target with memory mutation support
-├── src/
-│   ├── main.cpp           # Unified Deadeye application (CLI scanner + GUI viewer)
-│   └── test_target.cpp    # Test process allocating heap and RWX regions
-├── .gitignore
-└── README.md
-```
 
 ---
 
-## ✨ Features
+## Features
 
 - **Dual-Mode Single Binary**: Automatically launches in interactive GUI mode when double-clicked, or runs as a headless CLI scanner when passed arguments in a terminal.
 - **Real-Time Memory Heartbeat**: Periodic (1s) live diff monitoring that flags modified rows and shows exact previous byte values as memory changes in running targets.
@@ -36,7 +24,7 @@ Deadeye/
 
 ---
 
-## 🛠️ Building
+## Building
 
 ### Requirements
 - **OS**: Windows 10 or 11 (x64)
@@ -63,7 +51,7 @@ cl /std:c++17 /EHsc /W4 /O2 src/test_target.cpp /Fe:build/test_target.exe
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Interactive GUI Mode
 Double-click `build/deadeye.exe` or run:
@@ -96,7 +84,7 @@ When passed command-line arguments, Deadeye runs directly in your terminal:
 
 ---
 
-## 🧪 Testing with `test_target`
+## Testing with `test_target`
 
 1. Start the included test target in a terminal:
    ```powershell
