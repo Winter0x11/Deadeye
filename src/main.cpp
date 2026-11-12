@@ -95,7 +95,6 @@ constexpr int SEV_MIN_LOW = 10;
 #define ID_COMBO_MIN_SEV 117
 #define ID_CHK_HIDE_CLEAN 118
 #define ID_BTN_EXPORT_JSON 119
-#define ID_COMBO_THEME 120
 #define ID_BTN_DIFF_PROC 121
 #define ID_BTN_YARA 122
 #define IDT_HEARTBEAT 1001
@@ -1331,7 +1330,6 @@ static HWND g_btn_search = nullptr;
 static HWND g_btn_next_hit = nullptr;
 static HWND g_chk_hits_only = nullptr;
 static HWND g_chk_heartbeat = nullptr;
-static HWND g_combo_theme = nullptr;
 static HWND g_btn_diff_proc = nullptr;
 static HWND g_btn_yara = nullptr;
 
@@ -1437,6 +1435,20 @@ void update_theme_brushes()
     const ThemeColors &tc = get_current_theme();
     g_br_window = CreateSolidBrush(tc.bg_window);
     g_br_control = CreateSolidBrush(tc.bg_control);
+}
+
+void apply_theme_switch(HWND hwnd, AppTheme new_theme)
+{
+    g_theme = new_theme;
+    update_theme_brushes();
+    InvalidateRect(hwnd, nullptr, TRUE);
+    if (g_list_regions) InvalidateRect(g_list_regions, nullptr, TRUE);
+    if (g_edit_hex) InvalidateRect(g_edit_hex, nullptr, TRUE);
+    if (g_lbl_triage_reasons) InvalidateRect(g_lbl_triage_reasons, nullptr, TRUE);
+    if (g_lbl_status) InvalidateRect(g_lbl_status, nullptr, TRUE);
+    HWND btns[] = { g_btn_load, g_btn_triage, g_btn_search, g_btn_next_hit, g_btn_export_json, g_btn_snap, g_btn_clear_snaps, g_btn_prev_page, g_btn_next_page, g_btn_diff_proc, g_btn_yara };
+    for (HWND b : btns) { if (b) InvalidateRect(b, nullptr, TRUE); }
+    set_status((g_theme == AppTheme::Dark) ? "Theme switched to Modern Dark." : "Theme switched to Classic Light.");
 }
 
 struct DiffPair
@@ -3366,14 +3378,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                         x, M, 110, RH, hwnd, reinterpret_cast<HMENU>(ID_CHK_HEARTBEAT), hInst, nullptr);
         x += 114;
 
-        g_combo_theme = CreateWindowA("COMBOBOX", "",
-                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-                                      x, M, 150, 100, hwnd, reinterpret_cast<HMENU>(ID_COMBO_THEME), hInst, nullptr);
-        SendMessageA(g_combo_theme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Theme: Light Mode"));
-        SendMessageA(g_combo_theme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Theme: Dark Mode"));
-        SendMessageA(g_combo_theme, CB_SETCURSEL, 0, 0);
-        x += 154;
-
         g_btn_diff_proc = CreateWindowA("BUTTON", "Diff Proc",
                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                                         x, M, 74, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_DIFF_PROC), hInst, nullptr);
@@ -3456,7 +3460,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         HWND ui_items[] = {
             lbl_pid, g_edit_pid, g_btn_load, g_btn_triage, lbl_pat, g_edit_pattern, g_btn_search,
-            g_btn_next_hit, g_chk_hits_only, g_chk_heartbeat, g_combo_theme, g_btn_diff_proc, g_btn_yara,
+            g_btn_next_hit, g_chk_hits_only, g_chk_heartbeat, g_btn_diff_proc, g_btn_yara,
             g_combo_view_mode, g_combo_min_sev, g_chk_hide_clean, g_btn_export_json,
             g_lbl_hex_info, g_btn_snap, g_combo_diff, g_btn_clear_snaps,
             g_btn_prev_page, g_btn_next_page, g_lbl_triage_reasons, g_lbl_status};
@@ -3734,19 +3738,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_hide_clean = (SendMessageA(g_chk_hide_clean, BM_GETCHECK, 0, 0) == BST_CHECKED);
             populate_region_list();
         }
-        else if (id == ID_COMBO_THEME && code == CBN_SELCHANGE)
-        {
-            LRESULT sel = SendMessageA(g_combo_theme, CB_GETCURSEL, 0, 0);
-            g_theme = (sel == 1) ? AppTheme::Dark : AppTheme::Light;
-            update_theme_brushes();
-            InvalidateRect(hwnd, nullptr, TRUE);
-            InvalidateRect(g_list_regions, nullptr, TRUE);
-            InvalidateRect(g_edit_hex, nullptr, TRUE);
-            InvalidateRect(g_lbl_triage_reasons, nullptr, TRUE);
-            InvalidateRect(g_lbl_status, nullptr, TRUE);
-            HWND btns[] = { g_btn_load, g_btn_triage, g_btn_search, g_btn_next_hit, g_btn_export_json, g_btn_snap, g_btn_clear_snaps, g_btn_prev_page, g_btn_next_page, g_btn_diff_proc, g_btn_yara };
-            for (HWND b : btns) InvalidateRect(b, nullptr, TRUE);
-        }
         else if (id == ID_CHK_HITS_ONLY)
         {
             populate_region_list();
@@ -3923,13 +3914,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         else if (id == IDM_FILE_THEME_LIGHT)
         {
-            SendMessageA(g_combo_theme, CB_SETCURSEL, 0, 0);
-            SendMessageA(hwnd, WM_COMMAND, MAKEWPARAM(ID_COMBO_THEME, CBN_SELCHANGE), reinterpret_cast<LPARAM>(g_combo_theme));
+            apply_theme_switch(hwnd, AppTheme::Light);
         }
         else if (id == IDM_FILE_THEME_DARK)
         {
-            SendMessageA(g_combo_theme, CB_SETCURSEL, 1, 0);
-            SendMessageA(hwnd, WM_COMMAND, MAKEWPARAM(ID_COMBO_THEME, CBN_SELCHANGE), reinterpret_cast<LPARAM>(g_combo_theme));
+            apply_theme_switch(hwnd, AppTheme::Dark);
         }
         else if (id == IDM_VIEW_HIDE_CLEAN)
         {
