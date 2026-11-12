@@ -31,9 +31,9 @@ Deadeye inspects target processes in a background worker thread and computes an 
 
 - **Pure Windows Subsystem Application**: Built strictly as a native GUI binary (`/SUBSYSTEM:WINDOWS`, `-mwindows`). No console flashing on launch, no command-line baggage.
 - **Full Application Menu Bar & Global Shortcuts**:
-  - **File**: Attach to Self (`Ctrl+Alt+S`), Run Defensive Triage (`Ctrl+T`), Export Triage JSON (`Ctrl+S`), Exit (`Alt+F4`).
+  - **File**: Attach to Self (`Ctrl+Alt+S`), Run Defensive Triage (`Ctrl+T`), Export Triage JSON (`Ctrl+S`), **Theme** (`Light Mode` / `Dark Mode`), Exit (`Alt+F4`).
   - **Edit**: Copy Region Address (`Ctrl+C`), Copy Hex Dump (`Ctrl+Shift+C`), Find Hex Pattern (`Ctrl+F`), Find Next Hit (`F3`).
-  - **View**: Triage Findings View (`Ctrl+1`), Memory Map View (`Ctrl+2`), Light Mode / Dark Mode, Hide Clean Regions, Hits Only Filter, Refresh Memory Walk (`F5`).
+  - **View**: Triage Findings View (`Ctrl+1`), Memory Map View (`Ctrl+2`), Hide Clean Regions, Hits Only Filter, Refresh Memory Walk (`F5`).
   - **Timeline**: Take Snapshot (`Ctrl+N`), Clear All Snapshots, Live Memory Heartbeat, Previous/Next 64 KB Page (`PgUp` / `PgDn`).
   - **Help**: Built-in Defensive Heuristics & Scoring Guide, About Deadeye dialog.
   - **Native Accelerators**: Global keyboard accelerator table (`TranslateAcceleratorA`) for rapid analyst workflows.
@@ -98,6 +98,14 @@ cl /std:c++17 /EHsc /W4 /O2 src/main.cpp /Fe:build/deadeye.exe /Fo:build/ /link 
 REM Compile the test target
 cl /std:c++17 /EHsc /W4 /O2 src/test_target.cpp /Fe:build/test_target.exe /Fo:build/
 ```
+
+---
+
+## Pre-Built Releases & CI/CD
+
+Pre-compiled standalone 64-bit binaries are published on GitHub:
+- **Release Bundle**: `Deadeye-v1.0.0-windows-x64.zip` containing `deadeye.exe`, `test_target.exe`, and documentation.
+- **Automated CI/CD**: Pushing any version tag (e.g. `git tag -a v1.0.0 -m "Release v1.0.0"` followed by `git push origin main --tags`) automatically triggers GitHub Actions to compile, test, package, and release release assets via [`.github/workflows/release.yml`](.github/workflows/release.yml).
 
 ---
 

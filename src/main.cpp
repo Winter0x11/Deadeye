@@ -17,6 +17,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <cstdint>
@@ -86,7 +87,9 @@ constexpr int SEV_MIN_LOW = 10;
 #define IDM_FILE_ATTACH_SELF 2001
 #define IDM_FILE_TRIAGE 2002
 #define IDM_FILE_EXPORT_JSON 2003
-#define IDM_FILE_EXIT 2004
+#define IDM_FILE_THEME_LIGHT 2004
+#define IDM_FILE_THEME_DARK 2005
+#define IDM_FILE_EXIT 2006
 
 #define IDM_EDIT_COPY_ADDR 2010
 #define IDM_EDIT_COPY_HEX 2011
@@ -95,8 +98,6 @@ constexpr int SEV_MIN_LOW = 10;
 
 #define IDM_VIEW_TRIAGE_FINDINGS 2020
 #define IDM_VIEW_MEMORY_MAP 2021
-#define IDM_VIEW_THEME_LIGHT 2022
-#define IDM_VIEW_THEME_DARK 2023
 #define IDM_VIEW_HIDE_CLEAN 2024
 #define IDM_VIEW_HITS_ONLY 2025
 #define IDM_VIEW_REFRESH 2026
@@ -604,7 +605,7 @@ bool has_pe_header(const uint8_t *buf, size_t len)
         return false;
     uint32_t e_lfanew = 0;
     std::memcpy(&e_lfanew, buf + 0x3C, sizeof(e_lfanew));
-    if (e_lfanew == 0 || e_lfanew + 4 > len)
+    if (e_lfanew < 0x40 || static_cast<uint64_t>(e_lfanew) + 4 > len)
         return false;
     return (buf[e_lfanew] == 'P' &&
             buf[e_lfanew + 1] == 'E' &&
@@ -716,7 +717,7 @@ SIZE_T scan_chunk_robust(HANDLE proc, uintptr_t chunk_addr, SIZE_T to_read,
                 std::vector<size_t> b_hits = find_all(b_buf.data(), b_len, *pat);
                 for (size_t bh : b_hits)
                 {
-                    if (bh < prev_tail.size())
+                    if (bh < prev_tail.size() && page_off >= prev_tail.size())
                     {
                         SIZE_T hit_pos = chunk_offset_in_reg + (page_off - prev_tail.size()) + bh;
                         if (out_hits.size() < max_hits)
@@ -760,24 +761,32 @@ SIZE_T scan_chunk_robust(HANDLE proc, uintptr_t chunk_addr, SIZE_T to_read,
     return total_read;
 }
 
-// Parses a numeric PID or 'self' string.
+// Parses a numeric PID or 'self' string with whitespace trimming.
 bool parse_pid_string(const std::string &arg, DWORD &out_pid)
 {
-    if (arg == "self")
+    size_t start = 0;
+    while (start < arg.size() && std::isspace(static_cast<unsigned char>(arg[start])))
+        ++start;
+    size_t end = arg.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(arg[end - 1])))
+        --end;
+    std::string trimmed = arg.substr(start, end - start);
+
+    if (trimmed == "self" || trimmed == "SELF" || trimmed == "Self")
     {
         out_pid = GetCurrentProcessId();
         return true;
     }
-    if (arg.empty())
+    if (trimmed.empty())
         return false;
-    for (size_t i = 0; i < arg.size(); ++i)
+    for (size_t i = 0; i < trimmed.size(); ++i)
     {
-        if (!std::isdigit(static_cast<unsigned char>(arg[i])))
+        if (!std::isdigit(static_cast<unsigned char>(trimmed[i])))
             return false;
     }
     errno = 0;
     char *end_ptr = nullptr;
-    unsigned long val = std::strtoul(arg.c_str(), &end_ptr, 10);
+    unsigned long val = std::strtoul(trimmed.c_str(), &end_ptr, 10);
     if (errno != 0 || end_ptr == nullptr || *end_ptr != '\0' || val == 0)
     {
         return false;
@@ -874,6 +883,8 @@ bool query_peb_modules_x64(HANDLE proc, std::vector<LoadedModuleRange> &out_modu
 
         if (!ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(curr), &flink, sizeof(flink), &bytes_read))
             break;
+        if (flink == 0 || flink == curr)
+            break;
         ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(curr + 0x30), &dll_base, sizeof(dll_base), &bytes_read);
         ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(curr + 0x40), &size_of_image, sizeof(size_of_image), &bytes_read);
         ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(curr + 0x58), &name_len, sizeof(name_len), &bytes_read);
@@ -962,7 +973,7 @@ bool query_process_regions(HANDLE proc, std::vector<RegionInfo> &out_regions, st
 // Evaluates defensive triage heuristics against process memory regions.
 // UI-independent core function.
 TriageReport run_process_triage(HANDLE proc, DWORD pid, std::vector<RegionInfo> &regions,
-                                volatile bool *abort_flag,
+                                std::atomic<bool> *abort_flag,
                                 void (*progress_cb)(SIZE_T current, SIZE_T total, void *user_data),
                                 void *user_data)
 {
@@ -977,7 +988,7 @@ TriageReport run_process_triage(HANDLE proc, DWORD pid, std::vector<RegionInfo> 
 
     for (size_t i = 0; i < regions.size(); ++i)
     {
-        if (abort_flag != nullptr && *abort_flag)
+        if (abort_flag != nullptr && abort_flag->load(std::memory_order_relaxed))
             break;
 
         RegionInfo &reg = regions[i];
@@ -2023,6 +2034,8 @@ void populate_region_list()
 
 void select_region_in_ui(size_t region_idx, SIZE_T view_offset, SIZE_T focus_offset)
 {
+    if (region_idx >= g_regions.size())
+        return;
     g_selected_region = region_idx;
     g_has_selection = true;
     g_view_offset = view_offset;
@@ -2114,11 +2127,13 @@ void draw_region_list_item(DRAWITEMSTRUCT *dis)
 
     SetBkMode(hdc, TRANSPARENT);
     SetTextColor(hdc, text_color);
-    SelectObject(hdc, g_mono_font);
+    HGDIOBJ old_font = SelectObject(hdc, g_mono_font);
 
     RECT text_rc = dis->rcItem;
     text_rc.left += 6; // Left margin padding
     DrawTextA(hdc, buf, -1, &text_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+    SelectObject(hdc, old_font);
 }
 
 enum class WorkerTaskType
@@ -2155,7 +2170,7 @@ struct WorkerResult
 };
 
 static HANDLE g_h_worker_thread = nullptr;
-static volatile bool g_scan_abort = false;
+static std::atomic<bool> g_scan_abort{false};
 
 DWORD WINAPI WorkerThreadProc(LPVOID param)
 {
@@ -2180,8 +2195,11 @@ DWORD WINAPI WorkerThreadProc(LPVOID param)
     {
         res->error_code = GetLastError();
         res->error_msg = format_win32_error(res->error_code);
-        PostMessageA(hwnd, (res->task_type == WorkerTaskType::Triage) ? WM_TRIAGE_COMPLETE : WM_SCAN_COMPLETE,
-                     FALSE, reinterpret_cast<LPARAM>(res));
+        if (!PostMessageA(hwnd, (res->task_type == WorkerTaskType::Triage) ? WM_TRIAGE_COMPLETE : WM_SCAN_COMPLETE,
+                          FALSE, reinterpret_cast<LPARAM>(res)))
+        {
+            delete res;
+        }
         return 0;
     }
 
@@ -2193,7 +2211,10 @@ DWORD WINAPI WorkerThreadProc(LPVOID param)
             res->error_code = GetLastError();
             res->error_msg = err.empty() ? format_win32_error(res->error_code) : err;
             CloseHandle(proc);
-            PostMessageA(hwnd, WM_TRIAGE_COMPLETE, FALSE, reinterpret_cast<LPARAM>(res));
+            if (!PostMessageA(hwnd, WM_TRIAGE_COMPLETE, FALSE, reinterpret_cast<LPARAM>(res)))
+            {
+                delete res;
+            }
             return 0;
         }
 
@@ -2206,14 +2227,17 @@ DWORD WINAPI WorkerThreadProc(LPVOID param)
         res->report = run_process_triage(proc, res->pid, res->regions, &g_scan_abort, triage_cb, hwnd);
         CloseHandle(proc);
 
-        if (g_scan_abort)
+        if (g_scan_abort.load(std::memory_order_relaxed))
         {
             delete res;
             return 0;
         }
 
         res->success = true;
-        PostMessageA(hwnd, WM_TRIAGE_COMPLETE, TRUE, reinterpret_cast<LPARAM>(res));
+        if (!PostMessageA(hwnd, WM_TRIAGE_COMPLETE, TRUE, reinterpret_cast<LPARAM>(res)))
+        {
+            delete res;
+        }
         return 0;
     }
 
@@ -2224,7 +2248,7 @@ DWORD WINAPI WorkerThreadProc(LPVOID param)
     MEMORY_BASIC_INFORMATION mbi;
     SIZE_T last_progress_bytes = 0;
 
-    while (!g_scan_abort)
+    while (!g_scan_abort.load(std::memory_order_relaxed))
     {
         std::memset(&mbi, 0, sizeof(mbi));
         SIZE_T q = VirtualQueryEx(proc, reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi));
@@ -2255,7 +2279,7 @@ DWORD WINAPI WorkerThreadProc(LPVOID param)
             SIZE_T prev_overlap = 0;
             bool pe_found = false;
 
-            while (offset < region_size && !g_scan_abort)
+            while (offset < region_size && !g_scan_abort.load(std::memory_order_relaxed))
             {
                 SIZE_T rem = region_size - offset;
                 SIZE_T to_read = (rem < CLI_CHUNK_SIZE) ? rem : CLI_CHUNK_SIZE;
@@ -2335,7 +2359,7 @@ DWORD WINAPI WorkerThreadProc(LPVOID param)
         addr = next;
     }
 
-    if (!g_scan_abort)
+    if (!g_scan_abort.load(std::memory_order_relaxed))
     {
         // Automatically evaluate triage findings on the loaded regions
         res->report = run_process_triage(proc, res->pid, res->regions, &g_scan_abort, nullptr, nullptr);
@@ -2343,14 +2367,17 @@ DWORD WINAPI WorkerThreadProc(LPVOID param)
 
     CloseHandle(proc);
 
-    if (g_scan_abort)
+    if (g_scan_abort.load(std::memory_order_relaxed))
     {
         delete res;
         return 0;
     }
 
     res->success = true;
-    PostMessageA(hwnd, WM_SCAN_COMPLETE, TRUE, reinterpret_cast<LPARAM>(res));
+    if (!PostMessageA(hwnd, WM_SCAN_COMPLETE, TRUE, reinterpret_cast<LPARAM>(res)))
+    {
+        delete res;
+    }
     return 0;
 }
 
@@ -2365,6 +2392,13 @@ void enable_ui_controls(BOOL enable)
 
 void on_worker_completed(WorkerResult *res)
 {
+    if (g_h_worker_thread != nullptr)
+    {
+        WaitForSingleObject(g_h_worker_thread, 100);
+        CloseHandle(g_h_worker_thread);
+        g_h_worker_thread = nullptr;
+    }
+
     enable_ui_controls(TRUE);
 
     if (!res->success)
@@ -2535,7 +2569,7 @@ void start_worker_task(WorkerTaskType task_type, bool require_pattern)
     task->use_pattern = use_pattern;
     task->task_type = task_type;
 
-    g_scan_abort = false;
+    g_scan_abort.store(false, std::memory_order_relaxed);
     g_h_worker_thread = CreateThread(nullptr, 0, WorkerThreadProc, task, 0, nullptr);
     if (g_h_worker_thread == nullptr)
     {
@@ -2825,7 +2859,8 @@ LRESULT CALLBACK ModernButtonSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
 
         SetBkMode(memDC, TRANSPARENT);
         SetTextColor(memDC, text_color);
-        SelectObject(memDC, (data->style == ModernButtonStyle::Primary) ? g_ui_font_bold : g_ui_font);
+        HFONT btn_font = (data->style == ModernButtonStyle::Primary) ? g_ui_font_bold : g_ui_font;
+        HGDIOBJ oldFont = SelectObject(memDC, btn_font);
 
         RECT text_rc = rc;
         if (is_pressed) {
@@ -2836,6 +2871,7 @@ LRESULT CALLBACK ModernButtonSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
 
         BitBlt(hdc, 0, 0, w, h, memDC, 0, 0, SRCCOPY);
 
+        SelectObject(memDC, oldFont);
         SelectObject(memDC, oldBmp);
         DeleteObject(memBmp);
         DeleteDC(memDC);
@@ -2850,6 +2886,11 @@ LRESULT CALLBACK ModernButtonSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM
 
 void make_button_modern(HWND btn, ModernButtonStyle style) {
     if (btn == nullptr) return;
+    ModernButtonData* existing = reinterpret_cast<ModernButtonData*>(GetPropA(btn, DEADEYE_BTN_PROP));
+    if (existing != nullptr) {
+        existing->style = style;
+        return;
+    }
     ModernButtonData* data = new ModernButtonData();
     data->style = style;
     data->is_hovered = false;
@@ -2872,7 +2913,14 @@ void copy_text_to_clipboard(HWND hwnd, const std::string &text)
         {
             std::memcpy(p, text.c_str(), text.size() + 1);
             GlobalUnlock(hGlob);
-            SetClipboardData(CF_TEXT, hGlob);
+            if (!SetClipboardData(CF_TEXT, hGlob))
+            {
+                GlobalFree(hGlob);
+            }
+        }
+        else
+        {
+            GlobalFree(hGlob);
         }
     }
     CloseClipboard();
@@ -2888,6 +2936,13 @@ HMENU create_application_menu()
     AppendMenuA(hFileMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_TRIAGE, "Run Defensive &Triage\tCtrl+T");
     AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_EXPORT_JSON, "&Export Triage JSON...\tCtrl+S");
+    AppendMenuA(hFileMenu, MF_SEPARATOR, 0, nullptr);
+
+    HMENU hThemeMenu = CreatePopupMenu();
+    AppendMenuA(hThemeMenu, MF_STRING, IDM_FILE_THEME_LIGHT, "&Light Mode");
+    AppendMenuA(hThemeMenu, MF_STRING, IDM_FILE_THEME_DARK, "&Dark Mode");
+    AppendMenuA(hFileMenu, MF_POPUP, reinterpret_cast<UINT_PTR>(hThemeMenu), "&Theme");
+
     AppendMenuA(hFileMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_EXIT, "E&xit\tAlt+F4");
     AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hFileMenu), "&File");
@@ -2905,9 +2960,6 @@ HMENU create_application_menu()
     HMENU hViewMenu = CreatePopupMenu();
     AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_TRIAGE_FINDINGS, "&Triage Findings View\tCtrl+1");
     AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_MEMORY_MAP, "&Memory Map View\tCtrl+2");
-    AppendMenuA(hViewMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_THEME_LIGHT, "&Light Mode");
-    AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_THEME_DARK, "&Dark Mode");
     AppendMenuA(hViewMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_HIDE_CLEAN, "&Hide Clean Regions");
     AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_HITS_ONLY, "&Hits Only Filter");
@@ -3136,8 +3188,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_INITMENUPOPUP:
     {
         HMENU hMenu = reinterpret_cast<HMENU>(wp);
-        CheckMenuItem(hMenu, IDM_VIEW_THEME_LIGHT, (g_theme == AppTheme::Light) ? MF_CHECKED : MF_UNCHECKED);
-        CheckMenuItem(hMenu, IDM_VIEW_THEME_DARK, (g_theme == AppTheme::Dark) ? MF_CHECKED : MF_UNCHECKED);
+        CheckMenuItem(hMenu, IDM_FILE_THEME_LIGHT, (g_theme == AppTheme::Light) ? MF_CHECKED : MF_UNCHECKED);
+        CheckMenuItem(hMenu, IDM_FILE_THEME_DARK, (g_theme == AppTheme::Dark) ? MF_CHECKED : MF_UNCHECKED);
         CheckMenuItem(hMenu, IDM_VIEW_TRIAGE_FINDINGS, (g_view_mode == ViewMode::TriageFindings) ? MF_CHECKED : MF_UNCHECKED);
         CheckMenuItem(hMenu, IDM_VIEW_MEMORY_MAP, (g_view_mode == ViewMode::MemoryMap) ? MF_CHECKED : MF_UNCHECKED);
         CheckMenuItem(hMenu, IDM_VIEW_HIDE_CLEAN, g_hide_clean ? MF_CHECKED : MF_UNCHECKED);
@@ -3180,7 +3232,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_CTLCOLORSTATIC:
     {
         HDC hdc = reinterpret_cast<HDC>(wp);
+        HWND hctl = reinterpret_cast<HWND>(lp);
         const ThemeColors &tc = get_current_theme();
+        if (hctl == g_edit_hex)
+        {
+            SetTextColor(hdc, tc.text_normal);
+            SetBkColor(hdc, tc.bg_control);
+            return reinterpret_cast<INT_PTR>(g_br_control);
+        }
         SetTextColor(hdc, tc.text_normal);
         SetBkColor(hdc, tc.bg_window);
         return reinterpret_cast<INT_PTR>(g_br_window);
@@ -3357,17 +3416,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (sel != LB_ERR && static_cast<size_t>(sel) < g_visible_indices.size())
             {
                 size_t reg_idx = g_visible_indices[static_cast<size_t>(sel)];
-                SIZE_T first_hit = g_regions[reg_idx].hits.empty()
-                                       ? static_cast<SIZE_T>(-1)
-                                       : g_regions[reg_idx].hits[0];
-                SIZE_T page_off = (first_hit == static_cast<SIZE_T>(-1))
-                                      ? 0
-                                      : (first_hit / VIEW_PAGE_SIZE) * VIEW_PAGE_SIZE;
-                g_selected_region = reg_idx;
-                g_has_selection = true;
-                g_view_offset = page_off;
-                display_selected_region(first_hit);
-                update_triage_details_label(reg_idx);
+                if (reg_idx < g_regions.size())
+                {
+                    SIZE_T first_hit = g_regions[reg_idx].hits.empty()
+                                           ? static_cast<SIZE_T>(-1)
+                                           : g_regions[reg_idx].hits[0];
+                    SIZE_T page_off = (first_hit == static_cast<SIZE_T>(-1))
+                                          ? 0
+                                          : (first_hit / VIEW_PAGE_SIZE) * VIEW_PAGE_SIZE;
+                    g_selected_region = reg_idx;
+                    g_has_selection = true;
+                    g_view_offset = page_off;
+                    display_selected_region(first_hit);
+                    update_triage_details_label(reg_idx);
+                }
             }
         }
         else if (id == ID_BTN_PREV_PAGE)
@@ -3491,12 +3553,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             SendMessageA(g_combo_view_mode, CB_SETCURSEL, 1, 0);
             SendMessageA(hwnd, WM_COMMAND, MAKEWPARAM(ID_COMBO_VIEW_MODE, CBN_SELCHANGE), reinterpret_cast<LPARAM>(g_combo_view_mode));
         }
-        else if (id == IDM_VIEW_THEME_LIGHT)
+        else if (id == IDM_FILE_THEME_LIGHT)
         {
             SendMessageA(g_combo_theme, CB_SETCURSEL, 0, 0);
             SendMessageA(hwnd, WM_COMMAND, MAKEWPARAM(ID_COMBO_THEME, CBN_SELCHANGE), reinterpret_cast<LPARAM>(g_combo_theme));
         }
-        else if (id == IDM_VIEW_THEME_DARK)
+        else if (id == IDM_FILE_THEME_DARK)
         {
             SendMessageA(g_combo_theme, CB_SETCURSEL, 1, 0);
             SendMessageA(hwnd, WM_COMMAND, MAKEWPARAM(ID_COMBO_THEME, CBN_SELCHANGE), reinterpret_cast<LPARAM>(g_combo_theme));
@@ -3622,7 +3684,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         KillTimer(hwnd, IDT_HEARTBEAT);
-        g_scan_abort = true;
+        g_scan_abort.store(true, std::memory_order_relaxed);
         if (g_h_worker_thread != nullptr)
         {
             WaitForSingleObject(g_h_worker_thread, 1000);
