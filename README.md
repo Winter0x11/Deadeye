@@ -6,6 +6,26 @@ Designed for defensive reverse engineering, malware analysis, and detection engi
 
 ---
 
+## Quick Install (One-Line Command)
+
+Run this single command in **PowerShell** (no admin rights or external runtimes required):
+
+```powershell
+powershell -ep bypass -c "irm https://raw.githubusercontent.com/Winter0x11/Deadeye/main/install.ps1 | iex"
+```
+
+**What this one-liner does automatically:**
+1. Resolves the latest release binary from GitHub.
+2. Downloads and extracts `deadeye.exe` to `%LOCALAPPDATA%\Deadeye`.
+3. Adds Deadeye to your user `PATH` (so you can run `deadeye` from any terminal).
+4. Creates a Windows Start Menu shortcut.
+5. Immediately launches Deadeye.
+
+> [!TIP]
+> **Zero External Dependencies**: Deadeye is compiled with fully static C++ runtimes (`-static -static-libgcc -static-libstdc++`). It runs out-of-the-box on clean Windows 10 & 11 installations with no Visual C++ Redistributable or MinGW DLL requirements.
+
+---
+
 ## Defensive Triage Heuristics & Additive Scoring
 
 Deadeye inspects target processes in a background worker thread and computes an **additive threat severity score** for every committed memory region based on weighted heuristics:
@@ -81,11 +101,11 @@ if (-not (Test-Path build)) { New-Item -ItemType Directory -Path build }
 # Compile Windows resources & Common-Controls v6 / DPI manifest
 windres src/deadeye.rc -O coff -o build/deadeye_res.o
 
-# Compile Deadeye GUI (pure Windows subsystem, zero warnings)
-g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 src/main.cpp build/deadeye_res.o -o build/deadeye.exe -mwindows -ladvapi32 -lcomctl32 -lcomdlg32 -lgdi32 -luser32
+# Compile fully static standalone binary (zero external DLL requirements)
+g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 -static -static-libgcc -static-libstdc++ src/main.cpp build/deadeye_res.o -o build/deadeye.exe -mwindows -ladvapi32 -lcomctl32 -lcomdlg32 -lgdi32 -luser32
 
 # Compile the test target
-g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 src/test_target.cpp -o build/test_target.exe
+g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 -static -static-libgcc -static-libstdc++ src/test_target.cpp -o build/test_target.exe
 ```
 
 ### Build with MSVC (Visual Studio Developer Command Prompt)
