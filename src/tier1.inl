@@ -397,31 +397,60 @@ bool load_process_session_from_file(const std::string &filepath, ProcessSnapshot
 
     session = ProcessSnapshotSession{};
     ProcessRegionSnapshot cur_reg{};
+    bool in_regions_list = false;
     bool in_region = false;
 
     std::string line;
     while (std::getline(in, line))
     {
-        if (line.find("\"pid\":") != std::string::npos)
+        size_t first = line.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) continue;
+        std::string trimmed = line.substr(first);
+        while (!trimmed.empty() && (trimmed.back() == '\r' || trimmed.back() == '\n' || trimmed.back() == ' ' || trimmed.back() == '\t'))
         {
-            session.pid = static_cast<DWORD>(std::stoul(extract_json_str_val(line, "pid")));
+            trimmed.pop_back();
         }
-        else if (line.find("\"process_name\":") != std::string::npos)
+
+        if (line.find("\"regions\":") != std::string::npos)
         {
-            session.process_name = extract_json_str_val(line, "process_name");
+            in_regions_list = true;
+            continue;
         }
-        else if (line.find("\"timestamp\":") != std::string::npos)
+
+        if (!in_regions_list)
         {
-            session.timestamp_str = extract_json_str_val(line, "timestamp");
+            if (line.find("\"pid\":") != std::string::npos)
+            {
+                session.pid = static_cast<DWORD>(std::stoul(extract_json_str_val(line, "pid")));
+            }
+            else if (line.find("\"process_name\":") != std::string::npos)
+            {
+                session.process_name = extract_json_str_val(line, "process_name");
+            }
+            else if (line.find("\"timestamp\":") != std::string::npos)
+            {
+                session.timestamp_str = extract_json_str_val(line, "timestamp");
+            }
+            else if (line.find("\"total_committed_bytes\":") != std::string::npos)
+            {
+                session.total_committed_bytes = std::stoull(extract_json_str_val(line, "total_committed_bytes"));
+            }
+            continue;
         }
-        else if (line.find("\"total_committed_bytes\":") != std::string::npos)
-        {
-            session.total_committed_bytes = std::stoull(extract_json_str_val(line, "total_committed_bytes"));
-        }
-        else if (line.find("    {") != std::string::npos)
+
+        if (trimmed == "{" && !in_region)
         {
             in_region = true;
             cur_reg = ProcessRegionSnapshot{};
+        }
+        else if ((trimmed == "}" || trimmed == "},") && in_region)
+        {
+            session.regions.push_back(cur_reg);
+            in_region = false;
+        }
+        else if (trimmed == "]" || trimmed == "],")
+        {
+            in_regions_list = false;
         }
         else if (in_region)
         {
@@ -462,11 +491,6 @@ bool load_process_session_from_file(const std::string &filepath, ProcessSnapshot
             else if (line.find("\"is_unbacked\":") != std::string::npos)
             {
                 cur_reg.is_unbacked = (extract_json_str_val(line, "is_unbacked") == "true");
-            }
-            else if (line.find("    }") != std::string::npos)
-            {
-                session.regions.push_back(cur_reg);
-                in_region = false;
             }
         }
     }
@@ -674,7 +698,8 @@ FalsePositiveReport test_rule_false_positives(const Pattern &pat, DWORD exclude_
 
             while (VirtualQueryEx(hProc, reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == sizeof(mbi))
             {
-                if (mbi.State == MEM_COMMIT && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
+                if (mbi.State == MEM_COMMIT && !(mbi.Protect & PAGE_GUARD) && !(mbi.Protect & PAGE_NOACCESS) &&
+                    (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
                 {
                     SIZE_T to_read = std::min<SIZE_T>(mbi.RegionSize, read_buf.size());
                     SIZE_T bytes_read = 0;
@@ -715,8 +740,18 @@ void on_capture_baseline()
 {
     if (g_current_pid == 0)
     {
-        MessageBoxA(g_hwnd_main, "Please attach to a process first before capturing a baseline.", "Deadeye Process Diff", MB_OK | MB_ICONWARNING);
-        return;
+        char pid_buf[64] = {};
+        GetWindowTextA(g_edit_pid, pid_buf, sizeof(pid_buf));
+        DWORD parsed_pid = 0;
+        if (parse_pid_string(pid_buf, parsed_pid) && parsed_pid != 0)
+        {
+            g_current_pid = parsed_pid;
+        }
+        else
+        {
+            MessageBoxA(g_hwnd_main, "Please enter a valid numeric target PID first before capturing a baseline.", "Deadeye Process Diff", MB_OK | MB_ICONWARNING);
+            return;
+        }
     }
 
     std::string err;
@@ -744,14 +779,33 @@ void on_capture_baseline()
 
 void on_capture_diff()
 {
-    if (!g_has_baseline)
-    {
-        MessageBoxA(g_hwnd_main, "No baseline snapshot found. Please capture a baseline snapshot first (Diff -> Capture Baseline).", "Deadeye Process Diff", MB_OK | MB_ICONWARNING);
-        return;
-    }
     if (g_current_pid == 0)
     {
-        MessageBoxA(g_hwnd_main, "Please attach to a process first.", "Deadeye Process Diff", MB_OK | MB_ICONWARNING);
+        char pid_buf[64] = {};
+        GetWindowTextA(g_edit_pid, pid_buf, sizeof(pid_buf));
+        DWORD parsed_pid = 0;
+        if (parse_pid_string(pid_buf, parsed_pid) && parsed_pid != 0)
+        {
+            g_current_pid = parsed_pid;
+        }
+        else
+        {
+            MessageBoxA(g_hwnd_main, "Please enter a valid numeric target PID first.", "Deadeye Process Diff", MB_OK | MB_ICONWARNING);
+            return;
+        }
+    }
+
+    if (!g_has_baseline)
+    {
+        on_capture_baseline();
+        if (g_has_baseline)
+        {
+            MessageBoxA(g_hwnd_main,
+                        "Baseline snapshot captured successfully!\n\n"
+                        "Now run your target malware sample or trigger suspicious activity,\n"
+                        "then click 'Diff Proc' again (or press Ctrl+D) to compute the diff.",
+                        "Deadeye Baseline Captured", MB_OK | MB_ICONINFORMATION);
+        }
         return;
     }
 
@@ -1064,15 +1118,41 @@ LRESULT CALLBACK YaraDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             GetWindowTextA(data->hEditRule, buf.data(), len + 1);
             std::string rule_str = buf.data();
 
-            size_t b1 = rule_str.find('{');
-            size_t b2 = rule_str.rfind('}');
-            if (b1 == std::string::npos || b2 == std::string::npos || b2 <= b1)
+            std::string hex_str;
+            size_t str_pos = rule_str.find("strings:");
+            if (str_pos != std::string::npos)
             {
-                SetWindowTextA(data->hEditReport, "[ERROR] Could not find hex signature enclosed in { ... } in the rule editor.");
-                return 0;
+                size_t sig_brace_start = rule_str.find('{', str_pos);
+                if (sig_brace_start != std::string::npos)
+                {
+                    size_t sig_brace_end = rule_str.find('}', sig_brace_start);
+                    if (sig_brace_end != std::string::npos && sig_brace_end > sig_brace_start)
+                    {
+                        hex_str = rule_str.substr(sig_brace_start + 1, sig_brace_end - sig_brace_start - 1);
+                    }
+                }
+            }
+            if (hex_str.empty())
+            {
+                size_t first_brace = rule_str.find('{');
+                if (first_brace != std::string::npos)
+                {
+                    size_t second_brace = rule_str.find('{', first_brace + 1);
+                    if (second_brace != std::string::npos)
+                    {
+                        size_t second_brace_end = rule_str.find('}', second_brace);
+                        if (second_brace_end != std::string::npos && second_brace_end > second_brace)
+                        {
+                            hex_str = rule_str.substr(second_brace + 1, second_brace_end - second_brace - 1);
+                        }
+                    }
+                }
+            }
+            if (hex_str.empty())
+            {
+                hex_str = rule_str;
             }
 
-            std::string hex_str = rule_str.substr(b1 + 1, b2 - b1 - 1);
             Pattern pat;
             std::string perr;
             if (!parse_pattern(hex_str, pat, perr))
@@ -1199,14 +1279,28 @@ LRESULT CALLBACK YaraDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 void open_yara_dialog(HWND hParent)
 {
-    if (g_selected_region >= g_regions.size())
+    uintptr_t target_base = 0;
+    if (g_view_mode == ViewMode::ProcessDiff)
+    {
+        if (g_selected_region < g_process_diffs.size())
+        {
+            target_base = g_process_diffs[g_selected_region].base + g_view_offset;
+        }
+    }
+    else
+    {
+        if (g_selected_region < g_regions.size())
+        {
+            target_base = g_regions[g_selected_region].base + g_view_offset;
+        }
+    }
+
+    if (target_base == 0)
     {
         MessageBoxA(hParent, "Please select a memory region or bytes in hex view first.", "Deadeye YARA Generator", MB_OK | MB_ICONWARNING);
         return;
     }
 
-    const RegionInfo &reg = g_regions[g_selected_region];
-    uintptr_t target_base = reg.base + g_view_offset;
     std::vector<uint8_t> target_bytes;
 
     // Check if user selected text in hex dump

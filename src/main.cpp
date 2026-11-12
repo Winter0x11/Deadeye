@@ -101,7 +101,6 @@ constexpr int SEV_MIN_LOW = 10;
 #define IDT_HEARTBEAT 1001
 
 // Menu Item IDs
-#define IDM_FILE_ATTACH_SELF 2001
 #define IDM_FILE_TRIAGE 2002
 #define IDM_FILE_EXPORT_JSON 2003
 #define IDM_FILE_THEME_LIGHT 2004
@@ -539,6 +538,9 @@ bool parse_pattern(const std::string &input, Pattern &out, std::string &err)
             ++i;
         std::string tok = input.substr(start, i - start);
 
+        if (tok == "?")
+            tok = "??";
+
         if (tok.size() % 2 != 0)
         {
             err = "Odd-length token '" + tok + "' in pattern.";
@@ -920,7 +922,7 @@ SIZE_T scan_chunk_robust(HANDLE proc, uintptr_t chunk_addr, SIZE_T to_read,
     return total_read;
 }
 
-// Parses a numeric PID or 'self' string with whitespace trimming.
+// Parses a numeric PID string with whitespace trimming.
 bool parse_pid_string(const std::string &arg, DWORD &out_pid)
 {
     size_t start = 0;
@@ -931,11 +933,6 @@ bool parse_pid_string(const std::string &arg, DWORD &out_pid)
         --end;
     std::string trimmed = arg.substr(start, end - start);
 
-    if (trimmed == "self" || trimmed == "SELF" || trimmed == "Self")
-    {
-        out_pid = GetCurrentProcessId();
-        return true;
-    }
     if (trimmed.empty())
         return false;
     for (size_t i = 0; i < trimmed.size(); ++i)
@@ -2303,13 +2300,31 @@ void draw_region_list_item(DRAWITEMSTRUCT *dis)
 {
     if (dis->itemID == static_cast<UINT>(-1))
         return;
+
+    const ThemeColors &tc = get_current_theme();
     size_t vis_idx = static_cast<size_t>(dis->itemID);
-    if (vis_idx >= g_visible_indices.size())
+
+    if (g_visible_indices.empty() || vis_idx >= g_visible_indices.size())
+    {
+        HDC hdc = dis->hDC;
+        HBRUSH hbr = CreateSolidBrush(tc.bg_control);
+        FillRect(hdc, &dis->rcItem, hbr);
+        DeleteObject(hbr);
+
+        char buf[256] = {};
+        SendMessageA(dis->hwndItem, LB_GETTEXT, dis->itemID, reinterpret_cast<LPARAM>(buf));
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, tc.text_muted);
+        HGDIOBJ old_font = SelectObject(hdc, g_mono_font);
+        RECT text_rc = dis->rcItem;
+        text_rc.left += 6;
+        DrawTextA(hdc, buf, -1, &text_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(hdc, old_font);
         return;
+    }
 
     size_t reg_idx = g_visible_indices[vis_idx];
 
-    const ThemeColors &tc = get_current_theme();
     bool is_selected = (dis->itemState & ODS_SELECTED) != 0;
 
     COLORREF bg_color = tc.row_image_bg;
@@ -2790,7 +2805,7 @@ void start_worker_task(WorkerTaskType task_type, bool require_pattern)
     DWORD pid = 0;
     if (!parse_pid_string(pid_str, pid))
     {
-        MessageBoxA(g_hwnd_main, "Enter a valid numeric PID or 'self'.", "Invalid Target PID", MB_ICONWARNING);
+        MessageBoxA(g_hwnd_main, "Enter a valid numeric PID.", "Invalid Target PID", MB_ICONWARNING);
         return;
     }
 
@@ -3210,8 +3225,6 @@ HMENU create_application_menu()
 
     // 1. File Menu
     HMENU hFileMenu = CreatePopupMenu();
-    AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_ATTACH_SELF, "Attach to &Self\tCtrl+Alt+S");
-    AppendMenuA(hFileMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_TRIAGE, "Run Defensive &Triage\tCtrl+T");
     AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_EXPORT_JSON, "&Export Triage JSON...\tCtrl+S");
     AppendMenuA(hFileMenu, MF_SEPARATOR, 0, nullptr);
@@ -3309,7 +3322,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                      x, M, 28, RH, hwnd, nullptr, hInst, nullptr);
         x += 30;
 
-        g_edit_pid = CreateWindowA("EDIT", "self",
+        g_edit_pid = CreateWindowA("EDIT", "",
                                    WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
                                    x, M, 64, RH, hwnd, reinterpret_cast<HMENU>(ID_EDIT_PID), hInst, nullptr);
         x += 68;
@@ -3486,12 +3499,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             { FCONTROL | FVIRTKEY, 'B', IDM_DIFF_CAPTURE_BASELINE },
             { FCONTROL | FVIRTKEY, 'D', IDM_DIFF_CAPTURE_CURRENT },
             { FCONTROL | FVIRTKEY, 'Y', ID_BTN_YARA },
-            { FCONTROL | FVIRTKEY, 'U', IDM_DIFF_VIEW_STRINGS },
-            { FCONTROL | FALT | FVIRTKEY, 'S', IDM_FILE_ATTACH_SELF }
+            { FCONTROL | FVIRTKEY, 'U', IDM_DIFF_VIEW_STRINGS }
         };
         g_haccel = CreateAcceleratorTableA(accels, sizeof(accels) / sizeof(accels[0]));
 
-        PostMessageA(hwnd, WM_COMMAND, ID_BTN_TRIAGE, 0);
+        if (GetWindowTextLengthA(g_edit_pid) > 0)
+        {
+            PostMessageA(hwnd, WM_COMMAND, ID_BTN_TRIAGE, 0);
+        }
+        else
+        {
+            set_status("Ready. Enter target PID and click 'Triage Findings'.");
+        }
         return 0;
     }
 
@@ -3839,11 +3858,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 KillTimer(hwnd, IDT_HEARTBEAT);
                 set_status("Heartbeat stopped.");
             }
-        }
-        else if (id == IDM_FILE_ATTACH_SELF)
-        {
-            SetWindowTextA(g_edit_pid, "self");
-            PostMessageA(hwnd, WM_COMMAND, ID_BTN_LOAD, 0);
         }
         else if (id == IDM_FILE_TRIAGE)
         {

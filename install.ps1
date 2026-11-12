@@ -42,7 +42,7 @@ try {
 
 if (-not $DownloadUrl) {
     # Direct fallback URL to the compiled zip or pre-packaged tag
-    $DownloadUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/v1.0.1/Deadeye-v1.0.1-windows-x64.zip"
+    $DownloadUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/v1.0.2/Deadeye-v1.0.2-windows-x64.zip"
     Write-Host "[*] Falling back to standard release asset: $DownloadUrl" -ForegroundColor Yellow
 }
 
