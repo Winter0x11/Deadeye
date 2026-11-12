@@ -24,15 +24,24 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <windows.h>
 #include <commdlg.h>
 #include <commctrl.h>
+#include <tlhelp32.h>
+#include <psapi.h>
 
 #ifdef _MSC_VER
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
@@ -58,6 +67,8 @@ constexpr int WEIGHT_UNLINKED_MODULE = 45; // Image region unlinked from PEB loa
 constexpr int WEIGHT_PRIVATE_RWX = 40;     // Private memory with RWX/RXC protection
 constexpr int WEIGHT_WRITE_THEN_FLIP = 35; // AllocationProtect writable, Protect executable
 constexpr int WEIGHT_UNBACKED_EXEC = 25;   // Executable unbacked by MEM_IMAGE
+constexpr int WEIGHT_BEHAVIOR_UNPACK = 50; // Memory flipped to executable with byte changes / entropy shift
+constexpr int WEIGHT_SLEEP_OBFUSCATION = 65; // Protection/entropy oscillating across heartbeat ticks
 
 constexpr int SEV_MIN_CRITICAL = 80;
 constexpr int SEV_MIN_HIGH = 50;
@@ -85,6 +96,8 @@ constexpr int SEV_MIN_LOW = 10;
 #define ID_CHK_HIDE_CLEAN 118
 #define ID_BTN_EXPORT_JSON 119
 #define ID_COMBO_THEME 120
+#define ID_BTN_DIFF_PROC 121
+#define ID_BTN_YARA 122
 #define IDT_HEARTBEAT 1001
 
 // Menu Item IDs
@@ -99,9 +112,11 @@ constexpr int SEV_MIN_LOW = 10;
 #define IDM_EDIT_COPY_HEX 2011
 #define IDM_EDIT_FIND_PATTERN 2012
 #define IDM_EDIT_FIND_NEXT 2013
+#define IDM_EDIT_GENERATE_YARA 2014
 
 #define IDM_VIEW_TRIAGE_FINDINGS 2020
 #define IDM_VIEW_MEMORY_MAP 2021
+#define IDM_VIEW_PROCESS_DIFF 2022
 #define IDM_VIEW_HIDE_CLEAN 2024
 #define IDM_VIEW_HITS_ONLY 2025
 #define IDM_VIEW_REFRESH 2026
@@ -111,6 +126,12 @@ constexpr int SEV_MIN_LOW = 10;
 #define IDM_TIMELINE_HEARTBEAT 2032
 #define IDM_TIMELINE_PREV_PAGE 2033
 #define IDM_TIMELINE_NEXT_PAGE 2034
+
+#define IDM_DIFF_CAPTURE_BASELINE 2050
+#define IDM_DIFF_CAPTURE_CURRENT 2051
+#define IDM_DIFF_SAVE_SESSION 2052
+#define IDM_DIFF_LOAD_SESSION 2053
+#define IDM_DIFF_VIEW_STRINGS 2055
 
 #define IDM_HELP_HEURISTICS 2040
 #define IDM_HELP_ABOUT 2041
@@ -136,6 +157,19 @@ struct Snapshot
     std::string label;
 };
 
+struct MemoryTransition
+{
+    DWORD timestamp_ms = 0;
+    DWORD old_protect = 0;
+    DWORD new_protect = 0;
+    double old_entropy = 0.0;
+    double new_entropy = 0.0;
+    uint64_t old_hash = 0;
+    uint64_t new_hash = 0;
+    bool is_unpack = false;
+    bool is_sleep_cycle = false;
+};
+
 // Metadata, detection heuristics, hit offsets, and snapshot timeline for a memory region.
 struct RegionInfo
 {
@@ -153,6 +187,106 @@ struct RegionInfo
     std::vector<SIZE_T> hits;
     bool hits_truncated = false;
     std::vector<Snapshot> snapshots;
+
+    // Behavioral Timeline & Detections
+    DWORD last_protect = 0;
+    double last_entropy = 0.0;
+    uint64_t last_hash = 0;
+    int flip_count = 0;
+    std::vector<DWORD> protect_history;
+    std::vector<double> entropy_history;
+    std::vector<MemoryTransition> transitions;
+    bool behavior_unpack_detected = false;
+    bool sleep_obfuscation_detected = false;
+};
+
+// Tier 1: Process-Wide Memory Diff Structures
+struct ProcessRegionSnapshot
+{
+    uintptr_t base = 0;
+    SIZE_T size = 0;
+    DWORD state = 0;
+    DWORD type = 0;
+    DWORD protect = 0;
+    DWORD alloc_protect = 0;
+    uintptr_t alloc_base = 0;
+    uint64_t content_hash = 0;
+    double entropy = 0.0;
+    bool has_pe = false;
+    bool is_unbacked = false;
+    bool is_rwx = false;
+    bool is_write_then_flip = false;
+    bool is_readable = false;
+};
+
+struct ProcessSnapshotSession
+{
+    DWORD pid = 0;
+    std::string process_name;
+    std::string timestamp_str;
+    SIZE_T total_committed_bytes = 0;
+    std::vector<ProcessRegionSnapshot> regions;
+};
+
+enum class ProcessDiffKind
+{
+    Appeared,       // [NEW]
+    Disappeared,    // [REMOVED]
+    ProtectionChg,  // [PROT_CHG]
+    ContentChg,     // [MODIFIED]
+    Unchanged
+};
+
+struct ProcessDiffItem
+{
+    ProcessDiffKind kind = ProcessDiffKind::Unchanged;
+    uintptr_t base = 0;
+    SIZE_T size = 0;
+    DWORD type = 0;
+    DWORD old_protect = 0;
+    DWORD new_protect = 0;
+    double old_entropy = 0.0;
+    double new_entropy = 0.0;
+    uint64_t old_hash = 0;
+    uint64_t new_hash = 0;
+    bool has_pe = false;
+    bool is_rwx = false;
+    bool is_unbacked = false;
+    bool is_unpack = false;
+    std::string summary;
+};
+
+// Tier 1: String Extraction & Categorization
+struct RevealedString
+{
+    std::string text;
+    std::string category; // "[URL] ", "[IP]  ", "[PATH]", "[CMD] ", "[REG] ", "[STR] "
+    uintptr_t addr = 0;
+};
+
+// Tier 1: YARA Generation & False-Positive Testing
+struct YaraWildcardResult
+{
+    std::string hex_pattern;
+    size_t total_bytes = 0;
+    size_t wildcard_count = 0;
+    std::vector<std::string> wildcards_applied;
+};
+
+struct FalsePositiveMatch
+{
+    DWORD pid = 0;
+    std::string process_name;
+    uintptr_t match_addr = 0;
+};
+
+struct FalsePositiveReport
+{
+    size_t total_processes_checked = 0;
+    size_t total_processes_scanned = 0;
+    SIZE_T total_bytes_scanned = 0;
+    std::vector<FalsePositiveMatch> matches;
+    DWORD elapsed_ms = 0;
 };
 
 // Triage finding for an individual region
@@ -167,7 +301,7 @@ struct TriageFinding
     DWORD alloc_protect = 0;
     int severity_score = 0;
     std::string severity_label;       // "CRIT", "HIGH", "MED", "LOW", "CLEAN"
-    std::vector<std::string> flags;   // "INJECTED_PE", "UNLINKED_MODULE", "WRITE_THEN_FLIP", "PRIVATE_RWX", "UNBACKED_EXEC"
+    std::vector<std::string> flags;   // "INJECTED_PE", "UNLINKED_MODULE", "WRITE_THEN_FLIP", "PRIVATE_RWX", "UNBACKED_EXEC", "BEHAVIOR_UNPACK", "SLEEP_OBFUSCATION"
     std::vector<std::string> reasons; // Detailed explanation strings with point values
 };
 
@@ -191,7 +325,8 @@ struct LoadedModuleRange
 enum class ViewMode
 {
     TriageFindings = 0,
-    MemoryMap = 1
+    MemoryMap = 1,
+    ProcessDiff = 2
 };
 
 // Application Color Themes
@@ -229,6 +364,16 @@ struct ThemeColors
     COLORREF row_image_bg;
     COLORREF row_image_text;
 
+    // Process Diff Row Highlighting Palette
+    COLORREF row_diff_new_bg;
+    COLORREF row_diff_new_text;
+    COLORREF row_diff_chg_bg;
+    COLORREF row_diff_chg_text;
+    COLORREF row_diff_mod_bg;
+    COLORREF row_diff_mod_text;
+    COLORREF row_diff_del_bg;
+    COLORREF row_diff_del_text;
+
     COLORREF row_sel_bg;
     COLORREF row_sel_text;
 };
@@ -250,6 +395,11 @@ static const ThemeColors g_theme_light = {
     RGB(230, 242, 255), RGB(0, 60, 120), // MEM_MAPPED clean (Sky Blue)
     RGB(255, 255, 255), RGB(20, 20, 20), // MEM_IMAGE clean (Pure white)
 
+    RGB(215, 245, 225), RGB(0, 100, 35),   // Diff New (Mint Green)
+    RGB(255, 224, 185), RGB(140, 60, 0),   // Diff Prot Changed (Peach / Orange)
+    RGB(255, 248, 195), RGB(120, 80, 0),   // Diff Modified (Amber / Gold)
+    RGB(235, 235, 235), RGB(120, 120, 120), // Diff Disappeared (Muted Gray)
+
     RGB(51, 153, 255), RGB(255, 255, 255) // Selection (Windows blue / white text)
 };
 
@@ -269,6 +419,11 @@ static const ThemeColors g_theme_dark = {
     RGB(42, 42, 30), RGB(240, 240, 170), // MEM_PRIVATE (Muted yellow tint)
     RGB(25, 40, 55), RGB(170, 210, 255), // MEM_MAPPED (Muted blue tint)
     RGB(37, 37, 38), RGB(220, 220, 220), // MEM_IMAGE (Neutral dark)
+
+    RGB(20, 55, 30), RGB(150, 255, 180),  // Diff New (Dark Emerald / Mint)
+    RGB(65, 45, 20), RGB(255, 190, 120),  // Diff Prot Changed (Dark Amber)
+    RGB(60, 55, 20), RGB(255, 230, 130),  // Diff Modified (Dark Gold)
+    RGB(35, 35, 35), RGB(130, 130, 130),  // Diff Disappeared (Dim Gray)
 
     RGB(26, 95, 180), RGB(255, 255, 255) // Selection (Deep slate blue)
 };
@@ -1076,6 +1231,20 @@ TriageReport run_process_triage(HANDLE proc, DWORD pid, std::vector<RegionInfo> 
             finding.reasons.push_back("Executable memory not backed by a disk image (+" +
                                       std::to_string(WEIGHT_UNBACKED_EXEC) + ")");
         }
+        if (reg.behavior_unpack_detected)
+        {
+            finding.severity_score += WEIGHT_BEHAVIOR_UNPACK;
+            finding.flags.push_back("BEHAVIOR_UNPACK");
+            finding.reasons.push_back("Unpack detected: memory flipped to executable with byte changes / entropy shift (+" +
+                                      std::to_string(WEIGHT_BEHAVIOR_UNPACK) + ")");
+        }
+        if (reg.sleep_obfuscation_detected)
+        {
+            finding.severity_score += WEIGHT_SLEEP_OBFUSCATION;
+            finding.flags.push_back("SLEEP_OBFUSCATION");
+            finding.reasons.push_back("Sleep obfuscation detected: oscillating between dormant encrypted and active executable (+" +
+                                      std::to_string(WEIGHT_SLEEP_OBFUSCATION) + ")");
+        }
 
         if (finding.severity_score >= SEV_MIN_CRITICAL)
             finding.severity_label = "CRIT";
@@ -1166,6 +1335,8 @@ static HWND g_btn_next_hit = nullptr;
 static HWND g_chk_hits_only = nullptr;
 static HWND g_chk_heartbeat = nullptr;
 static HWND g_combo_theme = nullptr;
+static HWND g_btn_diff_proc = nullptr;
+static HWND g_btn_yara = nullptr;
 
 static HWND g_combo_view_mode = nullptr;
 static HWND g_combo_min_sev = nullptr;
@@ -1207,6 +1378,14 @@ static bool g_has_selection = false;
 static SIZE_T g_view_offset = 0;
 static size_t g_hit_cursor_region = 0;
 static size_t g_hit_cursor_index = 0;
+
+// Process-wide Diff and Behavioral Tracking State
+static ProcessSnapshotSession g_process_baseline;
+static ProcessSnapshotSession g_process_target;
+static std::vector<ProcessDiffItem> g_process_diffs;
+static bool g_has_baseline = false;
+static bool g_has_target = false;
+static std::vector<RevealedString> g_revealed_strings;
 
 static HANDLE g_target_proc = nullptr;
 static std::string g_last_hex_dump;
@@ -1855,6 +2034,24 @@ void display_selected_region(SIZE_T focus_offset)
 
 void update_triage_details_label(size_t reg_idx)
 {
+    if (g_view_mode == ViewMode::ProcessDiff)
+    {
+        if (reg_idx < g_process_diffs.size())
+        {
+            const auto &d = g_process_diffs[reg_idx];
+            std::string kind_str = (d.kind == ProcessDiffKind::Appeared) ? "NEW" :
+                                   (d.kind == ProcessDiffKind::Disappeared) ? "REMOVED" :
+                                   (d.kind == ProcessDiffKind::ProtectionChg) ? "PROT_CHG" : "MODIFIED";
+            std::string text = "Diff Details [" + kind_str + "]: 0x" + to_hex_string(d.base) + " (" + fmt_size_short(d.size) + ") | " + d.summary;
+            SetWindowTextA(g_lbl_triage_reasons, text.c_str());
+        }
+        else
+        {
+            SetWindowTextA(g_lbl_triage_reasons, "Diff Details: Ready.");
+        }
+        return;
+    }
+
     if (reg_idx >= g_regions.size())
     {
         SetWindowTextA(g_lbl_triage_reasons, "Details: Ready.");
@@ -1899,6 +2096,45 @@ void populate_region_list()
 
     bool hits_only = (SendMessageA(g_chk_hits_only, BM_GETCHECK, 0, 0) == BST_CHECKED);
 
+    if (g_view_mode == ViewMode::ProcessDiff)
+    {
+        if (g_process_diffs.empty())
+        {
+            SendMessageA(g_list_regions, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>("No process diffs. Capture baseline (Ctrl+B), then diff (Ctrl+D)."));
+        }
+        else
+        {
+            for (size_t i = 0; i < g_process_diffs.size(); ++i)
+            {
+                const auto &d = g_process_diffs[i];
+                std::string badge;
+                switch (d.kind)
+                {
+                    case ProcessDiffKind::Appeared: badge = "[+NEW   ]"; break;
+                    case ProcessDiffKind::Disappeared: badge = "[-FREED ]"; break;
+                    case ProcessDiffKind::ProtectionChg: badge = "[!PROT  ]"; break;
+                    case ProcessDiffKind::ContentChg: badge = "[~MODIF ]"; break;
+                    default: badge = "[ UNCHG ]"; break;
+                }
+
+                char row[256];
+                std::snprintf(row, sizeof(row), "%-9s %016llX %s %-4s %-8s %s",
+                              badge.c_str(),
+                              static_cast<unsigned long long>(d.base),
+                              fmt_size_short(d.size).c_str(),
+                              type_short(d.type).c_str(),
+                              prot_short(d.new_protect ? d.new_protect : d.old_protect).c_str(),
+                              d.summary.c_str());
+
+                SendMessageA(g_list_regions, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(row));
+                g_visible_indices.push_back(i);
+            }
+        }
+        SendMessageA(g_list_regions, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(g_list_regions, nullptr, TRUE);
+        return;
+    }
+
     if (g_view_mode == ViewMode::TriageFindings)
     {
         for (size_t i = 0; i < g_triage_report.findings.size(); ++i)
@@ -1931,6 +2167,10 @@ void populate_region_list()
                     flg_str += "!FLIP ";
                 else if (flg == "UNBACKED_EXEC")
                     flg_str += "!X ";
+                else if (flg == "BEHAVIOR_UNPACK")
+                    flg_str += "!UNPK ";
+                else if (flg == "SLEEP_OBFUSCATION")
+                    flg_str += "!SLP ";
             }
             if (flg_str.empty())
                 flg_str = "      ";
@@ -2068,9 +2308,6 @@ void draw_region_list_item(DRAWITEMSTRUCT *dis)
         return;
 
     size_t reg_idx = g_visible_indices[vis_idx];
-    if (reg_idx >= g_regions.size())
-        return;
-    const RegionInfo &reg = g_regions[reg_idx];
 
     const ThemeColors &tc = get_current_theme();
     bool is_selected = (dis->itemState & ODS_SELECTED) != 0;
@@ -2078,41 +2315,76 @@ void draw_region_list_item(DRAWITEMSTRUCT *dis)
     COLORREF bg_color = tc.row_image_bg;
     COLORREF text_color = tc.row_image_text;
 
-    // Apply highlight colors based on region threat indicators
-    if (reg.is_pe_in_private)
+    if (g_view_mode == ViewMode::ProcessDiff)
     {
-        bg_color = tc.row_pe_bg;
-        text_color = tc.row_pe_text;
+        if (reg_idx < g_process_diffs.size())
+        {
+            const auto &d = g_process_diffs[reg_idx];
+            switch (d.kind)
+            {
+                case ProcessDiffKind::Appeared:
+                    bg_color = tc.row_diff_new_bg;
+                    text_color = tc.row_diff_new_text;
+                    break;
+                case ProcessDiffKind::ProtectionChg:
+                    bg_color = tc.row_diff_chg_bg;
+                    text_color = tc.row_diff_chg_text;
+                    break;
+                case ProcessDiffKind::ContentChg:
+                    bg_color = tc.row_diff_mod_bg;
+                    text_color = tc.row_diff_mod_text;
+                    break;
+                case ProcessDiffKind::Disappeared:
+                    bg_color = tc.row_diff_del_bg;
+                    text_color = tc.row_diff_del_text;
+                    break;
+                default:
+                    break;
+            }
+        }
     }
-    else if (reg.private_rwx)
+    else
     {
-        bg_color = tc.row_rwx_bg;
-        text_color = tc.row_rwx_text;
-    }
-    else if (reg.write_then_flip)
-    {
-        bg_color = tc.row_flip_bg;
-        text_color = tc.row_flip_text;
-    }
-    else if (reg.is_unlinked_image)
-    {
-        bg_color = tc.row_unlinked_bg;
-        text_color = tc.row_unlinked_text;
-    }
-    else if (reg.is_unbacked_exec)
-    {
-        bg_color = tc.row_unbacked_bg;
-        text_color = tc.row_unbacked_text;
-    }
-    else if (reg.type == MEM_PRIVATE)
-    {
-        bg_color = tc.row_priv_bg;
-        text_color = tc.row_priv_text;
-    }
-    else if (reg.type == MEM_MAPPED)
-    {
-        bg_color = tc.row_mapped_bg;
-        text_color = tc.row_mapped_text;
+        if (reg_idx >= g_regions.size())
+            return;
+        const RegionInfo &reg = g_regions[reg_idx];
+
+        // Apply highlight colors based on region threat indicators
+        if (reg.is_pe_in_private)
+        {
+            bg_color = tc.row_pe_bg;
+            text_color = tc.row_pe_text;
+        }
+        else if (reg.private_rwx)
+        {
+            bg_color = tc.row_rwx_bg;
+            text_color = tc.row_rwx_text;
+        }
+        else if (reg.write_then_flip)
+        {
+            bg_color = tc.row_flip_bg;
+            text_color = tc.row_flip_text;
+        }
+        else if (reg.is_unlinked_image)
+        {
+            bg_color = tc.row_unlinked_bg;
+            text_color = tc.row_unlinked_text;
+        }
+        else if (reg.is_unbacked_exec)
+        {
+            bg_color = tc.row_unbacked_bg;
+            text_color = tc.row_unbacked_text;
+        }
+        else if (reg.type == MEM_PRIVATE)
+        {
+            bg_color = tc.row_priv_bg;
+            text_color = tc.row_priv_text;
+        }
+        else if (reg.type == MEM_MAPPED)
+        {
+            bg_color = tc.row_mapped_bg;
+            text_color = tc.row_mapped_text;
+        }
     }
 
     if (is_selected)
@@ -2930,6 +3202,8 @@ void copy_text_to_clipboard(HWND hwnd, const std::string &text)
     CloseClipboard();
 }
 
+#include "tier1.inl"
+
 HMENU create_application_menu()
 {
     HMENU hMenuBar = CreateMenu();
@@ -2958,12 +3232,15 @@ HMENU create_application_menu()
     AppendMenuA(hEditMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(hEditMenu, MF_STRING, IDM_EDIT_FIND_PATTERN, "&Find Hex Pattern...\tCtrl+F");
     AppendMenuA(hEditMenu, MF_STRING, IDM_EDIT_FIND_NEXT, "Find &Next Hit\tF3");
+    AppendMenuA(hEditMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(hEditMenu, MF_STRING, IDM_EDIT_GENERATE_YARA, "Generate &YARA Rule from Selection...\tCtrl+Y");
     AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hEditMenu), "&Edit");
 
     // 3. View Menu
     HMENU hViewMenu = CreatePopupMenu();
     AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_TRIAGE_FINDINGS, "&Triage Findings View\tCtrl+1");
     AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_MEMORY_MAP, "&Memory Map View\tCtrl+2");
+    AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_PROCESS_DIFF, "&Process Diff View\tCtrl+3");
     AppendMenuA(hViewMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_HIDE_CLEAN, "&Hide Clean Regions");
     AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_HITS_ONLY, "&Hits Only Filter");
@@ -2971,7 +3248,18 @@ HMENU create_application_menu()
     AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_REFRESH, "&Refresh Memory Walk\tF5");
     AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hViewMenu), "&View");
 
-    // 4. Timeline Menu
+    // 4. Diff Menu
+    HMENU hDiffMenu = CreatePopupMenu();
+    AppendMenuA(hDiffMenu, MF_STRING, IDM_DIFF_CAPTURE_BASELINE, "Capture &Baseline Snapshot\tCtrl+B");
+    AppendMenuA(hDiffMenu, MF_STRING, IDM_DIFF_CAPTURE_CURRENT, "Compare with &Current (Diff)\tCtrl+D");
+    AppendMenuA(hDiffMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(hDiffMenu, MF_STRING, IDM_DIFF_SAVE_SESSION, "&Save Diff Session to JSON...");
+    AppendMenuA(hDiffMenu, MF_STRING, IDM_DIFF_LOAD_SESSION, "&Load Diff Session from JSON...");
+    AppendMenuA(hDiffMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(hDiffMenu, MF_STRING, IDM_DIFF_VIEW_STRINGS, "View Newly &Revealed Strings...\tCtrl+U");
+    AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hDiffMenu), "&Diff");
+
+    // 5. Timeline Menu
     HMENU hTimelineMenu = CreatePopupMenu();
     AppendMenuA(hTimelineMenu, MF_STRING, IDM_TIMELINE_SNAP, "&Take Snapshot\tCtrl+N");
     AppendMenuA(hTimelineMenu, MF_STRING, IDM_TIMELINE_CLEAR, "&Clear All Snapshots");
@@ -2982,7 +3270,7 @@ HMENU create_application_menu()
     AppendMenuA(hTimelineMenu, MF_STRING, IDM_TIMELINE_NEXT_PAGE, "&Next 64K Page\tPgDn");
     AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hTimelineMenu), "&Timeline");
 
-    // 5. Help Menu
+    // 6. Help Menu
     HMENU hHelpMenu = CreatePopupMenu();
     AppendMenuA(hHelpMenu, MF_STRING, IDM_HELP_HEURISTICS, "&Defensive Heuristics Guide...");
     AppendMenuA(hHelpMenu, MF_SEPARATOR, 0, nullptr);
@@ -3071,6 +3359,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SendMessageA(g_combo_theme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Theme: Light Mode"));
         SendMessageA(g_combo_theme, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Theme: Dark Mode"));
         SendMessageA(g_combo_theme, CB_SETCURSEL, 0, 0);
+        x += 154;
+
+        g_btn_diff_proc = CreateWindowA("BUTTON", "Diff Proc",
+                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                        x, M, 74, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_DIFF_PROC), hInst, nullptr);
+        x += 78;
+
+        g_btn_yara = CreateWindowA("BUTTON", "YARA Rule",
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                   x, M, 78, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_YARA), hInst, nullptr);
 
         // Row 2: Filter Bar (Left side) & Hex Timeline Bar (Right side)
         int r2_y = M + RH + 6;
@@ -3080,6 +3378,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                           M, r2_y, 148, 120, hwnd, reinterpret_cast<HMENU>(ID_COMBO_VIEW_MODE), hInst, nullptr);
         SendMessageA(g_combo_view_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("View: Triage Findings"));
         SendMessageA(g_combo_view_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("View: Memory Map"));
+        SendMessageA(g_combo_view_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("View: Process Diff"));
         SendMessageA(g_combo_view_mode, CB_SETCURSEL, 0, 0);
 
         g_combo_min_sev = CreateWindowA("COMBOBOX", "",
@@ -3144,7 +3443,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         HWND ui_items[] = {
             lbl_pid, g_edit_pid, g_btn_load, g_btn_triage, lbl_pat, g_edit_pattern, g_btn_search,
-            g_btn_next_hit, g_chk_hits_only, g_chk_heartbeat, g_combo_theme,
+            g_btn_next_hit, g_chk_hits_only, g_chk_heartbeat, g_combo_theme, g_btn_diff_proc, g_btn_yara,
             g_combo_view_mode, g_combo_min_sev, g_chk_hide_clean, g_btn_export_json,
             g_lbl_hex_info, g_btn_snap, g_combo_diff, g_btn_clear_snaps,
             g_btn_prev_page, g_btn_next_page, g_lbl_triage_reasons, g_lbl_status};
@@ -3164,6 +3463,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         make_button_modern(g_btn_clear_snaps, ModernButtonStyle::Standard);
         make_button_modern(g_btn_prev_page, ModernButtonStyle::Standard);
         make_button_modern(g_btn_next_page, ModernButtonStyle::Standard);
+        make_button_modern(g_btn_diff_proc, ModernButtonStyle::Accent);
+        make_button_modern(g_btn_yara, ModernButtonStyle::Primary);
 
         // Attach application menu bar
         HMENU hMenu = create_application_menu();
@@ -3181,6 +3482,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             { FCONTROL | FVIRTKEY, 'N', ID_BTN_SNAP },
             { FCONTROL | FVIRTKEY, '1', IDM_VIEW_TRIAGE_FINDINGS },
             { FCONTROL | FVIRTKEY, '2', IDM_VIEW_MEMORY_MAP },
+            { FCONTROL | FVIRTKEY, '3', IDM_VIEW_PROCESS_DIFF },
+            { FCONTROL | FVIRTKEY, 'B', IDM_DIFF_CAPTURE_BASELINE },
+            { FCONTROL | FVIRTKEY, 'D', IDM_DIFF_CAPTURE_CURRENT },
+            { FCONTROL | FVIRTKEY, 'Y', ID_BTN_YARA },
+            { FCONTROL | FVIRTKEY, 'U', IDM_DIFF_VIEW_STRINGS },
             { FCONTROL | FALT | FVIRTKEY, 'S', IDM_FILE_ATTACH_SELF }
         };
         g_haccel = CreateAcceleratorTableA(accels, sizeof(accels) / sizeof(accels[0]));
@@ -3196,6 +3502,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         CheckMenuItem(hMenu, IDM_FILE_THEME_DARK, (g_theme == AppTheme::Dark) ? MF_CHECKED : MF_UNCHECKED);
         CheckMenuItem(hMenu, IDM_VIEW_TRIAGE_FINDINGS, (g_view_mode == ViewMode::TriageFindings) ? MF_CHECKED : MF_UNCHECKED);
         CheckMenuItem(hMenu, IDM_VIEW_MEMORY_MAP, (g_view_mode == ViewMode::MemoryMap) ? MF_CHECKED : MF_UNCHECKED);
+        CheckMenuItem(hMenu, IDM_VIEW_PROCESS_DIFF, (g_view_mode == ViewMode::ProcessDiff) ? MF_CHECKED : MF_UNCHECKED);
         CheckMenuItem(hMenu, IDM_VIEW_HIDE_CLEAN, g_hide_clean ? MF_CHECKED : MF_UNCHECKED);
         CheckMenuItem(hMenu, IDM_VIEW_HITS_ONLY, (SendMessageA(g_chk_hits_only, BM_GETCHECK, 0, 0) == BST_CHECKED) ? MF_CHECKED : MF_UNCHECKED);
         CheckMenuItem(hMenu, IDM_TIMELINE_HEARTBEAT, (SendMessageA(g_chk_heartbeat, BM_GETCHECK, 0, 0) == BST_CHECKED) ? MF_CHECKED : MF_UNCHECKED);
@@ -3353,18 +3660,39 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         else if (id == ID_COMBO_VIEW_MODE && code == CBN_SELCHANGE)
         {
             LRESULT sel = SendMessageA(g_combo_view_mode, CB_GETCURSEL, 0, 0);
-            g_view_mode = (sel == 1) ? ViewMode::MemoryMap : ViewMode::TriageFindings;
+            if (sel == 2)
+                g_view_mode = ViewMode::ProcessDiff;
+            else if (sel == 1)
+                g_view_mode = ViewMode::MemoryMap;
+            else
+                g_view_mode = ViewMode::TriageFindings;
+
             populate_region_list();
-            if (!g_visible_indices.empty())
+            if (g_view_mode == ViewMode::ProcessDiff)
             {
-                select_region_in_ui(g_visible_indices[0], 0, static_cast<SIZE_T>(-1));
+                if (!g_visible_indices.empty())
+                {
+                    SendMessageA(g_list_regions, LB_SETCURSEL, 0, 0);
+                    update_triage_details_label(0);
+                }
+                else
+                {
+                    SetWindowTextA(g_lbl_triage_reasons, "Diff Details: No diffs. Click Diff Proc to compare.");
+                }
             }
             else
             {
-                g_has_selection = false;
-                update_diff_combo();
-                display_selected_region(static_cast<SIZE_T>(-1));
-                SetWindowTextA(g_lbl_triage_reasons, "Details: Ready.");
+                if (!g_visible_indices.empty())
+                {
+                    select_region_in_ui(g_visible_indices[0], 0, static_cast<SIZE_T>(-1));
+                }
+                else
+                {
+                    g_has_selection = false;
+                    update_diff_combo();
+                    display_selected_region(static_cast<SIZE_T>(-1));
+                    SetWindowTextA(g_lbl_triage_reasons, "Details: Ready.");
+                }
             }
         }
         else if (id == ID_COMBO_MIN_SEV && code == CBN_SELCHANGE)
@@ -3397,7 +3725,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             InvalidateRect(g_edit_hex, nullptr, TRUE);
             InvalidateRect(g_lbl_triage_reasons, nullptr, TRUE);
             InvalidateRect(g_lbl_status, nullptr, TRUE);
-            HWND btns[] = { g_btn_load, g_btn_triage, g_btn_search, g_btn_next_hit, g_btn_export_json, g_btn_snap, g_btn_clear_snaps, g_btn_prev_page, g_btn_next_page };
+            HWND btns[] = { g_btn_load, g_btn_triage, g_btn_search, g_btn_next_hit, g_btn_export_json, g_btn_snap, g_btn_clear_snaps, g_btn_prev_page, g_btn_next_page, g_btn_diff_proc, g_btn_yara };
             for (HWND b : btns) InvalidateRect(b, nullptr, TRUE);
         }
         else if (id == ID_CHK_HITS_ONLY)
@@ -3420,19 +3748,41 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (sel != LB_ERR && static_cast<size_t>(sel) < g_visible_indices.size())
             {
                 size_t reg_idx = g_visible_indices[static_cast<size_t>(sel)];
-                if (reg_idx < g_regions.size())
+                if (g_view_mode == ViewMode::ProcessDiff)
                 {
-                    SIZE_T first_hit = g_regions[reg_idx].hits.empty()
-                                           ? static_cast<SIZE_T>(-1)
-                                           : g_regions[reg_idx].hits[0];
-                    SIZE_T page_off = (first_hit == static_cast<SIZE_T>(-1))
-                                          ? 0
-                                          : (first_hit / VIEW_PAGE_SIZE) * VIEW_PAGE_SIZE;
-                    g_selected_region = reg_idx;
-                    g_has_selection = true;
-                    g_view_offset = page_off;
-                    display_selected_region(first_hit);
-                    update_triage_details_label(reg_idx);
+                    if (reg_idx < g_process_diffs.size())
+                    {
+                        update_triage_details_label(reg_idx);
+                        uintptr_t target_base = g_process_diffs[reg_idx].base;
+                        for (size_t r = 0; r < g_regions.size(); ++r)
+                        {
+                            if (g_regions[r].base == target_base)
+                            {
+                                g_selected_region = r;
+                                g_has_selection = true;
+                                g_view_offset = 0;
+                                display_selected_region(static_cast<SIZE_T>(-1));
+                                break;
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    if (reg_idx < g_regions.size())
+                    {
+                        SIZE_T first_hit = g_regions[reg_idx].hits.empty()
+                                               ? static_cast<SIZE_T>(-1)
+                                               : g_regions[reg_idx].hits[0];
+                        SIZE_T page_off = (first_hit == static_cast<SIZE_T>(-1))
+                                              ? 0
+                                              : (first_hit / VIEW_PAGE_SIZE) * VIEW_PAGE_SIZE;
+                        g_selected_region = reg_idx;
+                        g_has_selection = true;
+                        g_view_offset = page_off;
+                        display_selected_region(first_hit);
+                        update_triage_details_label(reg_idx);
+                    }
                 }
             }
         }
@@ -3605,13 +3955,51 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         {
             PostMessageA(hwnd, WM_COMMAND, ID_BTN_NEXT_PAGE, 0);
         }
+        else if (id == ID_BTN_DIFF_PROC)
+        {
+            on_capture_diff();
+        }
+        else if (id == ID_BTN_YARA || id == IDM_EDIT_GENERATE_YARA)
+        {
+            open_yara_dialog(hwnd);
+        }
+        else if (id == IDM_DIFF_CAPTURE_BASELINE)
+        {
+            on_capture_baseline();
+        }
+        else if (id == IDM_DIFF_CAPTURE_CURRENT)
+        {
+            on_capture_diff();
+        }
+        else if (id == IDM_DIFF_SAVE_SESSION)
+        {
+            on_save_diff_session();
+        }
+        else if (id == IDM_DIFF_LOAD_SESSION)
+        {
+            on_load_diff_session();
+        }
+        else if (id == IDM_DIFF_VIEW_STRINGS)
+        {
+            open_revealed_strings_dialog(hwnd);
+        }
+        else if (id == IDM_VIEW_PROCESS_DIFF)
+        {
+            SendMessageA(g_combo_view_mode, CB_SETCURSEL, 2, 0);
+            SendMessageA(hwnd, WM_COMMAND, MAKEWPARAM(ID_COMBO_VIEW_MODE, CBN_SELCHANGE), reinterpret_cast<LPARAM>(g_combo_view_mode));
+        }
         else if (id == IDM_HELP_HEURISTICS)
         {
             std::string info =
-                
                 "[+50] INJECTED_PE:\n"
                 "   MZ/PE header detected inside committed MEM_PRIVATE pages.\n"
                 "   (Reflective DLL injection, process hollowing, unhooking)\n\n"
+                "[+50] BEHAVIOR_UNPACK:\n"
+                "   Memory flipped to executable with byte mutations or entropy drop.\n"
+                "   (Payload unpacking, dynamically decoded shellcode)\n\n"
+                "[+65] SLEEP_OBFUSCATION:\n"
+                "   Region protection/entropy oscillates across heartbeat ticks.\n"
+                "   (Encrypted at rest, decrypted while running)\n\n"
                 "[+45] UNLINKED_MODULE:\n"
                 "   MEM_IMAGE allocation missing from PEB InLoadOrderModuleList.\n"
                 "   (DKOM evasion, stealth module unlinking)\n\n"
@@ -3628,7 +4016,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 "  * HIGH:     Score >= 50\n"
                 "  * MEDIUM:   Score >= 25\n"
                 "  * LOW:      Score >= 10\n"
-                "  * CLEAN:    Score = 0";
+                "  * CLEAN:    Score = 0\n\n"
+                "Note: Heartbeat polling interval is 1s; sub-second transitions may be missed.";
             MessageBoxA(hwnd, info.c_str(), "Deadeye Heuristics Reference", MB_OK | MB_ICONINFORMATION);
         }
         else if (id == IDM_HELP_ABOUT)
@@ -3678,6 +4067,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_TIMER:
         if (wp == IDT_HEARTBEAT)
         {
+            evaluate_memory_behavior_heartbeat();
             if (g_has_selection && g_selected_region < g_regions.size())
             {
                 display_selected_region(static_cast<SIZE_T>(-1));
@@ -3745,6 +4135,26 @@ int run_gui(HINSTANCE hInst, int nCmdShow)
     wc.hIcon = hIconBig;
     wc.hIconSm = hIconSmall;
     RegisterClassExA(&wc);
+
+    WNDCLASSEXA wcYara = {};
+    wcYara.cbSize = sizeof(wcYara);
+    wcYara.lpfnWndProc = YaraDlgProc;
+    wcYara.hInstance = hInst;
+    wcYara.hbrBackground = nullptr;
+    wcYara.lpszClassName = "DeadeyeYaraDlg";
+    wcYara.hCursor = LoadCursorA(nullptr, IDC_ARROW);
+    wcYara.hIcon = hIconSmall;
+    RegisterClassExA(&wcYara);
+
+    WNDCLASSEXA wcStr = {};
+    wcStr.cbSize = sizeof(wcStr);
+    wcStr.lpfnWndProc = StringsDlgProc;
+    wcStr.hInstance = hInst;
+    wcStr.hbrBackground = nullptr;
+    wcStr.lpszClassName = "DeadeyeStringsDlg";
+    wcStr.hCursor = LoadCursorA(nullptr, IDC_ARROW);
+    wcStr.hIcon = hIconSmall;
+    RegisterClassExA(&wcStr);
 
     HWND hwnd = CreateWindowA("DeadeyeHexViewer", "Deadeye",
                               WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,

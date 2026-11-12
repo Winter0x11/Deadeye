@@ -30,7 +30,7 @@ jobs:
         shell: msys2 {0}
         run: |
           mkdir -p build
-          windres src/deadeye.rc -O coff -o build/deadeye_res.o
+          windres -I src -i src/deadeye.rc -O coff -o build/deadeye_res.o
           g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 -static -static-libgcc -static-libstdc++ src/main.cpp build/deadeye_res.o -o build/deadeye.exe -mwindows -ladvapi32 -lcomctl32 -lcomdlg32 -lgdi32 -luser32
           rm -f build/deadeye_res.o
 

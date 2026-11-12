@@ -1,21 +1,51 @@
 # Deadeye
 
-**Deadeye** is a high-performance Windows process memory triage scanner, interactive hex viewer, and real-time diff timeline built in modern C++17 and native Win32.
+**Deadeye** is an advanced Windows process memory triage scanner, detection-engineering toolkit, and behavioral diff timeline built in modern C++17 and native Win32.
 
-Designed for defensive reverse engineering, malware analysis, and detection engineering, Deadeye brings color-coded visual triage directly to your desktop. It automatically flags suspicious memory conditions (such as private RWX regions, write-then-flip executable memory, reflective DLL/PE headers in private heap/stack pages, and unlinked modules), monitors live memory mutations in real time without pausing or attaching a debugger, and exports valid JSON reports for automation.
+Designed for reverse engineers, threat hunters, and detection engineers, Deadeye bridges the gap between memory analysis and rule deployment: generate auto-wildcarded YARA rules from hex selections, instantly validate them against clean running processes to verify zero false positives, diff entire process address spaces before and after running malware, and monitor unpacking transitions in real time without pausing or attaching a debugger.
+
+---
+
+## Key Detection & Analysis Capabilities
+
+### 1. Hex Selection to YARA Rule with Live False-Positive Testing
+Select any sequence of bytes in the hex viewer (or press `Ctrl+Y`) to generate an optimized YARA signature with architecture-aware wildcarding:
+- **Intelligent Relocation Wildcarding**: Automatically replaces volatile bytes that change across compilations:
+  - Relative CALL / JMP displacements (`E8 ?? ?? ?? ??`, `E9 ?? ?? ?? ??`)
+  - Conditional near jumps (`0F 80..8F ?? ?? ?? ??`)
+  - x64 RIP-relative displacements (ModR/M `[rip + disp32]` with disp32 masked)
+  - 64-bit immediate constants and address relocations (`48 B8..BF ??..??`)
+- **Built-in False-Positive Validator**: Click **Run False-Positive Test** directly inside Deadeye. It scans the executable memory of every active running process on the host machine using SIMD-accelerated pattern matching. If a signature matches benign software (e.g. `svchost.exe`, `explorer.exe`), it reports the exact PID, process name, and match address so you can refine your rule before deployment.
+
+### 2. Process-Wide Memory Diff & Offline Analysis Sessions
+Deadeye captures the full virtual address space (region map, memory states, page protections, Shannon entropy, and FNV-1a content hashes) before and after running a suspicious sample:
+- **Comprehensive State Diffs**: Highlights regions that:
+  - `[+NEW   ]`: Newly allocated / committed memory (e.g. injected payloads, shellcode buffers).
+  - `[!PROT  ]`: Protection transitions (e.g. `RW` flipped to `RX` or `RWX`).
+  - `[~MODIF ]`: Existing regions whose content was mutated or decrypted in place.
+  - `[-FREED ]`: Deallocated or unmapped regions.
+- **Offline Session Files**: Save snapshot sessions to standard JSON (`.json`) files so team members can inspect and diff process states offline or across triage sandboxes.
+
+### 3. Behavioral Memory Timeline & Unpack Detection
+On an optional 1-second heartbeat timer, Deadeye tracks per-region transitions, entropy shifts, and content mutations:
+- **Unpack Detection (`BEHAVIOR_UNPACK`, +50 pts)**: Automatically detects when a non-executable region (`RW` / `RO`) flips to executable (`RX` / `RWX`) and its content changes or entropy drops (payload unpacked into memory).
+- **Sleep Obfuscation Detection (`SLEEP_OBFUSCATION`, +65 pts)**: Identifies regions whose protection or entropy oscillates across ticks (e.g., encrypted at rest during sleep cycles, decrypted while active).
+- **"New Strings After Unpack" (`Ctrl+U`)**: Automatically extracts ASCII and UTF-16LE strings revealed following protection flips. Categorizes indicators into badges: `[URL]`, `[IP]`, `[PATH]`, `[CMD]`, `[REG]`, and `[STR]` for immediate extraction of C2 configurations.
+- > [!IMPORTANT]
+  > **Polling Notice**: Periodic heartbeat polling operates on a 1-second interval. Very fast, sub-second unpack-and-reprotect transitions may execute between polling ticks. Deadeye is designed to provide lightweight, non-invasive observation without the overhead or evasion triggers of kernel drivers or active debugger hooks.
 
 ---
 
 ## Quick Install (One-Line Command)
 
-Run this single command in **PowerShell** (no admin rights or external runtimes required):
+Run this command in **PowerShell** (no admin rights or external runtimes required):
 
 ```powershell
 irm https://raw.githubusercontent.com/Winter0x11/Deadeye/main/install.ps1 | iex
 ```
 
 > [!NOTE]
-> If you are running from **Command Prompt (CMD)** or the **Windows Run Dialog (`Win + R`)**, prepend `powershell`:
+> If running from **Command Prompt (CMD)** or the **Windows Run Dialog (`Win + R`)**, prepend `powershell`:
 > ```cmd
 > powershell -ep bypass -c "irm https://raw.githubusercontent.com/Winter0x11/Deadeye/main/install.ps1 | iex"
 > ```
@@ -23,25 +53,27 @@ irm https://raw.githubusercontent.com/Winter0x11/Deadeye/main/install.ps1 | iex
 **What this one-liner does automatically:**
 1. Resolves the latest release binary from GitHub.
 2. Downloads and extracts `deadeye.exe` to `%LOCALAPPDATA%\Deadeye`.
-3. Adds Deadeye to your user `PATH` (so you can run `deadeye` from any terminal).
+3. Adds Deadeye to your user `PATH` (so you can run `deadeye` from any command prompt).
 4. Creates a Windows Start Menu shortcut.
 5. Immediately launches Deadeye.
 
 > [!TIP]
-> **Zero External Dependencies**: Deadeye is compiled with fully static C++ runtimes (`-static -static-libgcc -static-libstdc++`). It runs out-of-the-box on clean Windows 10 & 11 installations with no Visual C++ Redistributable or MinGW DLL requirements.
+> **Zero External Dependencies**: Deadeye is compiled with fully static C++ runtimes (`-static -static-libgcc -static-libstdc++`). It runs out-of-the-box on clean Windows 10 & 11 installations with zero Visual C++ Redistributable or MinGW DLL requirements.
 
 ---
 
 ## Defensive Triage Heuristics & Additive Scoring
 
-Deadeye inspects target processes in a background worker thread and computes an **additive threat severity score** for every committed memory region based on weighted heuristics:
+Deadeye inspects target processes in a background worker thread and computes an **additive threat severity score** for every committed memory region:
 
 | Detection Rule | Additive Weight | Description |
 |:---|:---:|:---|
-| `INJECTED_PE` | **+50** | Valid DOS (`MZ`) and NT (`PE\0\0`) headers detected within `MEM_PRIVATE` pages (indicative of reflective DLL loading, process hollowing, or unhooking stubs). |
-| `UNLINKED_MODULE` | **+45** | Committed `MEM_IMAGE` allocation whose base address is missing from the 64-bit PEB loader list (`InLoadOrderModuleList`), indicating module unlinking/DKOM evasion. *(Reported as unsupported on 32-bit WOW64 targets instead of guessing).* |
+| `SLEEP_OBFUSCATION` | **+65** | Region protection/entropy oscillates across heartbeat ticks (payload encrypted at rest, decrypted while active). |
+| `INJECTED_PE` | **+50** | Valid DOS (`MZ`) and NT (`PE\0\0`) headers detected within `MEM_PRIVATE` pages (reflective DLL loading, process hollowing, unhooking stubs). |
+| `BEHAVIOR_UNPACK` | **+50** | Region flipped from non-executable to executable with byte mutations or entropy drop. |
+| `UNLINKED_MODULE` | **+45** | Committed `MEM_IMAGE` allocation missing from the 64-bit PEB loader list (`InLoadOrderModuleList`), indicating DKOM evasion. |
 | `PRIVATE_RWX` | **+40** | Region marked `MEM_PRIVATE` with `PAGE_EXECUTE_READWRITE` or `PAGE_EXECUTE_WRITECOPY` protection. |
-| `WRITE_THEN_FLIP` | **+35** | `AllocationProtect` was non-executable writable (`PAGE_READWRITE` / `PAGE_WRITECOPY`), but current `Protect` is executable (`PAGE_EXECUTE` / `PAGE_EXECUTE_READ`). Common malware staging pattern. |
+| `WRITE_THEN_FLIP` | **+35** | `AllocationProtect` was writable (`PAGE_READWRITE`), current `Protect` is executable (`PAGE_EXECUTE_READ`). Staged payload execution. |
 | `UNBACKED_EXEC` | **+25** | Executable memory not backed by a verified disk image (`MEM_MAPPED` or `MEM_PRIVATE` with execution rights). |
 
 ### Severity Bands
@@ -53,41 +85,29 @@ Deadeye inspects target processes in a background worker thread and computes an 
 
 ---
 
-## Features
+## Features & UI Overview
 
-- **Pure Windows Subsystem Application**: Built strictly as a native GUI binary (`/SUBSYSTEM:WINDOWS`, `-mwindows`). No console flashing on launch, no command-line baggage.
-- **Full Application Menu Bar & Global Shortcuts**:
-  - **File**: Attach to Self (`Ctrl+Alt+S`), Run Defensive Triage (`Ctrl+T`), Export Triage JSON (`Ctrl+S`), **Theme** (`Light Mode` / `Dark Mode`), Exit (`Alt+F4`).
-  - **Edit**: Copy Region Address (`Ctrl+C`), Copy Hex Dump (`Ctrl+Shift+C`), Find Hex Pattern (`Ctrl+F`), Find Next Hit (`F3`).
-  - **View**: Triage Findings View (`Ctrl+1`), Memory Map View (`Ctrl+2`), Hide Clean Regions, Hits Only Filter, Refresh Memory Walk (`F5`).
+- **Pure Windows Subsystem Application**: Built strictly as a native GUI binary (`/SUBSYSTEM:WINDOWS`, `-mwindows`). No console flashing on launch, zero command-line baggage.
+- **Three Core View Modes**:
+  - **Triage Findings (`Ctrl+1`)**: Displays all evaluated regions sorted strictly by threat severity descending (`[SEV SCORE] FLAGS ADDRESS SIZE TYPE PROT`).
+  - **Memory Map (`Ctrl+2`)**: Linear address walk showing all committed pages with hit badges, snapshot counters, and detection flags.
+  - **Process Diff View (`Ctrl+3`)**: Comprehensive before-and-after difference list highlighting `[+NEW]`, `[!PROT]`, `[~MODIF]`, and `[-FREED]` regions.
+- **Menu Bar & Global Accelerators**:
+  - **File**: Attach to Self (`Ctrl+Alt+S`), Run Defensive Triage (`Ctrl+T`), Export Triage JSON (`Ctrl+S`), Theme (`Light` / `Dark`), Exit (`Alt+F4`).
+  - **Edit**: Copy Region Address (`Ctrl+C`), Copy Hex Dump (`Ctrl+Shift+C`), Find Hex Pattern (`Ctrl+F`), Find Next Hit (`F3`), **Generate YARA Rule (`Ctrl+Y`)**.
+  - **View**: Triage Findings (`Ctrl+1`), Memory Map (`Ctrl+2`), Process Diff View (`Ctrl+3`), Hide Clean Regions, Hits Only Filter, Refresh (`F5`).
+  - **Diff**: Capture Baseline (`Ctrl+B`), Compare with Current (`Ctrl+D`), Save Diff Session, Load Diff Session, **View Newly Revealed Strings (`Ctrl+U`)**.
   - **Timeline**: Take Snapshot (`Ctrl+N`), Clear All Snapshots, Live Memory Heartbeat, Previous/Next 64 KB Page (`PgUp` / `PgDn`).
-  - **Help**: Built-in Defensive Heuristics & Scoring Guide, About Deadeye dialog.
-  - **Native Accelerators**: Global keyboard accelerator table (`TranslateAcceleratorA`) for rapid analyst workflows.
+  - **Help**: Defensive Heuristics Reference Guide, About Deadeye.
 - **Modern Fluent UI Engine**:
-  - **Sleek Rounded Pushbuttons**: Custom double-buffered button engine with smooth rounded borders (6px radius) and seamless parent corner blending.
-  - **Interactive Hover & Click States**: Real-time cursor state changes (`IDC_HAND`), mouse tracking (`TrackMouseEvent` / `WM_MOUSELEAVE`), tactile 1px pressed offsets, and high-visibility keyboard focus rings.
-  - **Visual CTA Hierarchy**: Cobalt Azure Primary button for **Triage**, Emerald Green Accent for **Export JSON**, and clean modern Card buttons for search and navigation.
-  - **High-DPI & Common Controls v6**: Embedded application manifest with Microsoft Common-Controls 6.0.0.0 dependency and PerMonitorV2 DPI awareness for crystal-clear typography on high-resolution displays.
-- **UI-Independent Core Engine**: All memory walks, pattern scanning, and defensive triage evaluations take a process handle and return plain structs (`TriageReport`, `TriageFinding`, `RegionInfo`), keeping core logic fully decoupled from presentation.
-- **Two Flexible View Modes**:
-  - **Triage Findings**: Displays all evaluated regions sorted strictly by threat severity descending (`[SEV SCORE] FLAGS ADDRESS SIZE TYPE PROT`).
-  - **Memory Map**: Full linear address walk showing all committed pages with hit badges, snapshot counters, and detection flags.
-- **Threat Filters**:
-  - **Min Severity**: Filter by `All (0+)`, `Low (10+)`, `Med (25+)`, `High (50+)`, or `Crit (80+)`.
-  - **Hide Clean**: Instantly collapse benign regions to focus exclusively on anomalies.
-  - **Hits Only**: Show only regions containing pattern match hits.
-- **Finding Details Line**: Displays the exact point-scored breakdown and reasons for the selected finding (e.g. `Details [CRIT 110]: Injected PE/Reflective DLL (+50) | Write-then-flip (+35) | Unbacked Exec (+25)`).
-- **Export Valid JSON**: Export full findings to a file chosen via standard Windows Save Dialog (`GetSaveFileNameA`), including `base`, `size`, `alloc_base`, `type`, `protect`, `alloc_protect`, `flags`, `severity_score`, `severity_label`, and `reasons`.
-- **Real-Time Memory Heartbeat (1s)**: Periodic live diff monitoring that highlights modified bytes with aligned `old:` sub-rows without scrolling resets or flicker.
-- **Visual Memory Diff Timeline**: Capture point-in-time snapshots (`[+ Snap]`) and compare `Live vs Snapshot` or `Snapshot vs Snapshot`.
-- **SIMD-Accelerated Pattern Search**: Fast sliding-window pattern scanner using `memchr` anchor acceleration, wildcard support (`??`), all-wildcard rejection, and per-region hit caps (10,000).
-- **Robust Page-Wise Read Fallback**: Never silently abandons regions on partial read errors; automatically falls back to 4 KB page-by-page reads to scan past guard pages and decommitted blocks.
-- **Automatic `SeDebugPrivilege` Acquisition**: Attempts token privilege adjustment on startup so elevated processes can inspect system services and protected targets.
-- **Zero Third-Party Dependencies**: Pure C++17 and standard Win32 API (`user32`, `gdi32`, `advapi32`, `comctl32`, `comdlg32`).
+  - Smooth rounded buttons with interactive hover/click feedback.
+  - Full High-DPI and PerMonitorV2 awareness with embedded Common-Controls v6 manifest.
+  - Dual Dark and Light color palettes for both high-contrast lab work and presentation environments.
+- **Zero Third-Party Dependencies**: Native C++17 and standard Win32 API (`user32`, `gdi32`, `advapi32`, `comctl32`, `comdlg32`).
 
 ---
 
-## Building
+## Building from Source
 
 ### Repository
 ```powershell
@@ -95,28 +115,16 @@ git clone https://github.com/Winter0x11/Deadeye.git
 cd Deadeye
 ```
 
-### Requirements
-- **OS**: Windows 10 or 11 (x64)
-- **Compiler**: MinGW-w64 (`g++` & `windres`) or MSVC (`cl.exe`)
-
 ### Build with MinGW-w64 (GCC)
 ```powershell
 # Create build directory
 if (-not (Test-Path build)) { New-Item -ItemType Directory -Path build }
 
 # Compile Windows resources & Common-Controls v6 / DPI manifest
-windres src/deadeye.rc -O coff -o build/deadeye_res.o
+windres -I src -i src/deadeye.rc -o build/deadeye_res.o
 
 # Compile fully static standalone binary (zero external DLL requirements)
 g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 -static -static-libgcc -static-libstdc++ src/main.cpp build/deadeye_res.o -o build/deadeye.exe -mwindows -ladvapi32 -lcomctl32 -lcomdlg32 -lgdi32 -luser32
-```
-
-### Build with MSVC (Visual Studio Developer Command Prompt)
-```bat
-if not exist build mkdir build
-
-REM Compile Deadeye GUI (/W4, pure Windows subsystem, zero warnings)
-cl /std:c++17 /EHsc /W4 /O2 src/main.cpp /Fe:build/deadeye.exe /Fo:build/ /link /SUBSYSTEM:WINDOWS
 ```
 
 ---
@@ -124,38 +132,5 @@ cl /std:c++17 /EHsc /W4 /O2 src/main.cpp /Fe:build/deadeye.exe /Fo:build/ /link 
 ## Pre-Built Releases & CI/CD
 
 Pre-compiled standalone 64-bit binaries are published on GitHub:
-- **Release Bundle**: `Deadeye-v1.0.0-windows-x64.zip` containing `deadeye.exe` and documentation.
-- **Automated CI/CD**: Pushing any version tag (e.g. `git tag -a v1.0.0 -m "Release v1.0.0"` followed by `git push origin main --tags`) automatically triggers GitHub Actions to compile, test, package, and release release assets via [`.github/workflows/release.yml`](.github/workflows/release.yml).
-
----
-
-## Manual Test Checklist
-
-Use the included `test_target.exe` tool to verify each defensive triage condition inside Deadeye:
-
-| Test Mode | Test Command | Simulated Condition | Expected Triage Flags | Expected Severity | Visual Highlight Color |
-|:---:|:---|:---|:---|:---:|:---|
-| **1** | `.\build\test_target.exe 1` | `VirtualAlloc(PAGE_EXECUTE_READWRITE)` | `PRIVATE_RWX`, `UNBACKED_EXEC` | **65 (HIGH)** | Salmon / Red alert (`#FFC0C0`) |
-| **2** | `.\build\test_target.exe 2` | `VirtualAlloc(PAGE_READWRITE)` &rarr; `VirtualProtect(PAGE_EXECUTE_READ)` | `WRITE_THEN_FLIP`, `UNBACKED_EXEC` | **60 (HIGH)** | Peach / Orange (`#FFE0B9`) |
-| **3** | `.\build\test_target.exe 3` | Private memory containing `MZ` & `PE\0\0` headers | `INJECTED_PE`, `WRITE_THEN_FLIP`, `UNBACKED_EXEC` | **110 (CRIT)** | Alert Red (`#FFB4B4`) |
-| **4** | `.\build\test_target.exe 4` | `LoadLibraryA("version.dll")` & unlinked from PEB `InLoadOrderModuleList` | `UNLINKED_MODULE` | **45 (MED)** | Packed Purple (`#E8D0FF`) |
-| **All** | `.\build\test_target.exe all` | Simulates all 4 conditions simultaneously | Multiple rows matching above | **45 to 110** | Multi-colored threat palette |
-
-### Verification Steps:
-1. Launch `test_target.exe`:
-   ```powershell
-   .\build\test_target.exe all
-   ```
-   Note the printed target PID (e.g. `9244`).
-2. Launch `deadeye.exe`:
-   ```powershell
-   .\build\deadeye.exe
-   ```
-3. In Deadeye:
-   - Enter the target PID in the `PID:` box and click **Triage**.
-   - Verify that the left pane populates with the findings list sorted by threat severity.
-   - Verify that the injected PE finding is at the top with `[CRIT 110]` highlighted in red/purple.
-   - Click each row and verify that the hex viewer jumps directly to the corresponding base address.
-   - Verify that the **Details** line at the bottom displays the exact additive scoring explanation for each finding.
-   - Select the `RWX` row, check **Heartbeat (1s)**, and press `m` in `test_target.exe` to observe live memory diffs annotated in real time.
-   - Click **Export JSON**, save to a file, and verify the structured JSON output.
+- **Release Bundle**: `Deadeye-v1.0.1-windows-x64.zip` containing `deadeye.exe` and documentation.
+- **Automated CI/CD**: Pushing any version tag (e.g. `git tag -a v1.0.1 -m "Release v1.0.1"` followed by `git push origin main --tags`) automatically triggers GitHub Actions to compile, test, package, and publish release assets via [`.github/workflows/release.yml`](.github/workflows/release.yml).
