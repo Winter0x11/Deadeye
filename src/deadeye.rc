@@ -1,4 +1,4 @@
 #define IDI_APP 101
 
 1 24 "src/deadeye.manifest"
-IDI_APP ICON "deadeye_512.ico"
+IDI_APP ICON "newdeadeyeicon.ico"
