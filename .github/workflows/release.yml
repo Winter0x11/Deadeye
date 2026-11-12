@@ -26,27 +26,25 @@ jobs:
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-binutils
 
-      - name: Build Deadeye & Test Target
+      - name: Build Deadeye
         shell: msys2 {0}
         run: |
           mkdir -p build
           windres src/deadeye.rc -O coff -o build/deadeye_res.o
           g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 -static -static-libgcc -static-libstdc++ src/main.cpp build/deadeye_res.o -o build/deadeye.exe -mwindows -ladvapi32 -lcomctl32 -lcomdlg32 -lgdi32 -luser32
-          g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 -static -static-libgcc -static-libstdc++ src/test_target.cpp -o build/test_target.exe
           rm -f build/deadeye_res.o
 
       - name: Package Release
         shell: powershell
         run: |
           $tag = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "v1.0.0" }
-          Compress-Archive -Path build\deadeye.exe, build\test_target.exe, README.md, install.ps1 -DestinationPath "build\Deadeye-$tag-windows-x64.zip" -Force
+          Compress-Archive -Path build\deadeye.exe, README.md, install.ps1 -DestinationPath "build\Deadeye-$tag-windows-x64.zip" -Force
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             build/deadeye.exe
-            build/test_target.exe
             build/Deadeye-*.zip
           name: Deadeye ${{ github.ref_name }}
           draft: false

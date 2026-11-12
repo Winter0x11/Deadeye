@@ -109,9 +109,6 @@ windres src/deadeye.rc -O coff -o build/deadeye_res.o
 
 # Compile fully static standalone binary (zero external DLL requirements)
 g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 -static -static-libgcc -static-libstdc++ src/main.cpp build/deadeye_res.o -o build/deadeye.exe -mwindows -ladvapi32 -lcomctl32 -lcomdlg32 -lgdi32 -luser32
-
-# Compile the test target
-g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 -static -static-libgcc -static-libstdc++ src/test_target.cpp -o build/test_target.exe
 ```
 
 ### Build with MSVC (Visual Studio Developer Command Prompt)
@@ -120,9 +117,6 @@ if not exist build mkdir build
 
 REM Compile Deadeye GUI (/W4, pure Windows subsystem, zero warnings)
 cl /std:c++17 /EHsc /W4 /O2 src/main.cpp /Fe:build/deadeye.exe /Fo:build/ /link /SUBSYSTEM:WINDOWS
-
-REM Compile the test target
-cl /std:c++17 /EHsc /W4 /O2 src/test_target.cpp /Fe:build/test_target.exe /Fo:build/
 ```
 
 ---
@@ -130,7 +124,7 @@ cl /std:c++17 /EHsc /W4 /O2 src/test_target.cpp /Fe:build/test_target.exe /Fo:bu
 ## Pre-Built Releases & CI/CD
 
 Pre-compiled standalone 64-bit binaries are published on GitHub:
-- **Release Bundle**: `Deadeye-v1.0.0-windows-x64.zip` containing `deadeye.exe`, `test_target.exe`, and documentation.
+- **Release Bundle**: `Deadeye-v1.0.0-windows-x64.zip` containing `deadeye.exe` and documentation.
 - **Automated CI/CD**: Pushing any version tag (e.g. `git tag -a v1.0.0 -m "Release v1.0.0"` followed by `git push origin main --tags`) automatically triggers GitHub Actions to compile, test, package, and release release assets via [`.github/workflows/release.yml`](.github/workflows/release.yml).
 
 ---
