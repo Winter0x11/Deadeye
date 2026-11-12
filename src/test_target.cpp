@@ -189,7 +189,7 @@ int main(int argc, char *argv[])
     DWORD pid = GetCurrentProcessId();
 
     std::cout 
-              << " Deadeye Defensive Triage Test Target\n"
+              << "Deadeye Defensive Triage Test Target\n"
               
               << "PID: " << pid << "\n\n";
 

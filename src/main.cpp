@@ -16,6 +16,10 @@
 #define NOMINMAX
 #endif
 
+#ifndef IDI_APP
+#define IDI_APP 101
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -3720,18 +3724,41 @@ int run_gui(HINSTANCE hInst, int nCmdShow)
     icc.dwICC = ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES;
     InitCommonControlsEx(&icc);
 
-    WNDCLASSA wc = {};
+    HICON hIconBig = static_cast<HICON>(LoadImageA(hInst, MAKEINTRESOURCEA(IDI_APP), IMAGE_ICON,
+                                                   GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON),
+                                                   LR_DEFAULTCOLOR | LR_SHARED));
+    HICON hIconSmall = static_cast<HICON>(LoadImageA(hInst, MAKEINTRESOURCEA(IDI_APP), IMAGE_ICON,
+                                                     GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
+                                                     LR_DEFAULTCOLOR | LR_SHARED));
+    if (hIconBig == nullptr)
+    {
+        hIconBig = LoadIconA(nullptr, IDI_APPLICATION);
+    }
+
+    WNDCLASSEXA wc = {};
+    wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
     wc.hbrBackground = nullptr;
     wc.lpszClassName = "DeadeyeHexViewer";
     wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
-    wc.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
-    RegisterClassA(&wc);
+    wc.hIcon = hIconBig;
+    wc.hIconSm = hIconSmall;
+    RegisterClassExA(&wc);
 
-    HWND hwnd = CreateWindowA("DeadeyeHexViewer", "Deadeye ",
+    HWND hwnd = CreateWindowA("DeadeyeHexViewer", "Deadeye",
                               WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
                               1220, 740, nullptr, nullptr, hInst, nullptr);
+
+    if (hIconBig != nullptr)
+    {
+        SendMessageA(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(hIconBig));
+    }
+    if (hIconSmall != nullptr)
+    {
+        SendMessageA(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(hIconSmall));
+    }
+
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
