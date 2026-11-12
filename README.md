@@ -11,8 +11,14 @@ Designed for defensive reverse engineering, malware analysis, and detection engi
 Run this single command in **PowerShell** (no admin rights or external runtimes required):
 
 ```powershell
-powershell -ep bypass -c "irm https://raw.githubusercontent.com/Winter0x11/Deadeye/main/install.ps1 | iex"
+irm https://raw.githubusercontent.com/Winter0x11/Deadeye/main/install.ps1 | iex
 ```
+
+> [!NOTE]
+> If you are running from **Command Prompt (CMD)** or the **Windows Run Dialog (`Win + R`)**, prepend `powershell`:
+> ```cmd
+> powershell -ep bypass -c "irm https://raw.githubusercontent.com/Winter0x11/Deadeye/main/install.ps1 | iex"
+> ```
 
 **What this one-liner does automatically:**
 1. Resolves the latest release binary from GitHub.
