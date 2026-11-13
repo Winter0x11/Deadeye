@@ -70,6 +70,12 @@ constexpr int WEIGHT_UNBACKED_EXEC = 25;   // Executable unbacked by MEM_IMAGE
 constexpr int WEIGHT_BEHAVIOR_UNPACK = 50; // Memory flipped to executable with byte changes / entropy shift
 constexpr int WEIGHT_SLEEP_OBFUSCATION = 65; // Protection/entropy oscillating across heartbeat ticks
 
+// Static File-Derived Triage Severity Scoring Weights (Mapped PE & Raw Files)
+constexpr int WEIGHT_STATIC_WX_SECTION = 50;        // Section marked writable and executable (W+X)
+constexpr int WEIGHT_STATIC_EP_OUTSIDE_EXEC = 45;   // Entry point outside executable sections
+constexpr int WEIGHT_STATIC_EXEC_HIGH_ENTROPY = 40; // Executable section with high Shannon entropy (>7.2)
+constexpr int WEIGHT_STATIC_NONTRIVIAL_OVERLAY = 25;// Non-trivial overlay after last section (> 512 bytes)
+
 constexpr int SEV_MIN_CRITICAL = 80;
 constexpr int SEV_MIN_HIGH = 50;
 constexpr int SEV_MIN_MEDIUM = 25;
@@ -100,6 +106,7 @@ constexpr int SEV_MIN_LOW = 10;
 #define IDT_HEARTBEAT 1001
 
 // Menu Item IDs
+#define IDM_FILE_OPEN_SOURCE 2001
 #define IDM_FILE_TRIAGE 2002
 #define IDM_FILE_EXPORT_JSON 2003
 #define IDM_FILE_THEME_LIGHT 2004
@@ -185,6 +192,10 @@ struct RegionInfo
     std::vector<SIZE_T> hits;
     bool hits_truncated = false;
     std::vector<Snapshot> snapshots;
+
+    // Static Analysis Metadata
+    std::string section_name;
+    double entropy = 0.0;
 
     // Behavioral Timeline & Detections
     DWORD last_protect = 0;
@@ -303,20 +314,35 @@ struct TriageFinding
     std::vector<std::string> reasons; // Detailed explanation strings with point values
 };
 
-// Triage report for the entire process
-struct TriageReport
-{
-    DWORD pid = 0;
-    bool wow64_unsupported = false;
-    std::vector<TriageFinding> findings;
-};
-
 // Range of a loaded module enumerated from the PEB loader list.
 struct LoadedModuleRange
 {
     uintptr_t base = 0;
     SIZE_T size = 0;
     std::wstring name;
+};
+
+// Forward declarations for memsource.hpp
+std::string format_win32_error(DWORD err);
+std::string to_hex_string(uintptr_t val);
+bool is_unbacked_exec(DWORD type, DWORD protect);
+bool is_private_rwx(DWORD type, DWORD protect);
+bool is_write_then_flip(DWORD alloc_protect, DWORD protect);
+bool query_peb_modules_x64(HANDLE proc, std::vector<LoadedModuleRange> &out_modules, bool &out_wow64);
+
+#include "memsource.hpp"
+
+// Triage report for the entire process or memory source
+struct TriageReport
+{
+    DWORD pid = 0;
+    std::string source_description;
+    MemorySourceKind source_kind = MemorySourceKind::Live;
+    uintptr_t source_base = 0;
+    bool protection_is_synthetic = false;
+    bool wow64_unsupported = false;
+    std::vector<std::string> rules_not_evaluated;
+    std::vector<TriageFinding> findings;
 };
 
 // Application View Modes
@@ -798,127 +824,54 @@ bool enable_debug_privilege()
     return (ok && err == ERROR_SUCCESS);
 }
 
-// Reads memory from proc at base+offset for up to to_read bytes.
-// If the 1 MB chunk read fails or is partial, it falls back to 4 KB page-by-page reads,
-// skipping unreadable/guarded pages without aborting the rest of the region.
-SIZE_T scan_chunk_robust(HANDLE proc, uintptr_t chunk_addr, SIZE_T to_read,
+// Reads memory from a MemorySource at base+offset for up to to_read bytes.
+// Supports partial reads, gaps, and pattern matching across boundaries.
+SIZE_T scan_chunk_robust(MemorySource *source, uintptr_t chunk_addr, SIZE_T to_read,
                          const Pattern *pat, std::vector<uint8_t> &chunk_buf,
                          SIZE_T chunk_offset_in_reg, std::vector<SIZE_T> &out_hits,
                          size_t max_hits, bool &out_truncated, bool &out_has_pe)
 {
-    if (to_read == 0)
+    if (to_read == 0 || source == nullptr)
         return 0;
     if (chunk_buf.size() < to_read)
         chunk_buf.resize(to_read);
 
-    SIZE_T bytes_read = 0;
-    BOOL ok = ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(chunk_addr),
-                                chunk_buf.data(), to_read, &bytes_read);
+    SIZE_T bytes_read = source->read(chunk_addr, to_read, chunk_buf.data());
+    if (bytes_read == 0)
+        return 0;
 
-    if (ok && bytes_read == to_read)
+    if (chunk_offset_in_reg == 0 && has_pe_header(chunk_buf.data(), bytes_read))
     {
-        if (chunk_offset_in_reg == 0 && has_pe_header(chunk_buf.data(), bytes_read))
-        {
-            out_has_pe = true;
-        }
-        if (pat != nullptr && !pat->bytes.empty())
-        {
-            std::vector<size_t> hits = find_all(chunk_buf.data(), bytes_read, *pat);
-            for (size_t h : hits)
-            {
-                if (out_hits.size() < max_hits)
-                {
-                    out_hits.push_back(chunk_offset_in_reg + h);
-                }
-                else
-                {
-                    out_truncated = true;
-                    break;
-                }
-            }
-        }
-        return bytes_read;
+        out_has_pe = true;
     }
 
-    // Fallback: Read page-by-page (4 KB) across this chunk window
-    static const SIZE_T PAGE_4K = 4096;
-    SIZE_T total_read = 0;
-    std::vector<uint8_t> page_buf(PAGE_4K);
-    std::vector<uint8_t> prev_tail;
-    SIZE_T overlap = (pat != nullptr && !pat->bytes.empty()) ? (pat->bytes.size() - 1) : 0;
-
-    for (SIZE_T page_off = 0; page_off < to_read; page_off += PAGE_4K)
+    if (pat != nullptr && !pat->bytes.empty())
     {
-        SIZE_T page_len = (to_read - page_off < PAGE_4K) ? (to_read - page_off) : PAGE_4K;
-        SIZE_T p_read = 0;
-        BOOL p_ok = ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(chunk_addr + page_off),
-                                      page_buf.data(), page_len, &p_read);
-        if (!p_ok || p_read == 0)
+        std::vector<size_t> hits = find_all(chunk_buf.data(), bytes_read, *pat);
+        for (size_t h : hits)
         {
-            prev_tail.clear();
-            continue;
-        }
-
-        total_read += p_read;
-        if (chunk_offset_in_reg + page_off == 0 && has_pe_header(page_buf.data(), p_read))
-        {
-            out_has_pe = true;
-        }
-
-        if (pat != nullptr && !pat->bytes.empty())
-        {
-            if (!prev_tail.empty() && overlap > 0)
+            if (out_hits.size() < max_hits)
             {
-                size_t b_len = prev_tail.size() + std::min(overlap, p_read);
-                std::vector<uint8_t> b_buf(b_len);
-                std::memcpy(b_buf.data(), prev_tail.data(), prev_tail.size());
-                std::memcpy(b_buf.data() + prev_tail.size(), page_buf.data(), std::min(overlap, p_read));
-
-                std::vector<size_t> b_hits = find_all(b_buf.data(), b_len, *pat);
-                for (size_t bh : b_hits)
-                {
-                    if (bh < prev_tail.size() && page_off >= prev_tail.size())
-                    {
-                        SIZE_T hit_pos = chunk_offset_in_reg + (page_off - prev_tail.size()) + bh;
-                        if (out_hits.size() < max_hits)
-                        {
-                            out_hits.push_back(hit_pos);
-                        }
-                        else
-                        {
-                            out_truncated = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            std::vector<size_t> phits = find_all(page_buf.data(), p_read, *pat);
-            for (size_t hit_off : phits)
-            {
-                SIZE_T hit_pos = chunk_offset_in_reg + page_off + hit_off;
-                if (out_hits.size() < max_hits)
-                {
-                    out_hits.push_back(hit_pos);
-                }
-                else
-                {
-                    out_truncated = true;
-                    break;
-                }
-            }
-
-            if (p_read >= overlap)
-            {
-                prev_tail.assign(page_buf.data() + (p_read - overlap), page_buf.data() + p_read);
+                out_hits.push_back(chunk_offset_in_reg + h);
             }
             else
             {
-                prev_tail.assign(page_buf.data(), page_buf.data() + p_read);
+                out_truncated = true;
+                break;
             }
         }
     }
-    return total_read;
+
+    return bytes_read;
+}
+
+inline SIZE_T scan_chunk_robust(HANDLE proc, uintptr_t chunk_addr, SIZE_T to_read,
+                                const Pattern *pat, std::vector<uint8_t> &chunk_buf,
+                                SIZE_T chunk_offset_in_reg, std::vector<SIZE_T> &out_hits,
+                                size_t max_hits, bool &out_truncated, bool &out_has_pe)
+{
+    LiveProcessSource src(0, proc, false);
+    return scan_chunk_robust(&src, chunk_addr, to_read, pat, chunk_buf, chunk_offset_in_reg, out_hits, max_hits, out_truncated, out_has_pe);
 }
 
 // Parses a numeric PID string with whitespace trimming.
@@ -1125,139 +1078,324 @@ bool query_process_regions(HANDLE proc, std::vector<RegionInfo> &out_regions, st
     return true;
 }
 
-// Evaluates defensive triage heuristics against process memory regions.
+std::string escape_json(const std::string &s)
+{
+    std::string out;
+    out.reserve(s.size() + 16);
+    for (char c : s)
+    {
+        if (c == '\\') out += "\\\\";
+        else if (c == '"') out += "\\\"";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else if (c == '\t') out += "\\t";
+        else out += c;
+    }
+    return out;
+}
+
+std::string format_pe_summary(const PeSummaryInfo &pe)
+{
+    std::ostringstream ss;
+    ss << "Machine: " << pe.machine_name << " | Subsystem: " << pe.subsystem_name << " | ";
+    char ib_buf[32];
+    std::snprintf(ib_buf, sizeof(ib_buf), "0x%016llX", static_cast<unsigned long long>(pe.image_base));
+    ss << "ImageBase: " << ib_buf << " | ";
+    char ep_buf[32];
+    std::snprintf(ep_buf, sizeof(ep_buf), "+0x%X", pe.entry_point_rva);
+    ss << "Entry Point: " << ep_buf << " (" << (pe.entry_point_section.empty() ? "None" : pe.entry_point_section) << ")";
+    if (pe.ep_outside_exec_sections)
+    {
+        ss << " [!] OUTSIDE EXEC";
+    }
+    ss << " | Sections: " << pe.section_count;
+    ss << " | Overlay: " << pe.overlay_size << " bytes";
+    ss << " | IAT: Unresolved (raw on-disk thunks)";
+    if (pe.effective_base != pe.image_base)
+    {
+        ss << " | Relocs: " << pe.reloc_fixup_count << " applied";
+        if (pe.reloc_skipped_count > 0)
+        {
+            ss << " (" << pe.reloc_skipped_count << " skipped)";
+        }
+    }
+    return ss.str();
+}
+
+// Evaluates capability-aware triage heuristics against a MemorySource.
 // UI-independent core function.
-TriageReport run_process_triage(HANDLE proc, DWORD pid, std::vector<RegionInfo> &regions,
-                                std::atomic<bool> *abort_flag,
-                                void (*progress_cb)(SIZE_T current, SIZE_T total, void *user_data),
-                                void *user_data)
+TriageReport run_source_triage(std::shared_ptr<MemorySource> source,
+                               std::vector<RegionInfo> &regions,
+                               std::atomic<bool> *abort_flag = nullptr,
+                               void (*progress_cb)(SIZE_T current, SIZE_T total, void *user_data) = nullptr,
+                               void *user_data = nullptr)
 {
     TriageReport report;
-    report.pid = pid;
+    if (!source)
+        return report;
 
-    std::vector<LoadedModuleRange> peb_modules;
-    bool peb_ok = query_peb_modules_x64(proc, peb_modules, report.wow64_unsupported);
+    report.source_description = source->describe();
+    report.source_kind = source->kind();
+    report.source_base = source->get_base_address();
+    MemorySourceCapabilities caps = source->capabilities();
+    report.protection_is_synthetic = caps.protection_is_synthetic;
+    report.pid = (caps.is_live) ? source->get_pid() : 0;
 
-    std::vector<uint8_t> header_buf(4096);
     SIZE_T total_regions = regions.size();
 
-    for (size_t i = 0; i < regions.size(); ++i)
+    if (caps.is_live)
     {
-        if (abort_flag != nullptr && abort_flag->load(std::memory_order_relaxed))
-            break;
+        // Dynamic live process heuristics
+        report.rules_not_evaluated = {
+            "STATIC_WX_SECTION",
+            "STATIC_EP_OUTSIDE_EXEC",
+            "STATIC_EXEC_HIGH_ENTROPY",
+            "STATIC_NONTRIVIAL_OVERLAY"
+        };
 
-        RegionInfo &reg = regions[i];
+        std::vector<LoadedModuleRange> peb_modules;
+        bool peb_ok = source->query_peb_modules(peb_modules, report.wow64_unsupported);
 
-        // Check for injected PE header in MEM_PRIVATE regions
-        if (reg.type == MEM_PRIVATE)
+        std::vector<uint8_t> header_buf(4096);
+
+        for (size_t i = 0; i < regions.size(); ++i)
         {
-            SIZE_T to_read = (reg.size < 4096) ? reg.size : 4096;
-            SIZE_T bytes_read = 0;
-            if (ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(reg.base),
-                                  header_buf.data(), to_read, &bytes_read))
+            if (abort_flag != nullptr && abort_flag->load(std::memory_order_relaxed))
+                break;
+
+            RegionInfo &reg = regions[i];
+
+            // Check for injected PE header in MEM_PRIVATE regions
+            if (reg.type == MEM_PRIVATE)
             {
-                if (has_pe_header(header_buf.data(), bytes_read))
+                SIZE_T to_read = (reg.size < 4096) ? reg.size : 4096;
+                SIZE_T bytes_read = source->read(reg.base, to_read, header_buf.data());
+                if (bytes_read > 0 && has_pe_header(header_buf.data(), bytes_read))
                 {
                     reg.is_pe_in_private = true;
                 }
             }
-        }
 
-        // Check for unlinked MEM_IMAGE allocations (missing from PEB loader list)
-        if (!report.wow64_unsupported && peb_ok && reg.type == MEM_IMAGE && reg.base == reg.alloc_base)
-        {
-            bool in_peb = false;
-            for (const auto &mod : peb_modules)
+            // Check for unlinked MEM_IMAGE allocations (missing from PEB loader list)
+            if (!report.wow64_unsupported && peb_ok && reg.type == MEM_IMAGE && reg.base == reg.alloc_base)
             {
-                if (mod.base == reg.base)
+                bool in_peb = false;
+                for (const auto &mod : peb_modules)
                 {
-                    in_peb = true;
-                    break;
+                    if (mod.base == reg.base)
+                    {
+                        in_peb = true;
+                        break;
+                    }
+                }
+                if (!in_peb)
+                {
+                    reg.is_unlinked_image = true;
                 }
             }
-            if (!in_peb)
+
+            // Calculate additive triage severity score
+            TriageFinding finding;
+            finding.region_index = i;
+            finding.base = reg.base;
+            finding.size = reg.size;
+            finding.alloc_base = reg.alloc_base;
+            finding.type = reg.type;
+            finding.protect = reg.protect;
+            finding.alloc_protect = reg.alloc_protect;
+            finding.severity_score = 0;
+
+            if (reg.is_pe_in_private)
             {
-                reg.is_unlinked_image = true;
+                finding.severity_score += WEIGHT_INJECTED_PE;
+                finding.flags.push_back("INJECTED_PE");
+                finding.reasons.push_back("Injected PE/Reflective DLL header in private memory (+" +
+                                          std::to_string(WEIGHT_INJECTED_PE) + ")");
+            }
+            if (reg.is_unlinked_image)
+            {
+                finding.severity_score += WEIGHT_UNLINKED_MODULE;
+                finding.flags.push_back("UNLINKED_MODULE");
+                finding.reasons.push_back("Image allocation unlinked from PEB loader list (+" +
+                                          std::to_string(WEIGHT_UNLINKED_MODULE) + ")");
+            }
+            if (reg.private_rwx)
+            {
+                finding.severity_score += WEIGHT_PRIVATE_RWX;
+                finding.flags.push_back("PRIVATE_RWX");
+                finding.reasons.push_back("Private memory with RWX/RXC protection (+" +
+                                          std::to_string(WEIGHT_PRIVATE_RWX) + ")");
+            }
+            if (reg.write_then_flip)
+            {
+                finding.severity_score += WEIGHT_WRITE_THEN_FLIP;
+                finding.flags.push_back("WRITE_THEN_FLIP");
+                finding.reasons.push_back("Write-then-flip: allocated writable, currently executable (+" +
+                                          std::to_string(WEIGHT_WRITE_THEN_FLIP) + ")");
+            }
+            if (reg.is_unbacked_exec)
+            {
+                finding.severity_score += WEIGHT_UNBACKED_EXEC;
+                finding.flags.push_back("UNBACKED_EXEC");
+                finding.reasons.push_back("Executable memory not backed by a disk image (+" +
+                                          std::to_string(WEIGHT_UNBACKED_EXEC) + ")");
+            }
+            if (reg.behavior_unpack_detected)
+            {
+                finding.severity_score += WEIGHT_BEHAVIOR_UNPACK;
+                finding.flags.push_back("BEHAVIOR_UNPACK");
+                finding.reasons.push_back("Unpack detected: memory flipped to executable with byte changes / entropy shift (+" +
+                                          std::to_string(WEIGHT_BEHAVIOR_UNPACK) + ")");
+            }
+            if (reg.sleep_obfuscation_detected)
+            {
+                finding.severity_score += WEIGHT_SLEEP_OBFUSCATION;
+                finding.flags.push_back("SLEEP_OBFUSCATION");
+                finding.reasons.push_back("Sleep obfuscation detected: oscillating between dormant encrypted and active executable (+" +
+                                          std::to_string(WEIGHT_SLEEP_OBFUSCATION) + ")");
+            }
+
+            if (finding.severity_score >= SEV_MIN_CRITICAL) finding.severity_label = "CRIT";
+            else if (finding.severity_score >= SEV_MIN_HIGH) finding.severity_label = "HIGH";
+            else if (finding.severity_score >= SEV_MIN_MEDIUM) finding.severity_label = "MED";
+            else if (finding.severity_score >= SEV_MIN_LOW) finding.severity_label = "LOW";
+            else finding.severity_label = "CLEAN";
+
+            report.findings.push_back(finding);
+
+            if (progress_cb != nullptr && (i % 20 == 0 || i + 1 == total_regions))
+            {
+                progress_cb(i + 1, total_regions, user_data);
             }
         }
+    }
+    else if (source->kind() == MemorySourceKind::MappedPe)
+    {
+        // Mapped PE static heuristics
+        report.rules_not_evaluated = {
+            "INJECTED_PE",
+            "UNLINKED_MODULE",
+            "PRIVATE_RWX",
+            "WRITE_THEN_FLIP",
+            "UNBACKED_EXEC",
+            "BEHAVIOR_UNPACK",
+            "SLEEP_OBFUSCATION"
+        };
 
-        // Calculate additive triage severity score
-        TriageFinding finding;
-        finding.region_index = i;
-        finding.base = reg.base;
-        finding.size = reg.size;
-        finding.alloc_base = reg.alloc_base;
-        finding.type = reg.type;
-        finding.protect = reg.protect;
-        finding.alloc_protect = reg.alloc_protect;
-        finding.severity_score = 0;
+        PeSummaryInfo pe_info;
+        bool has_pe = source->get_pe_summary(pe_info);
 
-        if (reg.is_pe_in_private)
+        for (size_t i = 0; i < regions.size(); ++i)
         {
-            finding.severity_score += WEIGHT_INJECTED_PE;
-            finding.flags.push_back("INJECTED_PE");
-            finding.reasons.push_back("Injected PE/Reflective DLL header in private memory (+" +
-                                      std::to_string(WEIGHT_INJECTED_PE) + ")");
-        }
-        if (reg.is_unlinked_image)
-        {
-            finding.severity_score += WEIGHT_UNLINKED_MODULE;
-            finding.flags.push_back("UNLINKED_MODULE");
-            finding.reasons.push_back("Image allocation unlinked from PEB loader list (+" +
-                                      std::to_string(WEIGHT_UNLINKED_MODULE) + ")");
-        }
-        if (reg.private_rwx)
-        {
-            finding.severity_score += WEIGHT_PRIVATE_RWX;
-            finding.flags.push_back("PRIVATE_RWX");
-            finding.reasons.push_back("Private memory with RWX/RXC protection (+" +
-                                      std::to_string(WEIGHT_PRIVATE_RWX) + ")");
-        }
-        if (reg.write_then_flip)
-        {
-            finding.severity_score += WEIGHT_WRITE_THEN_FLIP;
-            finding.flags.push_back("WRITE_THEN_FLIP");
-            finding.reasons.push_back("Write-then-flip: allocated writable, currently executable (+" +
-                                      std::to_string(WEIGHT_WRITE_THEN_FLIP) + ")");
-        }
-        if (reg.is_unbacked_exec)
-        {
-            finding.severity_score += WEIGHT_UNBACKED_EXEC;
-            finding.flags.push_back("UNBACKED_EXEC");
-            finding.reasons.push_back("Executable memory not backed by a disk image (+" +
-                                      std::to_string(WEIGHT_UNBACKED_EXEC) + ")");
-        }
-        if (reg.behavior_unpack_detected)
-        {
-            finding.severity_score += WEIGHT_BEHAVIOR_UNPACK;
-            finding.flags.push_back("BEHAVIOR_UNPACK");
-            finding.reasons.push_back("Unpack detected: memory flipped to executable with byte changes / entropy shift (+" +
-                                      std::to_string(WEIGHT_BEHAVIOR_UNPACK) + ")");
-        }
-        if (reg.sleep_obfuscation_detected)
-        {
-            finding.severity_score += WEIGHT_SLEEP_OBFUSCATION;
-            finding.flags.push_back("SLEEP_OBFUSCATION");
-            finding.reasons.push_back("Sleep obfuscation detected: oscillating between dormant encrypted and active executable (+" +
-                                      std::to_string(WEIGHT_SLEEP_OBFUSCATION) + ")");
-        }
+            if (abort_flag != nullptr && abort_flag->load(std::memory_order_relaxed))
+                break;
 
-        if (finding.severity_score >= SEV_MIN_CRITICAL)
-            finding.severity_label = "CRIT";
-        else if (finding.severity_score >= SEV_MIN_HIGH)
-            finding.severity_label = "HIGH";
-        else if (finding.severity_score >= SEV_MIN_MEDIUM)
-            finding.severity_label = "MED";
-        else if (finding.severity_score >= SEV_MIN_LOW)
-            finding.severity_label = "LOW";
-        else
+            RegionInfo &reg = regions[i];
+
+            TriageFinding finding;
+            finding.region_index = i;
+            finding.base = reg.base;
+            finding.size = reg.size;
+            finding.alloc_base = reg.alloc_base;
+            finding.type = reg.type;
+            finding.protect = reg.protect;
+            finding.alloc_protect = reg.alloc_protect;
+            finding.severity_score = 0;
+
+            // 1. Static Heuristic: W+X section
+            bool is_exec = (reg.protect == PAGE_EXECUTE || reg.protect == PAGE_EXECUTE_READ ||
+                            reg.protect == PAGE_EXECUTE_READWRITE || reg.protect == PAGE_EXECUTE_WRITECOPY);
+            bool is_write = (reg.protect == PAGE_READWRITE || reg.protect == PAGE_WRITECOPY ||
+                             reg.protect == PAGE_EXECUTE_READWRITE || reg.protect == PAGE_EXECUTE_WRITECOPY);
+
+            if (is_exec && is_write)
+            {
+                finding.severity_score += WEIGHT_STATIC_WX_SECTION;
+                finding.flags.push_back("STATIC_WX_SECTION");
+                finding.reasons.push_back("Static: Section has both Writable and Executable rights (W+X) (+" +
+                                          std::to_string(WEIGHT_STATIC_WX_SECTION) + ")");
+            }
+
+            // 2. Static Heuristic: Entry point outside executable sections
+            if (has_pe && pe_info.ep_outside_exec_sections)
+            {
+                uintptr_t ep_va = pe_info.effective_base + pe_info.entry_point_rva;
+                if (ep_va >= reg.base && ep_va < reg.base + reg.size)
+                {
+                    finding.severity_score += WEIGHT_STATIC_EP_OUTSIDE_EXEC;
+                    finding.flags.push_back("STATIC_EP_OUTSIDE_EXEC");
+                    finding.reasons.push_back("Static: Entry point is outside all executable sections (+" +
+                                              std::to_string(WEIGHT_STATIC_EP_OUTSIDE_EXEC) + ")");
+                }
+            }
+
+            // 3. Static Heuristic: Section with executable rights and high Shannon entropy (>7.2)
+            double ent = (reg.entropy > 0.0) ? reg.entropy : reg.last_entropy;
+            if (is_exec && ent > 7.2)
+            {
+                finding.severity_score += WEIGHT_STATIC_EXEC_HIGH_ENTROPY;
+                finding.flags.push_back("STATIC_EXEC_HIGH_ENTROPY");
+                char ent_buf[32];
+                std::snprintf(ent_buf, sizeof(ent_buf), "%.2f", ent);
+                finding.reasons.push_back(std::string("Static: Executable section with high entropy (") + ent_buf +
+                                          " > 7.20, possible packed/encrypted payload) (+" +
+                                          std::to_string(WEIGHT_STATIC_EXEC_HIGH_ENTROPY) + ")");
+            }
+
+            // 4. Static Heuristic: Non-trivial overlay (> 512 bytes) (assigned to final section)
+            if (has_pe && pe_info.overlay_size > 512 && (i + 1 == regions.size()))
+            {
+                finding.severity_score += WEIGHT_STATIC_NONTRIVIAL_OVERLAY;
+                finding.flags.push_back("STATIC_NONTRIVIAL_OVERLAY");
+                finding.reasons.push_back("Static: Non-trivial overlay detected after raw sections (" +
+                                          std::to_string(pe_info.overlay_size) + " bytes) (+" +
+                                          std::to_string(WEIGHT_STATIC_NONTRIVIAL_OVERLAY) + ")");
+            }
+
+            if (finding.severity_score >= SEV_MIN_CRITICAL) finding.severity_label = "CRIT";
+            else if (finding.severity_score >= SEV_MIN_HIGH) finding.severity_label = "HIGH";
+            else if (finding.severity_score >= SEV_MIN_MEDIUM) finding.severity_label = "MED";
+            else if (finding.severity_score >= SEV_MIN_LOW) finding.severity_label = "LOW";
+            else finding.severity_label = "CLEAN";
+
+            report.findings.push_back(finding);
+
+            if (progress_cb != nullptr && (i % 20 == 0 || i + 1 == total_regions))
+            {
+                progress_cb(i + 1, total_regions, user_data);
+            }
+        }
+    }
+    else // RawFileSource
+    {
+        report.rules_not_evaluated = {
+            "INJECTED_PE",
+            "UNLINKED_MODULE",
+            "PRIVATE_RWX",
+            "WRITE_THEN_FLIP",
+            "UNBACKED_EXEC",
+            "BEHAVIOR_UNPACK",
+            "SLEEP_OBFUSCATION",
+            "STATIC_WX_SECTION",
+            "STATIC_EP_OUTSIDE_EXEC",
+            "STATIC_EXEC_HIGH_ENTROPY",
+            "STATIC_NONTRIVIAL_OVERLAY"
+        };
+
+        for (size_t i = 0; i < regions.size(); ++i)
+        {
+            RegionInfo &reg = regions[i];
+            TriageFinding finding;
+            finding.region_index = i;
+            finding.base = reg.base;
+            finding.size = reg.size;
+            finding.alloc_base = reg.alloc_base;
+            finding.type = reg.type;
+            finding.protect = reg.protect;
+            finding.alloc_protect = reg.alloc_protect;
+            finding.severity_score = 0;
             finding.severity_label = "CLEAN";
-
-        report.findings.push_back(finding);
-
-        if (progress_cb != nullptr && (i % 20 == 0 || i + 1 == total_regions))
-        {
-            progress_cb(i + 1, total_regions, user_data);
+            report.findings.push_back(finding);
         }
     }
 
@@ -1271,15 +1409,40 @@ TriageReport run_process_triage(HANDLE proc, DWORD pid, std::vector<RegionInfo> 
     return report;
 }
 
-// Serializes a TriageReport into valid JSON.
+// Backward-compatible triage evaluator for live target processes
+inline TriageReport run_process_triage(HANDLE proc, DWORD pid, std::vector<RegionInfo> &regions,
+                                       std::atomic<bool> *abort_flag = nullptr,
+                                       void (*progress_cb)(SIZE_T current, SIZE_T total, void *user_data) = nullptr,
+                                       void *user_data = nullptr)
+{
+    auto live_src = std::make_shared<LiveProcessSource>(pid, proc, false);
+    return run_source_triage(live_src, regions, abort_flag, progress_cb, user_data);
+}
+
+// Serializes a TriageReport into valid JSON with full MemorySource metadata.
 // UI-independent core function.
 std::string export_triage_json(const TriageReport &report)
 {
     std::string json;
-    json.reserve(report.findings.size() * 512 + 256);
+    json.reserve(report.findings.size() * 512 + 512);
     json += "{\n";
+    json += "  \"source\": {\n";
+    std::string kind_str = "Live";
+    if (report.source_kind == MemorySourceKind::MappedPe) kind_str = "MappedPe";
+    else if (report.source_kind == MemorySourceKind::RawFile) kind_str = "RawFile";
+    json += "    \"kind\": \"" + kind_str + "\",\n";
+    json += "    \"name\": \"" + escape_json(report.source_description) + "\",\n";
+    json += "    \"base\": \"" + to_hex_string(report.source_base) + "\",\n";
+    json += "    \"synthetic_protection\": " + std::string(report.protection_is_synthetic ? "true" : "false") + "\n";
+    json += "  },\n";
     json += "  \"pid\": " + std::to_string(report.pid) + ",\n";
     json += "  \"wow64_unsupported\": " + std::string(report.wow64_unsupported ? "true" : "false") + ",\n";
+    json += "  \"rules_not_evaluated\": [";
+    for (size_t k = 0; k < report.rules_not_evaluated.size(); ++k)
+    {
+        json += "\"" + report.rules_not_evaluated[k] + "\"" + (k + 1 < report.rules_not_evaluated.size() ? ", " : "");
+    }
+    json += "],\n";
     json += "  \"findings_count\": " + std::to_string(report.findings.size()) + ",\n";
     json += "  \"findings\": [\n";
 
@@ -1306,7 +1469,7 @@ std::string export_triage_json(const TriageReport &report)
         json += "      \"reasons\": [\n";
         for (size_t k = 0; k < f.reasons.size(); ++k)
         {
-            json += "        \"" + f.reasons[k] + "\"" + (k + 1 < f.reasons.size() ? ",\n" : "\n");
+            json += "        \"" + escape_json(f.reasons[k]) + "\"" + (k + 1 < f.reasons.size() ? ",\n" : "\n");
         }
         json += "      ]\n";
         json += "    }" + std::string(i + 1 < report.findings.size() ? ",\n" : "\n");
@@ -1363,6 +1526,7 @@ static bool g_hide_clean = false;
 
 static DWORD g_current_pid = 0;
 static std::string g_current_pid_label;
+static std::shared_ptr<MemorySource> g_current_source = nullptr;
 static Pattern g_active_pattern;
 static bool g_has_pattern = false;
 static std::vector<RegionInfo> g_regions;
@@ -1408,6 +1572,21 @@ HANDLE get_or_open_target_proc(DWORD pid)
     }
     g_target_proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
     return g_target_proc;
+}
+
+std::shared_ptr<MemorySource> get_active_source()
+{
+    if (g_current_source != nullptr)
+    {
+        return g_current_source;
+    }
+    if (g_current_pid != 0)
+    {
+        HANDLE proc = get_or_open_target_proc(g_current_pid);
+        g_current_source = std::make_shared<LiveProcessSource>(g_current_pid, proc, false, g_current_pid_label);
+        return g_current_source;
+    }
+    return nullptr;
 }
 
 void invalidate_hex_cache()
@@ -1746,24 +1925,20 @@ void on_take_snapshot()
     SIZE_T remaining = reg.size - g_view_offset;
     SIZE_T to_read = (remaining < VIEW_PAGE_SIZE) ? remaining : VIEW_PAGE_SIZE;
 
-    HANDLE proc = get_or_open_target_proc(g_current_pid);
-    if (proc == nullptr)
+    auto src = get_active_source();
+    if (src == nullptr)
     {
-        DWORD err = GetLastError();
-        set_status("[ERROR] OpenProcess failed: " + format_win32_error(err));
+        set_status("[ERROR] No memory source available");
         return;
     }
 
     Snapshot snap;
     snap.data.resize(to_read);
-    SIZE_T bytes_read = 0;
-    BOOL ok = ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(reg.base + g_view_offset),
-                                snap.data.data(), to_read, &bytes_read);
-    DWORD read_err = ok ? 0 : GetLastError();
+    SIZE_T bytes_read = src->read(reg.base + g_view_offset, to_read, snap.data.data());
 
     if (bytes_read == 0)
     {
-        set_status("[ERROR] Could not capture snapshot: " + format_win32_error(read_err));
+        set_status("[ERROR] Could not capture snapshot: memory unreadable at 0x" + fmt_addr(reg.base + g_view_offset));
         return;
     }
     snap.data.resize(bytes_read);
@@ -1870,25 +2045,21 @@ void display_selected_region(SIZE_T focus_offset)
     }
     else
     {
-        HANDLE proc = get_or_open_target_proc(g_current_pid);
-        if (proc == nullptr)
+        auto src = get_active_source();
+        if (src == nullptr)
         {
-            DWORD err = GetLastError();
-            std::string msg = "[ERROR] OpenProcess failed: " + format_win32_error(err) + "\r\n";
+            std::string msg = "[ERROR] No memory source available\r\n";
             SetWindowTextA(g_edit_hex, msg.c_str());
             g_last_hex_dump = msg;
             return;
         }
 
         buf.resize(to_read);
-        ok = ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(reg.base + g_view_offset),
-                               buf.data(), to_read, &bytes_read);
-        read_err = ok ? 0 : GetLastError();
+        bytes_read = src->read(reg.base + g_view_offset, to_read, buf.data());
 
         if (bytes_read == 0)
         {
-            std::string msg = "[WARN] ReadProcessMemory failed at 0x" + fmt_addr(reg.base + g_view_offset) +
-                              ": " + format_win32_error(read_err) + "\r\n";
+            std::string msg = "[WARN] Memory unreadable at 0x" + fmt_addr(reg.base + g_view_offset) + "\r\n";
             SetWindowTextA(g_edit_hex, msg.c_str());
             g_last_hex_dump = msg;
             return;
@@ -2078,6 +2249,8 @@ void update_triage_details_label(size_t reg_idx)
         }
     }
 
+    bool synthetic = (g_current_source != nullptr && g_current_source->capabilities().protection_is_synthetic);
+
     if (match != nullptr && !match->reasons.empty())
     {
         std::string text = "Details [" + match->severity_label + " " + std::to_string(match->severity_score) + "]: ";
@@ -2087,12 +2260,20 @@ void update_triage_details_label(size_t reg_idx)
             if (i + 1 < match->reasons.size())
                 text += " | ";
         }
+        if (synthetic)
+        {
+            text = "[Synthetic Protection] " + text;
+        }
         SetWindowTextA(g_lbl_triage_reasons, text.c_str());
     }
     else
     {
         std::string text = "Details [CLEAN 0]: Normal " + type_full(reg.type) + " memory (" +
                            prot_full(reg.protect) + "), AllocBase " + to_hex_string(reg.alloc_base);
+        if (synthetic)
+        {
+            text = "[Synthetic Protection] " + text;
+        }
         SetWindowTextA(g_lbl_triage_reasons, text.c_str());
     }
 }
@@ -2180,6 +2361,14 @@ void populate_region_list()
                     flg_str += "!UNPK ";
                 else if (flg == "SLEEP_OBFUSCATION")
                     flg_str += "!SLP ";
+                else if (flg == "STATIC_WX_SECTION")
+                    flg_str += "!W+X ";
+                else if (flg == "STATIC_EP_OUTSIDE_EXEC")
+                    flg_str += "!EP ";
+                else if (flg == "STATIC_EXEC_HIGH_ENTROPY")
+                    flg_str += "!ENT ";
+                else if (flg == "STATIC_NONTRIVIAL_OVERLAY")
+                    flg_str += "!OVL ";
             }
             if (flg_str.empty())
                 flg_str = "      ";
@@ -2267,6 +2456,11 @@ void populate_region_list()
                 flag = "!UNL";
             else if (r.is_unbacked_exec)
                 flag = "!X  ";
+
+            if (!r.section_name.empty())
+            {
+                tag = " [" + r.section_name + "]" + tag;
+            }
 
             std::snprintf(row, sizeof(row), "%016llX %s %s %s %s%s",
                           static_cast<unsigned long long>(r.base),
@@ -2453,6 +2647,7 @@ struct WorkerTask
     Pattern pat;
     bool use_pattern;
     WorkerTaskType task_type;
+    std::shared_ptr<MemorySource> source;
 };
 
 struct WorkerResult
@@ -2462,6 +2657,7 @@ struct WorkerResult
     std::string pid_label;
     Pattern pat;
     bool use_pattern;
+    std::shared_ptr<MemorySource> source;
     bool success;
     DWORD error_code;
     std::string error_msg;
@@ -2484,6 +2680,7 @@ DWORD WINAPI WorkerThreadProc(LPVOID param)
     res->pid_label = task->pid_label;
     res->pat = task->pat;
     res->use_pattern = task->use_pattern;
+    res->source = task->source;
     res->success = false;
     res->error_code = 0;
     res->total_bytes = 0;
@@ -2491,13 +2688,18 @@ DWORD WINAPI WorkerThreadProc(LPVOID param)
     res->regions_with_hits = 0;
 
     HWND hwnd = task->hwnd;
+    std::shared_ptr<MemorySource> source = task->source;
     delete task;
 
-    HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, res->pid);
-    if (proc == nullptr)
+    if (!source && res->pid != 0)
     {
-        res->error_code = GetLastError();
-        res->error_msg = format_win32_error(res->error_code);
+        source = std::make_shared<LiveProcessSource>(res->pid, res->pid_label);
+        res->source = source;
+    }
+
+    if (!source)
+    {
+        res->error_msg = "No memory source available.";
         if (!PostMessageA(hwnd, (res->task_type == WorkerTaskType::Triage) ? WM_TRIAGE_COMPLETE : WM_SCAN_COMPLETE,
                           FALSE, reinterpret_cast<LPARAM>(res)))
         {
@@ -2506,14 +2708,29 @@ DWORD WINAPI WorkerThreadProc(LPVOID param)
         return 0;
     }
 
+    if (source->capabilities().is_live)
+    {
+        auto live_src = std::dynamic_pointer_cast<LiveProcessSource>(source);
+        if (live_src && live_src->get_raw_handle() == nullptr)
+        {
+            res->error_code = GetLastError();
+            res->error_msg = format_win32_error(res->error_code);
+            if (!PostMessageA(hwnd, (res->task_type == WorkerTaskType::Triage) ? WM_TRIAGE_COMPLETE : WM_SCAN_COMPLETE,
+                              FALSE, reinterpret_cast<LPARAM>(res)))
+            {
+                delete res;
+            }
+            return 0;
+        }
+    }
+
     if (res->task_type == WorkerTaskType::Triage)
     {
         std::string err;
-        if (!query_process_regions(proc, res->regions, err))
+        if (!source->query_regions(res->regions, err))
         {
             res->error_code = GetLastError();
             res->error_msg = err.empty() ? format_win32_error(res->error_code) : err;
-            CloseHandle(proc);
             if (!PostMessageA(hwnd, WM_TRIAGE_COMPLETE, FALSE, reinterpret_cast<LPARAM>(res)))
             {
                 delete res;
@@ -2527,8 +2744,7 @@ DWORD WINAPI WorkerThreadProc(LPVOID param)
             PostMessageA(h, WM_SCAN_PROGRESS, cur, tot);
         };
 
-        res->report = run_process_triage(proc, res->pid, res->regions, &g_scan_abort, triage_cb, hwnd);
-        CloseHandle(proc);
+        res->report = run_source_triage(source, res->regions, &g_scan_abort, triage_cb, hwnd);
 
         if (g_scan_abort.load(std::memory_order_relaxed))
         {
@@ -2545,130 +2761,110 @@ DWORD WINAPI WorkerThreadProc(LPVOID param)
     }
 
     // MemoryMapScan (Load / Search)
+    std::string q_err;
+    std::vector<RegionInfo> query_regs;
+    if (!source->query_regions(query_regs, q_err))
+    {
+        res->error_code = GetLastError();
+        res->error_msg = q_err.empty() ? format_win32_error(res->error_code) : q_err;
+        if (!PostMessageA(hwnd, WM_SCAN_COMPLETE, FALSE, reinterpret_cast<LPARAM>(res)))
+        {
+            delete res;
+        }
+        return 0;
+    }
+
     std::vector<uint8_t> chunk_buf(CLI_CHUNK_SIZE);
     std::vector<SIZE_T> chunk_hits;
-    uintptr_t addr = 0;
-    MEMORY_BASIC_INFORMATION mbi;
     SIZE_T last_progress_bytes = 0;
 
-    while (!g_scan_abort.load(std::memory_order_relaxed))
+    for (size_t r_i = 0; r_i < query_regs.size() && !g_scan_abort.load(std::memory_order_relaxed); ++r_i)
     {
-        std::memset(&mbi, 0, sizeof(mbi));
-        SIZE_T q = VirtualQueryEx(proc, reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi));
-        if (q == 0)
-            break;
+        RegionInfo reg = query_regs[r_i];
+        uintptr_t region_base = reg.base;
+        SIZE_T region_size = reg.size;
 
-        uintptr_t region_base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
-        SIZE_T region_size = mbi.RegionSize;
+        SIZE_T offset = 0;
+        SIZE_T overlap = (res->use_pattern && !res->pat.bytes.empty()) ? (res->pat.bytes.size() - 1) : 0;
+        SIZE_T prev_overlap = 0;
+        bool pe_found = false;
 
-        if (mbi.State == MEM_COMMIT &&
-            (mbi.Protect & PAGE_NOACCESS) == 0 &&
-            (mbi.Protect & PAGE_GUARD) == 0)
+        while (offset < region_size && !g_scan_abort.load(std::memory_order_relaxed))
         {
+            SIZE_T rem = region_size - offset;
+            SIZE_T to_read = (rem < CLI_CHUNK_SIZE) ? rem : CLI_CHUNK_SIZE;
+            chunk_hits.clear();
 
-            RegionInfo reg;
-            reg.base = region_base;
-            reg.size = region_size;
-            reg.type = mbi.Type;
-            reg.protect = mbi.Protect;
-            reg.alloc_base = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
-            reg.alloc_protect = mbi.AllocationProtect;
-            reg.is_unbacked_exec = is_unbacked_exec(mbi.Type, mbi.Protect);
-            reg.private_rwx = is_private_rwx(mbi.Type, mbi.Protect);
-            reg.write_then_flip = is_write_then_flip(mbi.AllocationProtect, mbi.Protect);
+            bool truncated = false;
+            SIZE_T bytes_read = scan_chunk_robust(source.get(), region_base + offset, to_read,
+                                                  res->use_pattern ? &res->pat : nullptr,
+                                                  chunk_buf, offset, chunk_hits,
+                                                  MAX_HITS_PER_REGION - reg.hits.size(),
+                                                  truncated, pe_found);
 
-            SIZE_T offset = 0;
-            SIZE_T overlap = (res->use_pattern && !res->pat.bytes.empty()) ? (res->pat.bytes.size() - 1) : 0;
-            SIZE_T prev_overlap = 0;
-            bool pe_found = false;
-
-            while (offset < region_size && !g_scan_abort.load(std::memory_order_relaxed))
+            if (truncated)
             {
-                SIZE_T rem = region_size - offset;
-                SIZE_T to_read = (rem < CLI_CHUNK_SIZE) ? rem : CLI_CHUNK_SIZE;
-                chunk_hits.clear();
+                reg.hits_truncated = true;
+            }
 
-                bool truncated = false;
-                SIZE_T bytes_read = scan_chunk_robust(proc, region_base + offset, to_read,
-                                                      res->use_pattern ? &res->pat : nullptr,
-                                                      chunk_buf, offset, chunk_hits,
-                                                      MAX_HITS_PER_REGION - reg.hits.size(),
-                                                      truncated, pe_found);
+            if (reg.type == MEM_PRIVATE && pe_found)
+            {
+                reg.is_pe_in_private = true;
+            }
 
-                if (truncated)
+            if (bytes_read > prev_overlap)
+            {
+                res->total_bytes += (bytes_read - prev_overlap);
+            }
+
+            for (SIZE_T h : chunk_hits)
+            {
+                if (reg.hits.size() < MAX_HITS_PER_REGION)
                 {
-                    reg.hits_truncated = true;
-                }
-
-                if (mbi.Type == MEM_PRIVATE && pe_found)
-                {
-                    reg.is_pe_in_private = true;
-                }
-
-                if (bytes_read > prev_overlap)
-                {
-                    res->total_bytes += (bytes_read - prev_overlap);
-                }
-
-                for (SIZE_T h : chunk_hits)
-                {
-                    if (reg.hits.size() < MAX_HITS_PER_REGION)
-                    {
-                        reg.hits.push_back(h);
-                    }
-                    else
-                    {
-                        reg.hits_truncated = true;
-                        break;
-                    }
-                }
-
-                if (offset + to_read >= region_size)
-                    break;
-                if (bytes_read <= overlap)
-                {
-                    offset += to_read;
-                    prev_overlap = 0;
+                    reg.hits.push_back(h);
                 }
                 else
                 {
-                    offset += (bytes_read - overlap);
-                    prev_overlap = overlap;
+                    reg.hits_truncated = true;
+                    break;
                 }
             }
 
-            if (!reg.hits.empty())
+            if (offset + to_read >= region_size)
+                break;
+            if (bytes_read <= overlap)
             {
-                res->total_hits += reg.hits.size();
-                res->regions_with_hits += 1;
+                offset += to_read;
+                prev_overlap = 0;
             }
-
-            res->regions.push_back(std::move(reg));
-
-            if (res->total_bytes - last_progress_bytes >= 8 * 1024 * 1024)
+            else
             {
-                last_progress_bytes = res->total_bytes;
-                PostMessageA(hwnd, WM_SCAN_PROGRESS,
-                             static_cast<WPARAM>(res->total_bytes / (1024 * 1024)),
-                             static_cast<LPARAM>(res->total_hits));
+                offset += (bytes_read - overlap);
+                prev_overlap = overlap;
             }
         }
 
-        if (region_size == 0)
-            break;
-        uintptr_t next = region_base + region_size;
-        if (next <= addr)
-            break;
-        addr = next;
+        if (!reg.hits.empty())
+        {
+            res->total_hits += reg.hits.size();
+            res->regions_with_hits += 1;
+        }
+
+        res->regions.push_back(std::move(reg));
+
+        if (res->total_bytes - last_progress_bytes >= 8 * 1024 * 1024)
+        {
+            last_progress_bytes = res->total_bytes;
+            PostMessageA(hwnd, WM_SCAN_PROGRESS,
+                         static_cast<WPARAM>(res->total_bytes / (1024 * 1024)),
+                         static_cast<LPARAM>(res->total_hits));
+        }
     }
 
     if (!g_scan_abort.load(std::memory_order_relaxed))
     {
-        // Automatically evaluate triage findings on the loaded regions
-        res->report = run_process_triage(proc, res->pid, res->regions, &g_scan_abort, nullptr, nullptr);
+        res->report = run_source_triage(source, res->regions, &g_scan_abort, nullptr, nullptr);
     }
-
-    CloseHandle(proc);
 
     if (g_scan_abort.load(std::memory_order_relaxed))
     {
@@ -2723,6 +2919,10 @@ void on_worker_completed(WorkerResult *res)
     g_triage_report = std::move(res->report);
     g_current_pid = res->pid;
     g_current_pid_label = res->pid_label;
+    if (res->source)
+    {
+        g_current_source = res->source;
+    }
     g_active_pattern = res->pat;
     g_has_pattern = res->use_pattern;
     g_has_selection = false;
@@ -2766,7 +2966,14 @@ void on_worker_completed(WorkerResult *res)
 
     double mb = static_cast<double>(res->total_bytes) / (1024.0 * 1024.0);
     char status[320];
-    if (res->task_type == WorkerTaskType::Triage)
+    if (g_current_source != nullptr && !g_current_source->capabilities().is_live)
+    {
+        std::snprintf(status, sizeof(status),
+                      "%s: %zu sections/regions | Threats: %zu CRIT, %zu HIGH, %zu MED, %zu LOW [Static PE Rules]",
+                      g_current_source->describe().c_str(),
+                      g_regions.size(), crit, high, med, low);
+    }
+    else if (res->task_type == WorkerTaskType::Triage)
     {
         std::snprintf(status, sizeof(status),
                       "Triage complete for PID %lu (%s): %zu regions | Threats: %zu CRIT, %zu HIGH, %zu MED, %zu LOW%s",
@@ -2815,9 +3022,22 @@ void start_worker_task(WorkerTaskType task_type, bool require_pattern)
     std::string pat_str(pat_buf);
 
     DWORD pid = 0;
-    if (!parse_pid_string(pid_str, pid))
+    std::shared_ptr<MemorySource> active_source = nullptr;
+    if (parse_pid_string(pid_str, pid))
     {
-        MessageBoxA(g_hwnd_main, "Enter a valid numeric PID.", "Invalid Target PID", MB_ICONWARNING);
+        active_source = std::make_shared<LiveProcessSource>(pid);
+        g_current_source = active_source;
+        g_current_pid = pid;
+        SetWindowTextA(g_hwnd_main, "Deadeye - Memory Triage Scanner & Hex Viewer");
+        if (g_chk_heartbeat) EnableWindow(g_chk_heartbeat, TRUE);
+    }
+    else if (g_current_source != nullptr && !g_current_source->capabilities().is_live)
+    {
+        active_source = g_current_source;
+    }
+    else
+    {
+        MessageBoxA(g_hwnd_main, "Enter a valid numeric PID, or select File > Open Memory Source... to inspect a PE/binary file.", "Invalid Target", MB_ICONWARNING);
         return;
     }
 
@@ -2857,20 +3077,21 @@ void start_worker_task(WorkerTaskType task_type, bool require_pattern)
 
     if (task_type == WorkerTaskType::Triage)
     {
-        set_status("Triaging process memory in background...");
+        set_status("Triaging memory in background...");
     }
     else
     {
-        set_status(use_pattern ? "Scanning process memory in background..." : "Loading process memory map in background...");
+        set_status(use_pattern ? "Scanning memory in background..." : "Loading memory map in background...");
     }
 
     WorkerTask *task = new WorkerTask();
     task->hwnd = g_hwnd_main;
     task->pid = pid;
-    task->pid_label = pid_str;
+    task->pid_label = active_source ? active_source->describe() : ("PID " + std::to_string(pid));
     task->pat = pat;
     task->use_pattern = use_pattern;
     task->task_type = task_type;
+    task->source = active_source;
 
     g_scan_abort.store(false, std::memory_order_relaxed);
     g_h_worker_thread = CreateThread(nullptr, 0, WorkerThreadProc, task, 0, nullptr);
@@ -2935,16 +3156,26 @@ void on_export_json()
 
     if (g_triage_report.findings.empty())
     {
-        HANDLE proc = get_or_open_target_proc(g_current_pid);
-        if (proc != nullptr)
+        auto src = get_active_source();
+        if (src != nullptr)
         {
-            g_triage_report = run_process_triage(proc, g_current_pid, g_regions, nullptr, nullptr, nullptr);
+            g_triage_report = run_source_triage(src, g_regions);
         }
     }
 
     char filename_buf[MAX_PATH] = {};
-    std::snprintf(filename_buf, sizeof(filename_buf), "deadeye_triage_pid_%lu.json",
-                  static_cast<unsigned long>(g_current_pid));
+    if (g_current_source != nullptr && !g_current_source->capabilities().is_live)
+    {
+        std::string fn = g_current_source->get_file_path();
+        size_t last_slash = fn.find_last_of("\\/");
+        std::string base_fn = (last_slash != std::string::npos) ? fn.substr(last_slash + 1) : fn;
+        std::snprintf(filename_buf, sizeof(filename_buf), "deadeye_triage_%s.json", base_fn.c_str());
+    }
+    else
+    {
+        std::snprintf(filename_buf, sizeof(filename_buf), "deadeye_triage_pid_%lu.json",
+                      static_cast<unsigned long>(g_current_pid));
+    }
 
     OPENFILENAMEA ofn = {};
     ofn.lStructSize = sizeof(ofn);
@@ -3231,12 +3462,368 @@ void copy_text_to_clipboard(HWND hwnd, const std::string &text)
 
 #include "tier1.inl"
 
+bool get_pe_default_base(const std::string &filepath, uintptr_t &out_base, bool &out_is_pe)
+{
+    out_base = 0x140000000ULL;
+    out_is_pe = false;
+    std::ifstream file(filepath, std::ios::binary);
+    if (!file.is_open()) return false;
+    IMAGE_DOS_HEADER dos = {};
+    if (!file.read(reinterpret_cast<char*>(&dos), sizeof(dos)) || dos.e_magic != IMAGE_DOS_SIGNATURE)
+        return false;
+    if (dos.e_lfanew <= 0 || dos.e_lfanew > 64 * 1024 * 1024)
+        return false;
+    file.seekg(dos.e_lfanew, std::ios::beg);
+    DWORD nt_sig = 0;
+    if (!file.read(reinterpret_cast<char*>(&nt_sig), sizeof(nt_sig)) || nt_sig != IMAGE_NT_SIGNATURE)
+        return false;
+    IMAGE_FILE_HEADER file_hdr = {};
+    if (!file.read(reinterpret_cast<char*>(&file_hdr), sizeof(file_hdr)))
+        return false;
+    out_is_pe = true;
+    uint16_t opt_magic = 0;
+    if (!file.read(reinterpret_cast<char*>(&opt_magic), sizeof(opt_magic)))
+        return true;
+    if (opt_magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+    {
+        file.seekg(dos.e_lfanew + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER), std::ios::beg);
+        IMAGE_OPTIONAL_HEADER64 opt64 = {};
+        if (file.read(reinterpret_cast<char*>(&opt64), sizeof(opt64)))
+            out_base = static_cast<uintptr_t>(opt64.ImageBase);
+    }
+    else if (opt_magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC)
+    {
+        file.seekg(dos.e_lfanew + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER), std::ios::beg);
+        IMAGE_OPTIONAL_HEADER32 opt32 = {};
+        if (file.read(reinterpret_cast<char*>(&opt32), sizeof(opt32)))
+            out_base = static_cast<uintptr_t>(opt32.ImageBase);
+    }
+    return true;
+}
+
+struct PeMapDlgState
+{
+    bool confirmed = false;
+    uintptr_t base_address = 0;
+    bool apply_relocs = true;
+    HWND h_edit_base = nullptr;
+    HWND h_chk_relocs = nullptr;
+};
+
+static LRESULT CALLBACK PeMapDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    PeMapDlgState *state = reinterpret_cast<PeMapDlgState *>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
+    switch (msg)
+    {
+    case WM_CREATE:
+    {
+        CREATESTRUCTA *cs = reinterpret_cast<CREATESTRUCTA *>(lp);
+        state = reinterpret_cast<PeMapDlgState *>(cs->lpCreateParams);
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+
+        HWND lbl1 = CreateWindowExA(0, "STATIC", "Target Virtual Base Address (hex):",
+            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            20, 16, 380, 20, hwnd, nullptr, GetModuleHandleA(nullptr), nullptr);
+        SendMessageA(lbl1, WM_SETFONT, reinterpret_cast<WPARAM>(g_ui_font), TRUE);
+
+        char base_str[32];
+        std::snprintf(base_str, sizeof(base_str), "0x%016llX", static_cast<unsigned long long>(state->base_address));
+
+        state->h_edit_base = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", base_str,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+            20, 40, 380, 26, hwnd, reinterpret_cast<HMENU>(101), GetModuleHandleA(nullptr), nullptr);
+        SendMessageA(state->h_edit_base, WM_SETFONT, reinterpret_cast<WPARAM>(g_ui_font), TRUE);
+
+        state->h_chk_relocs = CreateWindowExA(0, "BUTTON", "Apply base relocations (if mapped base != ImageBase)",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            20, 78, 380, 24, hwnd, reinterpret_cast<HMENU>(102), GetModuleHandleA(nullptr), nullptr);
+        SendMessageA(state->h_chk_relocs, WM_SETFONT, reinterpret_cast<WPARAM>(g_ui_font), TRUE);
+        SendMessageA(state->h_chk_relocs, BM_SETCHECK, state->apply_relocs ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        HWND btn_ok = CreateWindowExA(0, "BUTTON", "OK",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            195, 120, 95, 30, hwnd, reinterpret_cast<HMENU>(IDOK), GetModuleHandleA(nullptr), nullptr);
+        SendMessageA(btn_ok, WM_SETFONT, reinterpret_cast<WPARAM>(g_ui_font_bold ? g_ui_font_bold : g_ui_font), TRUE);
+
+        HWND btn_cancel = CreateWindowExA(0, "BUTTON", "Cancel",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            305, 120, 95, 30, hwnd, reinterpret_cast<HMENU>(IDCANCEL), GetModuleHandleA(nullptr), nullptr);
+        SendMessageA(btn_cancel, WM_SETFONT, reinterpret_cast<WPARAM>(g_ui_font), TRUE);
+
+        SetFocus(state->h_edit_base);
+        SendMessageA(state->h_edit_base, EM_SETSEL, 0, -1);
+        return 0;
+    }
+    case WM_COMMAND:
+    {
+        WORD id = LOWORD(wp);
+        if (id == IDOK)
+        {
+            if (state != nullptr)
+            {
+                char buf[64] = {};
+                GetWindowTextA(state->h_edit_base, buf, sizeof(buf));
+                std::string s(buf);
+                uintptr_t val = 0;
+                try
+                {
+                    val = std::stoull(s, nullptr, 16);
+                }
+                catch (...)
+                {
+                    MessageBoxA(hwnd, "Invalid hexadecimal base address. Please enter a valid hex address (e.g. 0x140000000).", "Invalid Address", MB_OK | MB_ICONWARNING);
+                    return 0;
+                }
+                state->base_address = val;
+                state->apply_relocs = (SendMessageA(state->h_chk_relocs, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                state->confirmed = true;
+            }
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        else if (id == IDCANCEL)
+        {
+            if (state != nullptr) state->confirmed = false;
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    }
+    case WM_CLOSE:
+        if (state != nullptr) state->confirmed = false;
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+bool show_pe_map_options_dialog(HWND parent, uintptr_t default_base, uintptr_t &out_base, bool &out_apply_relocs)
+{
+    static bool registered = false;
+    static const char *CLASS_NAME = "DeadeyePeMapDlg";
+    if (!registered)
+    {
+        WNDCLASSA wc = {};
+        wc.lpfnWndProc = PeMapDlgProc;
+        wc.hInstance = GetModuleHandleA(nullptr);
+        wc.lpszClassName = CLASS_NAME;
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.hCursor = LoadCursorA(nullptr, IDC_ARROW);
+        RegisterClassA(&wc);
+        registered = true;
+    }
+
+    PeMapDlgState state;
+    state.base_address = default_base;
+    state.apply_relocs = true;
+
+    RECT rc_parent = {};
+    GetWindowRect(parent, &rc_parent);
+    int dlg_w = 440;
+    int dlg_h = 210;
+    int dlg_x = rc_parent.left + (rc_parent.right - rc_parent.left - dlg_w) / 2;
+    int dlg_y = rc_parent.top + (rc_parent.bottom - rc_parent.top - dlg_h) / 2;
+
+    HWND hwnd_dlg = CreateWindowExA(
+        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        CLASS_NAME,
+        "Deadeye - Map PE In-Memory Layout",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        dlg_x, dlg_y, dlg_w, dlg_h,
+        parent, nullptr, GetModuleHandleA(nullptr), &state);
+
+    if (hwnd_dlg == nullptr)
+        return false;
+
+    EnableWindow(parent, FALSE);
+
+    MSG msg;
+    while (IsWindow(hwnd_dlg) && GetMessageA(&msg, nullptr, 0, 0))
+    {
+        if (msg.message == WM_KEYDOWN)
+        {
+            if (msg.wParam == VK_ESCAPE)
+            {
+                SendMessageA(hwnd_dlg, WM_COMMAND, IDCANCEL, 0);
+                continue;
+            }
+            if (msg.wParam == VK_RETURN)
+            {
+                SendMessageA(hwnd_dlg, WM_COMMAND, IDOK, 0);
+                continue;
+            }
+        }
+        if (!IsDialogMessageA(hwnd_dlg, &msg))
+        {
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
+    }
+
+    EnableWindow(parent, TRUE);
+    SetForegroundWindow(parent);
+
+    if (state.confirmed)
+    {
+        out_base = state.base_address;
+        out_apply_relocs = state.apply_relocs;
+        return true;
+    }
+    return false;
+}
+
+void on_open_memory_source()
+{
+    char file_buf[MAX_PATH] = {};
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_hwnd_main;
+    ofn.lpstrFilter = "Executable & Binary Files (*.exe;*.dll;*.sys;*.bin;*.*)\0*.exe;*.dll;*.sys;*.bin;*.*\0PE Files (*.exe;*.dll;*.sys)\0*.exe;*.dll;*.sys\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFile = file_buf;
+    ofn.nMaxFile = sizeof(file_buf);
+    ofn.lpstrTitle = "Open Executable or Binary File";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+
+    if (!GetOpenFileNameA(&ofn))
+    {
+        return;
+    }
+
+    std::string filepath(file_buf);
+    uintptr_t pe_base = 0;
+    bool is_pe = false;
+    get_pe_default_base(filepath, pe_base, is_pe);
+
+    std::shared_ptr<MemorySource> new_source = nullptr;
+    std::string load_err;
+
+    if (is_pe)
+    {
+        int choice = MessageBoxA(
+            g_hwnd_main,
+            "This file has a valid Portable Executable (PE) signature.\n\n"
+            "Would you like to map it as an in-memory image layout according to its PE headers?\n\n"
+            "• Click YES to map sections at virtual addresses (loader layout)\n"
+            "• Click NO to open as flat raw bytes (one contiguous region)\n"
+            "• Click CANCEL to abort",
+            "Deadeye - Open Memory Source",
+            MB_YESNOCANCEL | MB_ICONQUESTION);
+
+        if (choice == IDCANCEL)
+        {
+            return;
+        }
+
+        if (choice == IDYES)
+        {
+            uintptr_t chosen_base = pe_base;
+            bool apply_relocs = true;
+            if (!show_pe_map_options_dialog(g_hwnd_main, pe_base, chosen_base, apply_relocs))
+            {
+                return;
+            }
+
+            new_source = MappedPeSource::open(filepath, chosen_base, apply_relocs, load_err);
+            if (!new_source)
+            {
+                MessageBoxA(g_hwnd_main, ("Failed to map PE: " + load_err).c_str(), "Deadeye - PE Loader Error", MB_OK | MB_ICONERROR);
+                return;
+            }
+        }
+        else
+        {
+            new_source = RawFileSource::open(filepath, 0x100000000ULL, load_err);
+            if (!new_source)
+            {
+                MessageBoxA(g_hwnd_main, ("Failed to open file: " + load_err).c_str(), "Deadeye - Raw File Error", MB_OK | MB_ICONERROR);
+                return;
+            }
+        }
+    }
+    else
+    {
+        new_source = RawFileSource::open(filepath, 0x100000000ULL, load_err);
+        if (!new_source)
+        {
+            MessageBoxA(g_hwnd_main, ("Failed to open raw file: " + load_err).c_str(), "Deadeye - Raw File Error", MB_OK | MB_ICONERROR);
+            return;
+        }
+    }
+
+    g_current_source = new_source;
+    g_current_pid = 0;
+    close_target_proc();
+
+    if (g_chk_heartbeat)
+    {
+        SendMessageA(g_chk_heartbeat, BM_SETCHECK, BST_UNCHECKED, 0);
+        EnableWindow(g_chk_heartbeat, FALSE);
+    }
+    KillTimer(g_hwnd_main, IDT_HEARTBEAT);
+
+    std::string desc = g_current_source->describe();
+    SetWindowTextA(g_hwnd_main, ("Deadeye - [" + desc + "]").c_str());
+    SetWindowTextA(g_edit_pid, desc.c_str());
+
+    g_regions.clear();
+    std::string q_err;
+    if (!g_current_source->query_regions(g_regions, q_err))
+    {
+        MessageBoxA(g_hwnd_main, ("Error querying regions: " + q_err).c_str(), "Deadeye - Error", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    invalidate_hex_cache();
+
+    g_triage_report = run_source_triage(g_current_source, g_regions);
+
+    PeSummaryInfo pe_summary;
+    if (g_current_source->get_pe_summary(pe_summary))
+    {
+        SetWindowTextA(g_lbl_triage_reasons, format_pe_summary(pe_summary).c_str());
+    }
+
+    g_view_mode = ViewMode::TriageFindings;
+    if (g_combo_view_mode)
+    {
+        SendMessageA(g_combo_view_mode, CB_SETCURSEL, 0, 0);
+    }
+    populate_region_list();
+
+    if (!g_visible_indices.empty())
+    {
+        select_region_in_ui(g_visible_indices[0], 0, static_cast<SIZE_T>(-1));
+    }
+    else
+    {
+        g_has_selection = false;
+        SetWindowTextA(g_edit_hex, "");
+        update_diff_combo();
+    }
+
+    size_t crit = 0, high = 0, med = 0, low = 0;
+    for (const auto &f : g_triage_report.findings)
+    {
+        if (f.severity_label == "CRIT") crit++;
+        else if (f.severity_label == "HIGH") high++;
+        else if (f.severity_label == "MED") med++;
+        else if (f.severity_label == "LOW") low++;
+    }
+
+    char status[320];
+    std::snprintf(status, sizeof(status),
+                  "%s: %zu sections/regions | Threats: %zu CRIT, %zu HIGH, %zu MED, %zu LOW [Static PE Rules]",
+                  desc.c_str(), g_regions.size(), crit, high, med, low);
+    set_status(status);
+}
+
 HMENU create_application_menu()
 {
     HMENU hMenuBar = CreateMenu();
 
     // 1. File Menu
     HMENU hFileMenu = CreatePopupMenu();
+    AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_OPEN_SOURCE, "&Open Memory Source...\tCtrl+O");
     AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_TRIAGE, "Run Defensive &Triage\tCtrl+T");
     AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_EXPORT_JSON, "&Export Triage JSON...\tCtrl+S");
     AppendMenuA(hFileMenu, MF_SEPARATOR, 0, nullptr);
@@ -3489,6 +4076,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         // Build global keyboard accelerators
         ACCEL accels[] = {
+            { FCONTROL | FVIRTKEY, 'O', IDM_FILE_OPEN_SOURCE },
             { FCONTROL | FVIRTKEY, 'T', ID_BTN_TRIAGE },
             { FCONTROL | FVIRTKEY, 'S', ID_BTN_EXPORT_JSON },
             { FCONTROL | FVIRTKEY, 'F', IDM_EDIT_FIND_PATTERN },
@@ -3850,6 +4438,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 set_status("Heartbeat stopped.");
             }
         }
+        else if (id == IDM_FILE_OPEN_SOURCE)
+        {
+            on_open_memory_source();
+        }
         else if (id == IDM_FILE_TRIAGE)
         {
             PostMessageA(hwnd, WM_COMMAND, ID_BTN_TRIAGE, 0);
@@ -4014,6 +4606,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 "   (Evasive staged payload execution)\n\n"
                 "[+25] UNBACKED_EXEC:\n"
                 "   Executable memory not backed by an on-disk image file.\n\n"
+                "Static Binary Heuristics (Mapped PE Offline Analysis):\n"
+                "[+50] STATIC_WX_SECTION:\n"
+                "   Section marked with both Writable and Executable rights (W+X).\n\n"
+                "[+45] STATIC_EP_OUTSIDE_EXEC:\n"
+                "   Entry point RVA is located outside all executable sections.\n\n"
+                "[+40] STATIC_EXEC_HIGH_ENTROPY:\n"
+                "   Executable section with Shannon entropy > 7.20 (packed/encrypted code).\n\n"
+                "[+25] STATIC_NONTRIVIAL_OVERLAY:\n"
+                "   Non-trivial overlay data (> 512 bytes) appended past raw section data.\n\n"
                 "Severity Scoring Thresholds:\n"
                 "  * CRITICAL: Score >= 80\n"
                 "  * HIGH:     Score >= 50\n"
