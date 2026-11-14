@@ -37,6 +37,12 @@ struct ProcessRegionSnapshot
     bool is_rwx = false;
     bool is_write_then_flip = false;
     bool is_readable = false;
+
+    // Explicit acquisition coverage metadata
+    SIZE_T bytes_read = 0;
+    bool is_fully_covered = false;
+    uint32_t chunks_read = 0;
+    uint32_t chunks_total = 0;
 };
 
 struct ProcessSnapshotSession
@@ -45,6 +51,8 @@ struct ProcessSnapshotSession
     std::string process_name;
     std::string timestamp_str;
     SIZE_T total_committed_bytes = 0;
+    SIZE_T total_bytes_read = 0;
+    size_t fully_covered_regions = 0;
     std::vector<ProcessRegionSnapshot> regions;
 };
 
@@ -54,6 +62,8 @@ enum class ProcessDiffKind
     Disappeared,    // [REMOVED]
     ProtectionChg,  // [PROT_CHG]
     ContentChg,     // [MODIFIED]
+    SizeChg,        // [RESIZED]
+    TypeChg,        // [TYPE_CHG]
     Unchanged
 };
 
@@ -62,7 +72,13 @@ struct ProcessDiffItem
     ProcessDiffKind kind = ProcessDiffKind::Unchanged;
     uintptr_t base = 0;
     SIZE_T size = 0;
+    SIZE_T old_size = 0;
+    SIZE_T new_size = 0;
     DWORD type = 0;
+    DWORD old_type = 0;
+    DWORD new_type = 0;
+    DWORD old_state = 0;
+    DWORD new_state = 0;
     DWORD old_protect = 0;
     DWORD new_protect = 0;
     double old_entropy = 0.0;
@@ -157,7 +173,9 @@ struct RegionSampleRecord
     uint64_t content_hash = 0;
     double avg_entropy = 0.0;
     double changed_fraction = 0.0; // 0.0 to 1.0 vs previous sample
-    std::vector<uint8_t> sample_bytes; // Capped to 4096 bytes for XOR delta
+    SIZE_T sample_offset = 0;      // Offset within region sampled
+    SIZE_T sample_size = 0;        // Bytes sampled at sample_offset
+    std::vector<uint8_t> sample_bytes; // Capped to 16384 bytes for XOR delta
 };
 
 inline constexpr size_t RING_BUFFER_CAP = 120;
@@ -170,6 +188,7 @@ struct WatchedRegionState
     DWORD alloc_protect = 0;
     bool is_pinned = false;
     bool is_deallocated = false;
+    size_t sample_window_idx = 0;  // Rotating sampling window index for regions > 64 KB
 
     // Ring buffer of last 120 samples
     std::vector<RegionSampleRecord> ring_samples;

@@ -778,19 +778,20 @@ void on_capture_diff()
         SendMessageA(get_app_state().combo_view_mode, CB_SETCURSEL, 2, 0);
         populate_region_list();
 
-        size_t new_cnt = 0, prot_cnt = 0, mod_cnt = 0, del_cnt = 0;
+        size_t new_cnt = 0, prot_cnt = 0, mod_cnt = 0, del_cnt = 0, res_cnt = 0;
         for (const auto &d : get_app_state().process_diffs)
         {
             if (d.kind == ProcessDiffKind::Appeared) new_cnt++;
             else if (d.kind == ProcessDiffKind::ProtectionChg) prot_cnt++;
             else if (d.kind == ProcessDiffKind::ContentChg) mod_cnt++;
             else if (d.kind == ProcessDiffKind::Disappeared) del_cnt++;
+            else if (d.kind == ProcessDiffKind::SizeChg || d.kind == ProcessDiffKind::TypeChg) res_cnt++;
         }
 
-        char msg[220];
+        char msg[256];
         std::snprintf(msg, sizeof(msg),
-                      "Diff complete: %zu changes detected | %zu new regions, %zu protection flips, %zu modified, %zu freed",
-                      get_app_state().process_diffs.size(), new_cnt, prot_cnt, mod_cnt, del_cnt);
+                      "Diff complete: %zu changes detected | %zu new, %zu prot flips, %zu resized/type, %zu modified, %zu freed",
+                      get_app_state().process_diffs.size(), new_cnt, prot_cnt, res_cnt, mod_cnt, del_cnt);
         set_status(msg);
     }
     else

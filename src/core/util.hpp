@@ -43,7 +43,9 @@ std::string extract_json_str_val(const std::string &line, const std::string &key
 
 // Hashing & Information Entropy
 uint64_t fnv1a64(const uint8_t *data, size_t len);
+uint64_t fnv1a64_update(uint64_t hash, const uint8_t *data, size_t len);
 double calculate_shannon_entropy(const uint8_t *data, size_t len);
+double calculate_entropy_from_counts(const uint64_t counts[256], uint64_t total_bytes);
 
 inline double calculate_buffer_entropy(const uint8_t *data, size_t len)
 {

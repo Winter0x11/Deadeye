@@ -27,7 +27,9 @@ void update_triage_details_label(size_t reg_idx)
             const auto &d = get_app_state().process_diffs[reg_idx];
             std::string kind_str = (d.kind == ProcessDiffKind::Appeared) ? "NEW" :
                                    (d.kind == ProcessDiffKind::Disappeared) ? "REMOVED" :
-                                   (d.kind == ProcessDiffKind::ProtectionChg) ? "PROT_CHG" : "MODIFIED";
+                                   (d.kind == ProcessDiffKind::ProtectionChg) ? "PROT_CHG" :
+                                   (d.kind == ProcessDiffKind::SizeChg) ? "RESIZED" :
+                                   (d.kind == ProcessDiffKind::TypeChg) ? "TYPE_CHG" : "MODIFIED";
             std::string text = "Diff Details [" + kind_str + "]: 0x" + to_hex_string(d.base) + " (" + fmt_size_short(d.size) + ") | " + d.summary;
             SetWindowTextA(get_app_state().lbl_triage_reasons, text.c_str());
         }
@@ -153,6 +155,8 @@ void populate_region_list()
                     case ProcessDiffKind::Appeared: badge = "[+NEW   ]"; break;
                     case ProcessDiffKind::Disappeared: badge = "[-FREED ]"; break;
                     case ProcessDiffKind::ProtectionChg: badge = "[!PROT  ]"; break;
+                    case ProcessDiffKind::SizeChg: badge = "[~RESIZE]"; break;
+                    case ProcessDiffKind::TypeChg: badge = "[!TYPE  ]"; break;
                     case ProcessDiffKind::ContentChg: badge = "[~MODIF ]"; break;
                     default: badge = "[ UNCHG ]"; break;
                 }
@@ -530,10 +534,12 @@ void draw_region_list_item(DRAWITEMSTRUCT *dis)
                     text_color = tc.row_diff_new_text;
                     break;
                 case ProcessDiffKind::ProtectionChg:
+                case ProcessDiffKind::TypeChg:
                     bg_color = tc.row_diff_chg_bg;
                     text_color = tc.row_diff_chg_text;
                     break;
                 case ProcessDiffKind::ContentChg:
+                case ProcessDiffKind::SizeChg:
                     bg_color = tc.row_diff_mod_bg;
                     text_color = tc.row_diff_mod_text;
                     break;

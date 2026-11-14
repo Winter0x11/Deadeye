@@ -327,9 +327,8 @@ std::string extract_json_str_val(const std::string &line, const std::string &key
     return val;
 }
 
-uint64_t fnv1a64(const uint8_t *data, size_t len)
+uint64_t fnv1a64_update(uint64_t hash, const uint8_t *data, size_t len)
 {
-    uint64_t hash = 14695981039346656037ULL;
     for (size_t i = 0; i < len; ++i)
     {
         hash ^= data[i];
@@ -338,22 +337,33 @@ uint64_t fnv1a64(const uint8_t *data, size_t len)
     return hash;
 }
 
-double calculate_shannon_entropy(const uint8_t *data, size_t len)
+uint64_t fnv1a64(const uint8_t *data, size_t len)
 {
-    if (len == 0) return 0.0;
-    uint32_t counts[256] = {0};
-    for (size_t i = 0; i < len; ++i)
-    {
-        counts[data[i]]++;
-    }
+    return fnv1a64_update(14695981039346656037ULL, data, len);
+}
+
+double calculate_entropy_from_counts(const uint64_t counts[256], uint64_t total_bytes)
+{
+    if (total_bytes == 0) return 0.0;
     double entropy = 0.0;
     for (int i = 0; i < 256; ++i)
     {
         if (counts[i] > 0)
         {
-            double p = static_cast<double>(counts[i]) / static_cast<double>(len);
+            double p = static_cast<double>(counts[i]) / static_cast<double>(total_bytes);
             entropy -= p * std::log2(p);
         }
     }
     return entropy;
+}
+
+double calculate_shannon_entropy(const uint8_t *data, size_t len)
+{
+    if (len == 0) return 0.0;
+    uint64_t counts[256] = {0};
+    for (size_t i = 0; i < len; ++i)
+    {
+        counts[data[i]]++;
+    }
+    return calculate_entropy_from_counts(counts, len);
 }

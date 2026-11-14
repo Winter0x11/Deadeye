@@ -391,8 +391,16 @@ void evaluate_watched_region_detections(
             last_prot = s.protect;
         }
 
-        bool cur_dormant = ((s.protect & (PAGE_NOACCESS | PAGE_READWRITE | PAGE_READONLY)) != 0) || (s.avg_entropy > 7.0);
-        bool cur_active = ((s.protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0) && (s.avg_entropy < 6.0 && s.avg_entropy > 0.0);
+        bool is_exec = (s.protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0;
+        bool is_dormant_prot = (s.protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0;
+        bool is_non_exec_rw = (s.protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_WRITECOPY)) != 0;
+
+        // Strengthened dormant criteria:
+        // Must either be an inaccessible state (PAGE_NOACCESS / PAGE_GUARD),
+        // or a non-executable buffer with high entropy (> 6.8).
+        // Standard PAGE_READWRITE buffers with low entropy are NEVER considered dormant.
+        bool cur_dormant = is_dormant_prot || (is_non_exec_rw && s.avg_entropy > 6.8);
+        bool cur_active = is_exec && (s.avg_entropy < 6.4 && s.avg_entropy > 0.0);
 
         if (!in_dormant_state && cur_dormant)
         {
@@ -410,7 +418,9 @@ void evaluate_watched_region_detections(
     if (min_ent > 10.0) min_ent = 0.0;
     if (max_ent < 0.0) max_ent = 0.0;
 
-    if (cycles >= 3)
+    // Require at least 3 full dormant-to-active cycles with actual protection or entropy delta
+    bool had_real_transition = (max_ent - min_ent >= 1.0) || (protect_seq.find("->") != std::string::npos);
+    if (cycles >= 3 && had_real_transition)
     {
         double period_ms = (cycles > 1 && last_cycle_t > first_cycle_t) ?
             static_cast<double>(last_cycle_t - first_cycle_t) / static_cast<double>(cycles - 1) : 2000.0;
@@ -448,7 +458,9 @@ void evaluate_watched_region_detections(
             }
             else if (!s1)
             {
-                if (it->content_hash != s2->content_hash && it->changed_fraction >= 0.25)
+                // Ensure samples share the same offset within region for valid XOR delta
+                if (it->sample_offset == s2->sample_offset &&
+                    it->content_hash != s2->content_hash && it->changed_fraction >= 0.25)
                 {
                     s1 = &(*it);
                     break;
@@ -718,17 +730,33 @@ bool run_behavior_tracker_tick(
             continue;
         }
 
-        // Readable: Read capped bytes (up to 64 KB)
-        SIZE_T to_read = (wreg.size < 64 * 1024) ? wreg.size : (64 * 1024);
+        // Support rotating window for large regions > 64 KB
+        SIZE_T chunk_cap = 64 * 1024;
+        SIZE_T offset = 0;
+        if (wreg.size > chunk_cap)
+        {
+            size_t num_windows = (wreg.size + chunk_cap - 1) / chunk_cap;
+            offset = (wreg.sample_window_idx % num_windows) * chunk_cap;
+            if (offset + chunk_cap > wreg.size)
+            {
+                offset = wreg.size - chunk_cap;
+            }
+            wreg.sample_window_idx = (wreg.sample_window_idx + 1) % num_windows;
+        }
+
+        SIZE_T to_read = (wreg.size - offset < chunk_cap) ? (wreg.size - offset) : chunk_cap;
         std::vector<uint8_t> read_buf(to_read);
         SIZE_T bytes_read = 0;
-        if (ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(wreg.key.base), read_buf.data(), to_read, &bytes_read) && bytes_read >= 512)
+        LPCVOID read_addr = reinterpret_cast<LPCVOID>(wreg.key.base + offset);
+        if (ReadProcessMemory(proc, read_addr, read_buf.data(), to_read, &bytes_read) && bytes_read >= 512)
         {
             rec.is_unreadable = false;
+            rec.sample_offset = offset;
+            rec.sample_size = bytes_read;
             rec.content_hash = fnv1a64(read_buf.data(), bytes_read);
             rec.avg_entropy = calculate_shannon_entropy(read_buf.data(), bytes_read);
 
-            SIZE_T save_len = (bytes_read < 4096) ? bytes_read : 4096;
+            SIZE_T save_len = (bytes_read < 16384) ? bytes_read : 16384;
             rec.sample_bytes.assign(read_buf.data(), read_buf.data() + save_len);
 
             if (!wreg.ring_samples.empty())
@@ -736,7 +764,7 @@ bool run_behavior_tracker_tick(
                 const RegionSampleRecord *prev = nullptr;
                 for (auto it = wreg.ring_samples.rbegin(); it != wreg.ring_samples.rend(); ++it)
                 {
-                    if (!it->is_unreadable && !it->sample_bytes.empty())
+                    if (!it->is_unreadable && !it->sample_bytes.empty() && it->sample_offset == rec.sample_offset)
                     {
                         prev = &(*it);
                         break;
@@ -820,7 +848,9 @@ bool capture_process_snapshot_session(DWORD pid, ProcessSnapshotSession &out_ses
 
     uintptr_t addr = 0;
     MEMORY_BASIC_INFORMATION mbi;
-    std::vector<uint8_t> read_buffer(256 * 1024);
+    const SIZE_T CHUNK_SIZE = 64 * 1024;
+    const SIZE_T MAX_READ_PER_REGION = 16 * 1024 * 1024; // 16 MB max per region for responsive capture
+    std::vector<uint8_t> chunk_buffer(CHUNK_SIZE);
 
     while (VirtualQueryEx(proc, reinterpret_cast<LPCVOID>(addr), &mbi, sizeof(mbi)) == sizeof(mbi))
     {
@@ -846,18 +876,57 @@ bool capture_process_snapshot_session(DWORD pid, ProcessSnapshotSession &out_ses
             snap.is_write_then_flip = (mbi.AllocationProtect & (PAGE_READWRITE | PAGE_WRITECOPY)) &&
                                       (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE));
 
+            snap.chunks_total = static_cast<uint32_t>((mbi.RegionSize + CHUNK_SIZE - 1) / CHUNK_SIZE);
+
             if (snap.is_readable)
             {
-                SIZE_T to_read = std::min<SIZE_T>(mbi.RegionSize, read_buffer.size());
-                SIZE_T bytes_read = 0;
-                if (ReadProcessMemory(proc, mbi.BaseAddress, read_buffer.data(), to_read, &bytes_read) && bytes_read > 0)
+                SIZE_T bytes_to_read = (mbi.RegionSize < MAX_READ_PER_REGION) ? mbi.RegionSize : MAX_READ_PER_REGION;
+                SIZE_T offset = 0;
+                uint64_t running_hash = 14695981039346656037ULL;
+                uint64_t byte_counts[256] = {};
+                SIZE_T total_bytes_read = 0;
+                uint32_t chunks_read = 0;
+
+                while (offset < bytes_to_read)
                 {
-                    snap.content_hash = fnv1a64(read_buffer.data(), bytes_read);
-                    snap.entropy = calculate_shannon_entropy(read_buffer.data(), bytes_read);
-                    if (bytes_read >= 2 && read_buffer[0] == 'M' && read_buffer[1] == 'Z')
+                    SIZE_T this_chunk = (bytes_to_read - offset < CHUNK_SIZE) ? (bytes_to_read - offset) : CHUNK_SIZE;
+                    SIZE_T n_read = 0;
+                    LPCVOID read_ptr = reinterpret_cast<LPCVOID>(snap.base + offset);
+                    if (ReadProcessMemory(proc, read_ptr, chunk_buffer.data(), this_chunk, &n_read) && n_read > 0)
                     {
-                        snap.has_pe = true;
+                        if (offset == 0 && n_read >= 2 && chunk_buffer[0] == 'M' && chunk_buffer[1] == 'Z')
+                        {
+                            snap.has_pe = true;
+                        }
+                        running_hash = fnv1a64_update(running_hash, chunk_buffer.data(), n_read);
+                        for (SIZE_T b = 0; b < n_read; ++b)
+                        {
+                            byte_counts[chunk_buffer[b]]++;
+                        }
+                        total_bytes_read += n_read;
+                        chunks_read++;
+                        offset += n_read;
+                        if (n_read < this_chunk) break;
                     }
+                    else
+                    {
+                        break;
+                    }
+                }
+
+                snap.bytes_read = total_bytes_read;
+                snap.chunks_read = chunks_read;
+                snap.is_fully_covered = (total_bytes_read == mbi.RegionSize);
+                if (total_bytes_read > 0)
+                {
+                    snap.content_hash = running_hash;
+                    snap.entropy = calculate_entropy_from_counts(byte_counts, total_bytes_read);
+                }
+
+                out_session.total_bytes_read += total_bytes_read;
+                if (snap.is_fully_covered)
+                {
+                    out_session.fully_covered_regions++;
                 }
             }
             out_session.regions.push_back(snap);
@@ -893,7 +962,9 @@ void compute_process_diff(const ProcessSnapshotSession &base, const ProcessSnaps
             item.kind = ProcessDiffKind::Appeared;
             item.base = cr.base;
             item.size = cr.size;
+            item.new_size = cr.size;
             item.type = cr.type;
+            item.new_type = cr.type;
             item.old_protect = 0;
             item.new_protect = cr.protect;
             item.new_entropy = cr.entropy;
@@ -910,14 +981,23 @@ void compute_process_diff(const ProcessSnapshotSession &base, const ProcessSnaps
         {
             const auto &br = *(it->second);
             bool prot_changed = (br.protect != cr.protect);
-            bool hash_changed = (br.content_hash != cr.content_hash);
+            bool hash_changed = (br.content_hash != cr.content_hash && (br.content_hash != 0 || cr.content_hash != 0));
+            bool size_changed = (br.size != cr.size);
+            bool type_changed = (br.type != cr.type);
+            bool state_changed = (br.state != cr.state);
 
-            if (prot_changed || hash_changed)
+            if (prot_changed || hash_changed || size_changed || type_changed || state_changed)
             {
                 ProcessDiffItem item;
                 item.base = cr.base;
                 item.size = cr.size;
+                item.old_size = br.size;
+                item.new_size = cr.size;
                 item.type = cr.type;
+                item.old_type = br.type;
+                item.new_type = cr.type;
+                item.old_state = br.state;
+                item.new_state = cr.state;
                 item.old_protect = br.protect;
                 item.new_protect = cr.protect;
                 item.old_entropy = br.entropy;
@@ -935,18 +1015,37 @@ void compute_process_diff(const ProcessSnapshotSession &base, const ProcessSnaps
                     item.is_unpack = true;
                 }
 
-                if (prot_changed)
+                if (size_changed)
+                {
+                    item.kind = ProcessDiffKind::SizeChg;
+                    item.summary = "Region resized: " + fmt_size_short(br.size) + " -> " + fmt_size_short(cr.size);
+                    if (prot_changed) item.summary += " (prot: " + prot_short(br.protect) + " -> " + prot_short(cr.protect) + ")";
+                    if (hash_changed) item.summary += " [Content modified]";
+                }
+                else if (type_changed)
+                {
+                    item.kind = ProcessDiffKind::TypeChg;
+                    item.summary = "Type changed: " + type_short(br.type) + " -> " + type_short(cr.type);
+                    if (prot_changed) item.summary += " (" + prot_short(br.protect) + " -> " + prot_short(cr.protect) + ")";
+                }
+                else if (prot_changed)
                 {
                     item.kind = ProcessDiffKind::ProtectionChg;
                     item.summary = "Protection flipped: " + prot_short(br.protect) + " -> " + prot_short(cr.protect);
                     if (item.is_unpack) item.summary += " [!Unpack Candidate]";
+                    if (hash_changed) item.summary += " [Content modified]";
                 }
-                else
+                else if (hash_changed)
                 {
                     item.kind = ProcessDiffKind::ContentChg;
                     char sbuf[128];
                     std::snprintf(sbuf, sizeof(sbuf), "Content modified: entropy %.2f -> %.2f", br.entropy, cr.entropy);
                     item.summary = sbuf;
+                }
+                else
+                {
+                    item.kind = ProcessDiffKind::ContentChg;
+                    item.summary = "Region state/allocation attributes updated";
                 }
                 out_diffs.push_back(item);
             }
@@ -983,6 +1082,8 @@ bool save_process_session_to_file(const ProcessSnapshotSession &session, const s
     out << "  \"process_name\": \"" << escape_json(session.process_name) << "\",\n";
     out << "  \"timestamp\": \"" << session.timestamp_str << "\",\n";
     out << "  \"total_committed_bytes\": " << session.total_committed_bytes << ",\n";
+    out << "  \"total_bytes_read\": " << session.total_bytes_read << ",\n";
+    out << "  \"fully_covered_regions\": " << session.fully_covered_regions << ",\n";
     out << "  \"region_count\": " << session.regions.size() << ",\n";
     out << "  \"regions\": [\n";
 
@@ -1003,6 +1104,10 @@ bool save_process_session_to_file(const ProcessSnapshotSession &session, const s
         std::snprintf(hx, sizeof(hx), "0x%016llX", static_cast<unsigned long long>(r.content_hash));
         out << "      \"content_hash\": \"" << hx << "\",\n";
         out << "      \"entropy\": " << r.entropy << ",\n";
+        out << "      \"bytes_read\": " << r.bytes_read << ",\n";
+        out << "      \"is_fully_covered\": " << (r.is_fully_covered ? "true" : "false") << ",\n";
+        out << "      \"chunks_read\": " << r.chunks_read << ",\n";
+        out << "      \"chunks_total\": " << r.chunks_total << ",\n";
         out << "      \"has_pe\": " << (r.has_pe ? "true" : "false") << ",\n";
         out << "      \"is_unbacked\": " << (r.is_unbacked ? "true" : "false") << ",\n";
         out << "      \"is_rwx\": " << (r.is_rwx ? "true" : "false") << ",\n";
@@ -1120,6 +1225,25 @@ bool load_process_session_from_file(const std::string &filepath, ProcessSnapshot
                     std::string v = extract_json_str_val(line, "entropy");
                     if (!v.empty()) cur_reg.entropy = std::stod(v);
                 }
+                else if (line.find("\"bytes_read\":") != std::string::npos)
+                {
+                    std::string v = extract_json_str_val(line, "bytes_read");
+                    if (!v.empty()) cur_reg.bytes_read = std::stoull(v);
+                }
+                else if (line.find("\"is_fully_covered\":") != std::string::npos)
+                {
+                    cur_reg.is_fully_covered = (extract_json_str_val(line, "is_fully_covered") == "true");
+                }
+                else if (line.find("\"chunks_read\":") != std::string::npos)
+                {
+                    std::string v = extract_json_str_val(line, "chunks_read");
+                    if (!v.empty()) cur_reg.chunks_read = static_cast<uint32_t>(std::stoul(v));
+                }
+                else if (line.find("\"chunks_total\":") != std::string::npos)
+                {
+                    std::string v = extract_json_str_val(line, "chunks_total");
+                    if (!v.empty()) cur_reg.chunks_total = static_cast<uint32_t>(std::stoul(v));
+                }
                 else if (line.find("\"has_pe\":") != std::string::npos)
                 {
                     cur_reg.has_pe = (extract_json_str_val(line, "has_pe") == "true");
@@ -1155,11 +1279,13 @@ YaraWildcardResult auto_wildcard_bytes(const uint8_t *bytes, size_t len, uintptr
     if (len == 0) return res;
 
     std::vector<uint8_t> wildcard_mask(len, 0);
+    const double MAX_WILDCARD_RATIO = 0.45;
+    size_t max_allowed_wildcards = static_cast<size_t>(len * MAX_WILDCARD_RATIO);
 
     for (size_t i = 0; i < len; )
     {
         // Near CALL (E8) or Near JMP (E9)
-        if ((bytes[i] == 0xE8 || bytes[i] == 0xE9) && i + 4 < len)
+        if ((bytes[i] == 0xE8 || bytes[i] == 0xE9) && i + 4 < len && (res.wildcard_count + 4 <= max_allowed_wildcards))
         {
             res.wildcards_applied.push_back("Offset +0x" + to_hex_string(i) + ": Wildcarded rel32 displacement for " +
                                             (bytes[i] == 0xE8 ? "CALL" : "JMP"));
@@ -1173,7 +1299,7 @@ YaraWildcardResult auto_wildcard_bytes(const uint8_t *bytes, size_t len, uintptr
         }
 
         // Conditional Near Jump: 0F 80..8F xx xx xx xx
-        if (bytes[i] == 0x0F && i + 5 < len && (bytes[i + 1] >= 0x80 && bytes[i + 1] <= 0x8F))
+        if (bytes[i] == 0x0F && i + 5 < len && (bytes[i + 1] >= 0x80 && bytes[i + 1] <= 0x8F) && (res.wildcard_count + 4 <= max_allowed_wildcards))
         {
             res.wildcards_applied.push_back("Offset +0x" + to_hex_string(i) + ": Wildcarded rel32 displacement for conditional Jcc");
             for (size_t k = 2; k <= 5; ++k)
@@ -1186,7 +1312,7 @@ YaraWildcardResult auto_wildcard_bytes(const uint8_t *bytes, size_t len, uintptr
         }
 
         // x64 REX.W + MOV reg64, imm64: 48 B8..BF (8-byte immediate relocation target)
-        if (bytes[i] == 0x48 && i + 9 < len && (bytes[i + 1] >= 0xB8 && bytes[i + 1] <= 0xBF))
+        if (bytes[i] == 0x48 && i + 9 < len && (bytes[i + 1] >= 0xB8 && bytes[i + 1] <= 0xBF) && (res.wildcard_count + 8 <= max_allowed_wildcards))
         {
             res.wildcards_applied.push_back("Offset +0x" + to_hex_string(i) + ": Wildcarded 64-bit immediate relocation target");
             for (size_t k = 2; k <= 9; ++k)
@@ -1199,7 +1325,7 @@ YaraWildcardResult auto_wildcard_bytes(const uint8_t *bytes, size_t len, uintptr
         }
 
         // x64 RIP-relative addressing: ModR/M byte where (modrm & 0xC7) == 0x05
-        if (i + 1 < len)
+        if (i + 1 < len && (res.wildcard_count + 4 <= max_allowed_wildcards))
         {
             uint8_t op = bytes[i];
             uint8_t modrm = bytes[i + 1];
@@ -1219,7 +1345,7 @@ YaraWildcardResult auto_wildcard_bytes(const uint8_t *bytes, size_t len, uintptr
         }
 
         // REX-prefixed RIP-relative
-        if (i + 2 < len && ((bytes[i] & 0xF0) == 0x40))
+        if (i + 2 < len && ((bytes[i] & 0xF0) == 0x40) && (res.wildcard_count + 4 <= max_allowed_wildcards))
         {
             uint8_t op = bytes[i + 1];
             uint8_t modrm = bytes[i + 2];
@@ -1288,6 +1414,7 @@ std::string generate_yara_rule_text(const YaraWildcardResult &wildcard_res, uint
     ss << "        target_pid = " << pid << "\r\n";
     ss << "        source_address = \"" << base_buf << "\"\r\n";
     ss << "        wildcard_ratio = \"" << pct_buf << "\"\r\n";
+    ss << "        wildcard_note = \"Heuristic opcode displacement wildcarding; verify disassembly before production deployment\"\r\n";
     ss << "    strings:\r\n";
     ss << "        $sig = { " << wildcard_res.hex_pattern << " }\r\n";
     ss << "    condition:\r\n";
