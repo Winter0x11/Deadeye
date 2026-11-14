@@ -5,36 +5,6 @@
 // - Hex Selection to YARA Rule with False-Positive Validator
 // ============================================================================
 
-uint64_t fnv1a64(const uint8_t *data, size_t len)
-{
-    uint64_t hash = 14695981039346656037ULL;
-    for (size_t i = 0; i < len; ++i)
-    {
-        hash ^= data[i];
-        hash *= 1099511628211ULL;
-    }
-    return hash;
-}
-
-double calculate_shannon_entropy(const uint8_t *data, size_t len)
-{
-    if (len == 0) return 0.0;
-    uint32_t counts[256] = {0};
-    for (size_t i = 0; i < len; ++i)
-    {
-        counts[data[i]]++;
-    }
-    double entropy = 0.0;
-    for (int i = 0; i < 256; ++i)
-    {
-        if (counts[i] > 0)
-        {
-            double p = static_cast<double>(counts[i]) / static_cast<double>(len);
-            entropy -= p * std::log2(p);
-        }
-    }
-    return entropy;
-}
 
 // Computes page-wise Shannon entropy and aggregated region metrics with compact ASCII profile.
 // Pages shorter than 512 bytes are treated as n/a ('?').
@@ -1080,23 +1050,6 @@ bool save_process_session_to_file(const ProcessSnapshotSession &session, const s
     return true;
 }
 
-std::string extract_json_str_val(const std::string &line, const std::string &key)
-{
-    size_t kpos = line.find("\"" + key + "\":");
-    if (kpos == std::string::npos) return "";
-    size_t colon = line.find(':', kpos);
-    if (colon == std::string::npos) return "";
-    size_t start = line.find_first_not_of(" \t\r\n", colon + 1);
-    if (start == std::string::npos) return "";
-    size_t end = line.find_last_not_of(" \t\r\n,");
-    if (end == std::string::npos || end < start) return "";
-    std::string val = line.substr(start, end - start + 1);
-    if (val.size() >= 2 && val.front() == '"' && val.back() == '"')
-    {
-        val = val.substr(1, val.size() - 2);
-    }
-    return val;
-}
 
 bool load_process_session_from_file(const std::string &filepath, ProcessSnapshotSession &session)
 {

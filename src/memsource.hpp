@@ -24,6 +24,7 @@
 #include <vector>
 #include <windows.h>
 #include <tlhelp32.h>
+#include "core/util.hpp"
 
 // ----------------------------------------------------------------------------
 // Core Types & Enumerations
@@ -68,26 +69,6 @@ struct PeSummaryInfo
     std::string parse_warning;
 };
 
-// Shannon entropy calculation helper
-inline double calculate_buffer_entropy(const uint8_t *data, size_t len)
-{
-    if (len == 0) return 0.0;
-    uint32_t counts[256] = {0};
-    for (size_t i = 0; i < len; ++i)
-    {
-        counts[data[i]]++;
-    }
-    double entropy = 0.0;
-    for (int i = 0; i < 256; ++i)
-    {
-        if (counts[i] > 0)
-        {
-            double p = static_cast<double>(counts[i]) / static_cast<double>(len);
-            entropy -= p * std::log2(p);
-        }
-    }
-    return entropy;
-}
 
 // ----------------------------------------------------------------------------
 // Abstract Base Interface: MemorySource
