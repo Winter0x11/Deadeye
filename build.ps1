@@ -50,6 +50,22 @@ Write-Host "Source Files  : $($srcFiles.Count) C++ translation units" -Foregroun
 function Build-MinGW {
     Write-Host "`n[*] Building with MinGW-w64 GCC..." -ForegroundColor Yellow
 
+    if (-not (Get-Command g++ -ErrorAction SilentlyContinue) -or -not (Get-Command windres -ErrorAction SilentlyContinue)) {
+        $candidatePaths = @(
+            "C:\msys64\mingw64\bin",
+            "$env:RUNNER_TEMP\msys64\mingw64\bin",
+            "D:\a\_temp\msys64\mingw64\bin",
+            "C:\mingw64\bin"
+        )
+        foreach ($cp in $candidatePaths) {
+            if ($cp -and (Test-Path "$cp\g++.exe") -and (Test-Path "$cp\windres.exe")) {
+                Write-Host "  -> Found MinGW in $cp, adding to PATH..." -ForegroundColor DarkGray
+                $env:PATH = "$cp;$env:PATH"
+                break
+            }
+        }
+    }
+
     $gccCmd = Get-Command g++ -ErrorAction SilentlyContinue
     $windresCmd = Get-Command windres -ErrorAction SilentlyContinue
 
