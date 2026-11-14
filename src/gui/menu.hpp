@@ -1,0 +1,96 @@
+// src/gui/menu.hpp
+// Deadeye GUI Menu, Accelerators, and Resource Identifiers
+#pragma once
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
+#include <windows.h>
+
+namespace gui {
+
+// Control IDs for GUI child windows
+#define ID_EDIT_PID 101
+#define ID_BTN_LOAD 102
+#define ID_EDIT_PATTERN 103
+#define ID_BTN_SEARCH 104
+#define ID_BTN_NEXT_HIT 105
+#define ID_CHK_HITS_ONLY 106
+#define ID_LIST_REGIONS 107
+#define ID_EDIT_HEX 108
+#define ID_BTN_PREV_PAGE 109
+#define ID_BTN_NEXT_PAGE 110
+#define ID_BTN_SNAP 111
+#define ID_COMBO_DIFF 112
+#define ID_BTN_CLEAR_SNAPS 113
+#define ID_CHK_HEARTBEAT 114
+#define ID_BTN_TRIAGE 115
+#define ID_COMBO_VIEW_MODE 116
+#define ID_COMBO_MIN_SEV 117
+#define ID_CHK_HIDE_CLEAN 118
+#define ID_BTN_EXPORT_JSON 119
+#define ID_BTN_DIFF_PROC 121
+#define ID_BTN_YARA 122
+#define ID_BTN_ATTACH 123
+#define IDT_HEARTBEAT 1001
+
+// Menu Item IDs
+#define IDM_FILE_OPEN_SOURCE 2001
+#define IDM_FILE_TRIAGE 2002
+#define IDM_FILE_EXPORT_JSON 2003
+#define IDM_FILE_THEME_LIGHT 2004
+#define IDM_FILE_THEME_DARK 2005
+#define IDM_FILE_EXIT 2006
+#define IDM_FILE_ATTACH 2007
+
+#define IDM_EDIT_COPY_ADDR 2010
+#define IDM_EDIT_COPY_HEX 2011
+#define IDM_EDIT_FIND_PATTERN 2012
+#define IDM_EDIT_FIND_NEXT 2013
+#define IDM_EDIT_GENERATE_YARA 2014
+
+#define IDM_VIEW_TRIAGE_FINDINGS 2020
+#define IDM_VIEW_MEMORY_MAP 2021
+#define IDM_VIEW_BEHAVIOR 2023
+#define IDM_VIEW_STRINGS 2027
+#define IDM_VIEW_PROCESS_DIFF 2022
+#define IDM_VIEW_HIDE_CLEAN 2024
+#define IDM_VIEW_HITS_ONLY 2025
+#define IDM_VIEW_REFRESH 2026
+
+#define IDM_TIMELINE_SNAP 2030
+#define IDM_TIMELINE_CLEAR 2031
+#define IDM_TIMELINE_HEARTBEAT 2032
+#define IDM_TIMELINE_PREV_PAGE 2033
+#define IDM_TIMELINE_NEXT_PAGE 2034
+
+#define IDM_DIFF_CAPTURE_BASELINE 2050
+#define IDM_DIFF_CAPTURE_CURRENT 2051
+#define IDM_DIFF_SAVE_SESSION 2052
+#define IDM_DIFF_LOAD_SESSION 2053
+#define IDM_DIFF_VIEW_STRINGS 2055
+
+#define IDM_BEHAVIOR_PIN 2060
+#define IDM_BEHAVIOR_WATCH_ALL_PRIV 2061
+#define IDM_BEHAVIOR_CLEAR 2062
+
+#define IDM_STRINGS_BASELINE 2070
+#define IDM_STRINGS_TOGGLE_NEW 2071
+#define IDM_STRINGS_EXTRACT_SEL 2072
+#define IDM_STRINGS_EXTRACT_ALL 2073
+
+#define IDM_HELP_HEURISTICS 2040
+#define IDM_HELP_ABOUT 2041
+#define IDM_HELP_BEHAVIOR_LIMITS 2042
+
+// Custom window messages for background worker thread scanning & triage
+#define WM_SCAN_PROGRESS (WM_USER + 1)
+#define WM_SCAN_COMPLETE (WM_USER + 2)
+#define WM_TRIAGE_COMPLETE (WM_USER + 3)
+#define WM_BEHAVIOR_TICK_DONE (WM_USER + 4)
+
+HMENU create_application_menu();
+HACCEL create_application_accelerators();
+
+} // namespace gui
