@@ -23,7 +23,7 @@ $ApiUrl    = "https://api.github.com/repos/$RepoOwner/$RepoName/releases/latest"
 # 1. Ensure TLS 1.2+ is active
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 
-# 2. Query GitHub for latest release asset or fallback to master branch
+# 2. Query GitHub for latest release asset or fallback to latest tag redirect
 Write-Host "[*] Resolving latest Deadeye release..." -ForegroundColor Yellow
 
 $DownloadUrl = $null
@@ -41,12 +41,32 @@ try {
 }
 
 if (-not $DownloadUrl) {
-    # Direct fallback URL to the compiled zip or pre-packaged tag
-    $DownloadUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/v1.0.2/Deadeye-v1.0.2-windows-x64.zip"
-    Write-Host "[*] Falling back to standard release asset: $DownloadUrl" -ForegroundColor Yellow
+    # If API is rate-limited, resolve latest tag via HTTP redirect header (does not consume API quota)
+    try {
+        $Req = [System.Net.HttpWebRequest]::Create("https://github.com/$RepoOwner/$RepoName/releases/latest")
+        $Req.AllowAutoRedirect = $false
+        $Resp = $Req.GetResponse()
+        $Location = $Resp.GetResponseHeader("Location")
+        $Resp.Close()
+        if ($Location -match "/tag/(v[0-9\.]+)") {
+            $LatestTag = $Matches[1]
+            $DownloadUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/$LatestTag/Deadeye-$LatestTag-windows-x64.zip"
+            Write-Host "[+] Resolved latest release via redirect: $LatestTag" -ForegroundColor Green
+        }
+    } catch {
+        # Fallback to current release
+        $DownloadUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/v1.0.6/Deadeye-v1.0.6-windows-x64.zip"
+        Write-Host "[*] Falling back to standard release asset: $DownloadUrl" -ForegroundColor Yellow
+    }
 }
 
-# 3. Create install destination directory
+# 3. Create install destination directory & stop running instances for clean update
+Get-Process -Name "deadeye" -ErrorAction SilentlyContinue | ForEach-Object {
+    Write-Host "[*] Stopping running Deadeye instance (PID $($_.Id)) for update..." -ForegroundColor Yellow
+    Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 300
+}
+
 if (-not (Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 }
@@ -92,6 +112,7 @@ try {
     $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
     $Shortcut.TargetPath = $ExePath
     $Shortcut.WorkingDirectory = $InstallDir
+    $Shortcut.IconLocation = "$ExePath,0"
     $Shortcut.Description = "Deadeye Windows Process Memory Triage Scanner & Hex Viewer"
     $Shortcut.Save()
     Write-Host "[+] Start Menu shortcut created: Deadeye" -ForegroundColor Green
