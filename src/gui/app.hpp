@@ -84,10 +84,12 @@ struct AppState
 
     // Windows & Controls
     HWND hwnd_main = nullptr;
+    HWND lbl_pid = nullptr;
     HWND edit_pid = nullptr;
     HWND btn_attach = nullptr;
     HWND btn_load = nullptr;
     HWND btn_triage = nullptr;
+    HWND lbl_pat = nullptr;
     HWND edit_pattern = nullptr;
     HWND btn_search = nullptr;
     HWND btn_next_hit = nullptr;

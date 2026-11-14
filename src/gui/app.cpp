@@ -1155,77 +1155,66 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         update_theme_brushes();
 
         const int M = 8, RH = 24;
-        int x = M;
 
-        // Row 1: Top Bar
-        HWND lbl_pid = CreateWindowA("STATIC", "PID:", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-                                     x, M, 28, RH, hwnd, nullptr, hInst, nullptr);
-        x += 30;
+        // Row 1: Top Bar - Target Group
+        get_app_state().lbl_pid = CreateWindowA("STATIC", "PID:", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
+                                                0, 0, 28, RH, hwnd, nullptr, hInst, nullptr);
 
         get_app_state().edit_pid = CreateWindowA("EDIT", "",
                                    WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
-                                   x, M, 56, RH, hwnd, reinterpret_cast<HMENU>(ID_EDIT_PID), hInst, nullptr);
-        x += 60;
+                                   0, 0, 52, RH, hwnd, reinterpret_cast<HMENU>(ID_EDIT_PID), hInst, nullptr);
 
         get_app_state().btn_attach = CreateWindowA("BUTTON", "Attach...",
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                     x, M, 66, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_ATTACH), hInst, nullptr);
-        x += 70;
+                                     0, 0, 64, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_ATTACH), hInst, nullptr);
 
         get_app_state().btn_load = CreateWindowA("BUTTON", "Load",
                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                   x, M, 48, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_LOAD), hInst, nullptr);
-        x += 52;
+                                   0, 0, 46, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_LOAD), hInst, nullptr);
 
         get_app_state().btn_triage = CreateWindowA("BUTTON", "Triage",
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                                     x, M, 58, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_TRIAGE), hInst, nullptr);
-        x += 64;
+                                     0, 0, 58, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_TRIAGE), hInst, nullptr);
 
-        HWND lbl_pat = CreateWindowA("STATIC", "Search Hex:", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
-                                     x, M, 76, RH, hwnd, nullptr, hInst, nullptr);
-        x += 78;
+        // Row 1: Top Bar - Search Group
+        get_app_state().lbl_pat = CreateWindowA("STATIC", "Search Hex:", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
+                                                0, 0, 72, RH, hwnd, nullptr, hInst, nullptr);
 
         get_app_state().edit_pattern = CreateWindowA("EDIT", "",
                                        WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
-                                       x, M, 200, RH, hwnd, reinterpret_cast<HMENU>(ID_EDIT_PATTERN), hInst, nullptr);
-        x += 204;
+                                       0, 0, 180, RH, hwnd, reinterpret_cast<HMENU>(ID_EDIT_PATTERN), hInst, nullptr);
 
         get_app_state().btn_search = CreateWindowA("BUTTON", "Search",
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                     x, M, 58, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_SEARCH), hInst, nullptr);
-        x += 62;
+                                     0, 0, 54, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_SEARCH), hInst, nullptr);
 
-        get_app_state().btn_next_hit = CreateWindowA("BUTTON", "Next Hit",
+        get_app_state().btn_next_hit = CreateWindowA("BUTTON", "Next",
                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | WS_DISABLED,
-                                       x, M, 66, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_NEXT_HIT), hInst, nullptr);
-        x += 70;
+                                       0, 0, 48, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_NEXT_HIT), hInst, nullptr);
 
         get_app_state().chk_hits_only = CreateWindowA("BUTTON", "Hits only",
                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                                        x, M, 78, RH, hwnd, reinterpret_cast<HMENU>(ID_CHK_HITS_ONLY), hInst, nullptr);
-        x += 82;
+                                        0, 0, 72, RH, hwnd, reinterpret_cast<HMENU>(ID_CHK_HITS_ONLY), hInst, nullptr);
 
-        get_app_state().chk_heartbeat = CreateWindowA("BUTTON", "Heartbeat (1s)",
+        // Row 1: Top Bar - Tools Group
+        get_app_state().chk_heartbeat = CreateWindowA("BUTTON", "Heartbeat",
                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                                        x, M, 110, RH, hwnd, reinterpret_cast<HMENU>(ID_CHK_HEARTBEAT), hInst, nullptr);
-        x += 114;
+                                        0, 0, 84, RH, hwnd, reinterpret_cast<HMENU>(ID_CHK_HEARTBEAT), hInst, nullptr);
 
         get_app_state().btn_diff_proc = CreateWindowA("BUTTON", "Diff Proc",
                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                        x, M, 74, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_DIFF_PROC), hInst, nullptr);
-        x += 78;
+                                        0, 0, 66, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_DIFF_PROC), hInst, nullptr);
 
-        get_app_state().btn_yara = CreateWindowA("BUTTON", "YARA Rule",
+        get_app_state().btn_yara = CreateWindowA("BUTTON", "YARA",
                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                   x, M, 78, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_YARA), hInst, nullptr);
+                                   0, 0, 64, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_YARA), hInst, nullptr);
 
         // Row 2: Filter Bar (Left side) & Hex Timeline Bar (Right side)
         int r2_y = M + RH + 6;
 
         get_app_state().combo_view_mode = CreateWindowA("COMBOBOX", "",
                                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-                                          M, r2_y, 168, 160, hwnd, reinterpret_cast<HMENU>(ID_COMBO_VIEW_MODE), hInst, nullptr);
+                                          M, r2_y, 140, 160, hwnd, reinterpret_cast<HMENU>(ID_COMBO_VIEW_MODE), hInst, nullptr);
         SendMessageA(get_app_state().combo_view_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("View: Triage Findings"));
         SendMessageA(get_app_state().combo_view_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("View: Memory Map"));
         SendMessageA(get_app_state().combo_view_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("View: Behavior Tracker"));
@@ -1235,7 +1224,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         get_app_state().combo_min_sev = CreateWindowA("COMBOBOX", "",
                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-                                        M + 172, r2_y, 102, 140, hwnd, reinterpret_cast<HMENU>(ID_COMBO_MIN_SEV), hInst, nullptr);
+                                        0, 0, 92, 140, hwnd, reinterpret_cast<HMENU>(ID_COMBO_MIN_SEV), hInst, nullptr);
         SendMessageA(get_app_state().combo_min_sev, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Min: All (0+)"));
         SendMessageA(get_app_state().combo_min_sev, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Min: Low (10+)"));
         SendMessageA(get_app_state().combo_min_sev, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Min: Med (25+)"));
@@ -1245,32 +1234,32 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         get_app_state().chk_hide_clean = CreateWindowA("BUTTON", "Hide clean",
                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                                         M + 278, r2_y, 84, RH, hwnd, reinterpret_cast<HMENU>(ID_CHK_HIDE_CLEAN), hInst, nullptr);
+                                         0, 0, 76, RH, hwnd, reinterpret_cast<HMENU>(ID_CHK_HIDE_CLEAN), hInst, nullptr);
 
         get_app_state().btn_export_json = CreateWindowA("BUTTON", "Export JSON",
                                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                          M + 366, r2_y, 88, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_EXPORT_JSON), hInst, nullptr);
+                                          0, 0, 78, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_EXPORT_JSON), hInst, nullptr);
 
         // Right side timeline header controls
         get_app_state().lbl_hex_info = CreateWindowA("STATIC", "Hex View",
                                        WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE | SS_ENDELLIPSIS,
-                                       442, r2_y, 300, RH, hwnd, nullptr, hInst, nullptr);
+                                       0, 0, 200, RH, hwnd, nullptr, hInst, nullptr);
 
         get_app_state().btn_snap = CreateWindowA("BUTTON", "+ Snap",
                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
-                                   0, 0, 68, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_SNAP), hInst, nullptr);
+                                   0, 0, 56, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_SNAP), hInst, nullptr);
         get_app_state().combo_diff = CreateWindowA("COMBOBOX", "",
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL | WS_DISABLED,
-                                     0, 0, 142, 160, hwnd, reinterpret_cast<HMENU>(ID_COMBO_DIFF), hInst, nullptr);
+                                     0, 0, 118, 160, hwnd, reinterpret_cast<HMENU>(ID_COMBO_DIFF), hInst, nullptr);
         get_app_state().btn_clear_snaps = CreateWindowA("BUTTON", "Clear",
                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
-                                          0, 0, 50, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_CLEAR_SNAPS), hInst, nullptr);
-        get_app_state().btn_prev_page = CreateWindowA("BUTTON", "< Prev 64K",
+                                          0, 0, 46, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_CLEAR_SNAPS), hInst, nullptr);
+        get_app_state().btn_prev_page = CreateWindowA("BUTTON", "< Prev",
                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
-                                        0, 0, 74, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_PREV_PAGE), hInst, nullptr);
-        get_app_state().btn_next_page = CreateWindowA("BUTTON", "Next 64K >",
+                                        0, 0, 62, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_PREV_PAGE), hInst, nullptr);
+        get_app_state().btn_next_page = CreateWindowA("BUTTON", "Next >",
                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
-                                        0, 0, 74, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_NEXT_PAGE), hInst, nullptr);
+                                        0, 0, 62, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_NEXT_PAGE), hInst, nullptr);
 
         // Main Panes: Left Owner-Drawn ListBox & Right Hex Edit View
         get_app_state().list_regions = CreateWindowA("LISTBOX", "",
@@ -1294,8 +1283,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                      M, 0, 800, 18, hwnd, nullptr, hInst, nullptr);
 
         HWND ui_items[] = {
-            lbl_pid, get_app_state().edit_pid, get_app_state().btn_attach, get_app_state().btn_load, get_app_state().btn_triage, lbl_pat, get_app_state().edit_pattern, get_app_state().btn_search,
-            get_app_state().btn_next_hit, get_app_state().chk_hits_only, get_app_state().chk_heartbeat, get_app_state().btn_diff_proc, get_app_state().btn_yara,
+            get_app_state().lbl_pid, get_app_state().edit_pid, get_app_state().btn_attach, get_app_state().btn_load, get_app_state().btn_triage,
+            get_app_state().lbl_pat, get_app_state().edit_pattern, get_app_state().btn_search, get_app_state().btn_next_hit, get_app_state().chk_hits_only,
+            get_app_state().chk_heartbeat, get_app_state().btn_diff_proc, get_app_state().btn_yara,
             get_app_state().combo_view_mode, get_app_state().combo_min_sev, get_app_state().chk_hide_clean, get_app_state().btn_export_json,
             get_app_state().lbl_hex_info, get_app_state().btn_snap, get_app_state().combo_diff, get_app_state().btn_clear_snaps,
             get_app_state().btn_prev_page, get_app_state().btn_next_page, get_app_state().lbl_triage_reasons, get_app_state().lbl_status};
@@ -1420,15 +1410,97 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 1;
     }
 
+    case WM_GETMINMAXINFO:
+    {
+        MINMAXINFO *mmi = reinterpret_cast<MINMAXINFO*>(lp);
+        mmi->ptMinTrackSize.x = 900;
+        mmi->ptMinTrackSize.y = 500;
+        return 0;
+    }
+
     case WM_SIZE:
     {
         int w = LOWORD(lp);
         int h = HIWORD(lp);
+        if (w <= 0 || h <= 0)
+            return 0;
+
         const int M = 8, RH = 24;
 
-        int list_w = 434;
-        if (w < 880)
-            list_w = w / 2 - M;
+        // -------------------------------------------------------------
+        // Row 1: Responsive Top Navigation Bar
+        // -------------------------------------------------------------
+        // Group A: Target Controls (Left-aligned)
+        int x_tgt = M;
+        MoveWindow(get_app_state().lbl_pid, x_tgt, M, 28, RH, TRUE);
+        x_tgt += 32;
+
+        MoveWindow(get_app_state().edit_pid, x_tgt, M, 52, RH, TRUE);
+        x_tgt += 56;
+
+        MoveWindow(get_app_state().btn_attach, x_tgt, M, 64, RH, TRUE);
+        x_tgt += 68;
+
+        MoveWindow(get_app_state().btn_load, x_tgt, M, 46, RH, TRUE);
+        x_tgt += 50;
+
+        MoveWindow(get_app_state().btn_triage, x_tgt, M, 58, RH, TRUE);
+        x_tgt += 62; // x_tgt is now at ~268
+
+        // Group C: Right Action / Tools Controls (Right-aligned, backwards)
+        int r_tools = w - M;
+
+        int btn_yara_w = 64;
+        int btn_yara_x = r_tools - btn_yara_w;
+        MoveWindow(get_app_state().btn_yara, btn_yara_x, M, btn_yara_w, RH, TRUE);
+        r_tools = btn_yara_x - 4;
+
+        int btn_diff_w = 66;
+        int btn_diff_x = r_tools - btn_diff_w;
+        MoveWindow(get_app_state().btn_diff_proc, btn_diff_x, M, btn_diff_w, RH, TRUE);
+        r_tools = btn_diff_x - 4;
+
+        int chk_hb_w = 84;
+        int chk_hb_x = r_tools - chk_hb_w;
+        MoveWindow(get_app_state().chk_heartbeat, chk_hb_x, M, chk_hb_w, RH, TRUE);
+        r_tools = chk_hb_x - 8;
+
+        // Group B: Pattern Search Controls (Sitting between Target Group and Tools Group)
+        // Fixed search controls at right of search group:
+        int chk_hits_w = 72;
+        int btn_next_w = 48;
+        int btn_search_w = 54;
+        int lbl_pat_w = 72;
+
+        int chk_hits_x = r_tools - chk_hits_w;
+        MoveWindow(get_app_state().chk_hits_only, chk_hits_x, M, chk_hits_w, RH, TRUE);
+
+        int btn_next_x = chk_hits_x - 4 - btn_next_w;
+        MoveWindow(get_app_state().btn_next_hit, btn_next_x, M, btn_next_w, RH, TRUE);
+
+        int btn_search_x = btn_next_x - 4 - btn_search_w;
+        MoveWindow(get_app_state().btn_search, btn_search_x, M, btn_search_w, RH, TRUE);
+
+        int lbl_pat_x = x_tgt + 8;
+        MoveWindow(get_app_state().lbl_pat, lbl_pat_x, M, lbl_pat_w, RH, TRUE);
+
+        int edit_pat_x = lbl_pat_x + lbl_pat_w + 4;
+        int edit_pat_w = (btn_search_x - 6) - edit_pat_x;
+        if (edit_pat_w < 60)
+            edit_pat_w = 60;
+        MoveWindow(get_app_state().edit_pattern, edit_pat_x, M, edit_pat_w, RH, TRUE);
+
+        // -------------------------------------------------------------
+        // Row 2 & Main Panes Proportions
+        // -------------------------------------------------------------
+        int available_w = w - 3 * M;
+        int list_w = (available_w * 44) / 100;
+        if (list_w < 380)
+            list_w = 380;
+        if (list_w > available_w - 400)
+            list_w = available_w - 400;
+        if (list_w < 280)
+            list_w = available_w / 2;
 
         int right_x = M + list_w + M;
         int right_w = w - right_x - M;
@@ -1441,31 +1513,63 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (pane_h < 60)
             pane_h = 60;
 
+        // Row 2 Left Sub-Bar (Constrained strictly within [M, M + list_w])
+        int btn_export_w = 78;
+        int btn_export_x = M + list_w - btn_export_w;
+        MoveWindow(get_app_state().btn_export_json, btn_export_x, r2_y, btn_export_w, RH, TRUE);
+
+        int chk_hide_w = 76;
+        int chk_hide_x = btn_export_x - 4 - chk_hide_w;
+        MoveWindow(get_app_state().chk_hide_clean, chk_hide_x, r2_y, chk_hide_w, RH, TRUE);
+
+        int combo_sev_w = 92;
+        int combo_sev_x = chk_hide_x - 4 - combo_sev_w;
+        MoveWindow(get_app_state().combo_min_sev, combo_sev_x, r2_y, combo_sev_w, 140, TRUE);
+
+        int combo_view_x = M;
+        int combo_view_w = (combo_sev_x - 4) - combo_view_x;
+        if (combo_view_w < 110)
+            combo_view_w = 110;
+        MoveWindow(get_app_state().combo_view_mode, combo_view_x, r2_y, combo_view_w, 160, TRUE);
+
+        // Row 2 Right Sub-Bar (Constrained strictly within [right_x, w - M])
         int cur_r = w - M;
-        int btn_next_x = cur_r - 74;
-        cur_r -= 78;
-        int btn_prev_x = cur_r - 74;
-        cur_r -= 78;
-        int btn_clr_x = cur_r - 50;
-        cur_r -= 54;
-        int combo_x = cur_r - 142;
-        cur_r -= 146;
-        int btn_snap_x = cur_r - 68;
-        cur_r -= 72;
-        int info_w = btn_snap_x - right_x - 6;
-        if (info_w < 50)
-            info_w = 50;
+
+        int page_btn_w = 62;
+        int btn_next_page_x = cur_r - page_btn_w;
+        cur_r -= (page_btn_w + 4);
+
+        int btn_prev_page_x = cur_r - page_btn_w;
+        cur_r -= (page_btn_w + 4);
+
+        int btn_clr_w = 46;
+        int btn_clr_x = cur_r - btn_clr_w;
+        cur_r -= (btn_clr_w + 4);
+
+        int combo_diff_w = 118;
+        int combo_diff_x = cur_r - combo_diff_w;
+        cur_r -= (combo_diff_w + 4);
+
+        int btn_snap_w = 56;
+        int btn_snap_x = cur_r - btn_snap_w;
+        cur_r -= (btn_snap_w + 6);
+
+        int info_w = cur_r - right_x;
+        if (info_w < 40)
+            info_w = 40;
 
         MoveWindow(get_app_state().lbl_hex_info, right_x, r2_y, info_w, RH, TRUE);
-        MoveWindow(get_app_state().btn_snap, btn_snap_x, r2_y, 68, RH, TRUE);
-        MoveWindow(get_app_state().combo_diff, combo_x, r2_y, 142, 160, TRUE);
-        MoveWindow(get_app_state().btn_clear_snaps, btn_clr_x, r2_y, 50, RH, TRUE);
-        MoveWindow(get_app_state().btn_prev_page, btn_prev_x, r2_y, 74, RH, TRUE);
-        MoveWindow(get_app_state().btn_next_page, btn_next_x, r2_y, 74, RH, TRUE);
+        MoveWindow(get_app_state().btn_snap, btn_snap_x, r2_y, btn_snap_w, RH, TRUE);
+        MoveWindow(get_app_state().combo_diff, combo_diff_x, r2_y, combo_diff_w, 160, TRUE);
+        MoveWindow(get_app_state().btn_clear_snaps, btn_clr_x, r2_y, btn_clr_w, RH, TRUE);
+        MoveWindow(get_app_state().btn_prev_page, btn_prev_page_x, r2_y, page_btn_w, RH, TRUE);
+        MoveWindow(get_app_state().btn_next_page, btn_next_page_x, r2_y, page_btn_w, RH, TRUE);
 
+        // Main Panes
         MoveWindow(get_app_state().list_regions, M, pane_top, list_w, pane_h, TRUE);
         MoveWindow(get_app_state().edit_hex, right_x, pane_top, right_w, pane_h, TRUE);
 
+        // Status lines
         MoveWindow(get_app_state().lbl_triage_reasons, M, h - 42, (w > M * 2) ? w - M * 2 : 10, 18, TRUE);
         MoveWindow(get_app_state().lbl_status, M, h - 22, (w > M * 2) ? w - M * 2 : 10, 18, TRUE);
         return 0;
