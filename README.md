@@ -40,14 +40,29 @@ Select any byte sequence in the hex viewer to generate an optimized YARA signatu
   - 64-bit immediate constants and address relocations (`48 B8..BF ??..??`)
 - **Built-in False-Positive Validator**: Scans the executable memory of every active running process on the host using SIMD-accelerated pattern matching. Reports matching PIDs and process names so you can refine rules before deployment.
 
-### 5. MemorySource Abstraction & Offline Mapped PE Inspection (`Ctrl+O`)
+### 5. Process Attachment Dialog (Debugger-Style Process / Window Picker, `Ctrl+A`)
+Attach to any running process or desktop application just like a native debugger:
+- **Intuitive Windowed Priority**: Processes with visible top-level windows (Notepad, Chrome, Spotify, test targets) are automatically elevated to the top of the list with their active window titles displayed.
+- **Rich Multi-Column Process List**:
+  - **Process Name**: Executable binary name (e.g. `notepad.exe`, `explorer.exe`).
+  - **PID**: Formatted with both decimal and hex identifiers (e.g. `1234 (0x04D2)`).
+  - **Window Title**: Visible application title bar text for rapid recognition.
+  - **Arch**: Architecture detection (`x64` vs `x86`) via `IsWow64Process`.
+  - **Executable Path**: Full filesystem image path.
+- **Interactive Multi-Field Search**: Real-time filtering matching case-insensitive process names, window titles, decimal PIDs, or hex PIDs (e.g. `0x4D2` or `4D2`).
+- **One-Click Window Filter**: Checkbox toggle `[x] Processes with visible windows only` to instantly narrow the view to active desktop software.
+- **Interactive Column Sorting**: Click any column header to sort ascending or descending by Process Name, PID, Window Title, Architecture, or Path.
+- **Keyboard-Driven Workflow**: Press `Ctrl+A` anywhere in the app to open, type to search, hit Down arrow to enter the list, and press Enter or double-click to attach immediately. Press `F5` to refresh active processes on demand.
+- **Strictly Read-Only**: Enumerates processes and metadata using `PROCESS_QUERY_LIMITED_INFORMATION`. Never writes memory, suspends threads, or injects modules.
+
+### 6. MemorySource Abstraction & Offline Mapped PE Inspection (`Ctrl+O`)
 - Open raw PE files (`.exe`, `.dll`, `.sys`) laid out in virtual memory exactly as the Windows loader maps them:
   - Headers mapped at base, sections aligned to `SectionAlignment`, zero-filled padding, unmapped gaps marked unreadable.
   - Section characteristics translated to synthetic protections (`PAGE_READONLY`, `PAGE_READWRITE`, `PAGE_EXECUTE_READ`, `PAGE_EXECUTE_READWRITE`).
   - Base relocation engine: applies `IMAGE_REL_BASED_HIGHLOW` and `DIR64` when mapped base differs from `ImageBase`.
   - PE Summary panel: machine, subsystem, ImageBase, Entry Point RVA, section count, overlay size, and flags if EP is outside executable sections.
 
-### 6. Process-Wide Memory Diff & Timeline Diffing (`Ctrl+5`)
+### 7. Process-Wide Memory Diff & Timeline Diffing (`Ctrl+5`)
 - Capture full virtual address space snapshots before and after running samples:
   - `[+NEW   ]`: Newly allocated/committed memory (injected payloads, shellcode buffers).
   - `[!PROT  ]`: Protection transitions (`RW` flipped to `RX` or `RWX`).
@@ -103,6 +118,7 @@ Deadeye is built exclusively for defensive analysis, triage, and detection engin
 
 | Shortcut | View / Action | Description |
 |:---|:---|:---|
+| `Ctrl+A` | **Attach to Process** | Opens debugger-style process & window picker with instant search and priority window sorting. |
 | `Ctrl+1` | **Triage Findings View** | Lists all evaluated regions sorted strictly by threat severity descending. |
 | `Ctrl+2` | **Memory Map View** | Linear address walk showing all committed pages with entropy and hit badges. |
 | `Ctrl+3` | **Behavior Tracker View** | Monitored regions showing samples, cycles, changed %, and detection flags. |

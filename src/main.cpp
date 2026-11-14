@@ -112,6 +112,7 @@ constexpr int SEV_MIN_LOW = 10;
 #define ID_BTN_EXPORT_JSON 119
 #define ID_BTN_DIFF_PROC 121
 #define ID_BTN_YARA 122
+#define ID_BTN_ATTACH 123
 #define IDT_HEARTBEAT 1001
 
 // Menu Item IDs
@@ -121,6 +122,7 @@ constexpr int SEV_MIN_LOW = 10;
 #define IDM_FILE_THEME_LIGHT 2004
 #define IDM_FILE_THEME_DARK 2005
 #define IDM_FILE_EXIT 2006
+#define IDM_FILE_ATTACH 2007
 
 #define IDM_EDIT_COPY_ADDR 2010
 #define IDM_EDIT_COPY_HEX 2011
@@ -523,6 +525,8 @@ PageEntropyProfile compute_region_entropy_profile(MemorySource &source, uintptr_
 void run_behavior_tracker_tick(std::shared_ptr<MemorySource> source, HWND hwnd);
 void extract_all_strings_from_source(std::shared_ptr<MemorySource> source, const std::vector<RegionInfo> &regions, int selected_idx, size_t min_len);
 std::string classify_string_tag(const std::string &s);
+LRESULT CALLBACK AttachDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+void open_attach_process_dialog(HWND hParent);
 
 // Application Color Themes
 enum class AppTheme
@@ -1811,6 +1815,7 @@ std::string export_triage_json(const TriageReport &report)
 
 static HWND g_hwnd_main = nullptr;
 static HWND g_edit_pid = nullptr;
+static HWND g_btn_attach = nullptr;
 static HWND g_btn_load = nullptr;
 static HWND g_btn_triage = nullptr;
 static HWND g_edit_pattern = nullptr;
@@ -1950,7 +1955,7 @@ void apply_theme_switch(HWND hwnd, AppTheme new_theme)
     if (g_edit_hex) InvalidateRect(g_edit_hex, nullptr, TRUE);
     if (g_lbl_triage_reasons) InvalidateRect(g_lbl_triage_reasons, nullptr, TRUE);
     if (g_lbl_status) InvalidateRect(g_lbl_status, nullptr, TRUE);
-    HWND btns[] = { g_btn_load, g_btn_triage, g_btn_search, g_btn_next_hit, g_btn_export_json, g_btn_snap, g_btn_clear_snaps, g_btn_prev_page, g_btn_next_page, g_btn_diff_proc, g_btn_yara };
+    HWND btns[] = { g_btn_attach, g_btn_load, g_btn_triage, g_btn_search, g_btn_next_hit, g_btn_export_json, g_btn_snap, g_btn_clear_snaps, g_btn_prev_page, g_btn_next_page, g_btn_diff_proc, g_btn_yara };
     for (HWND b : btns) { if (b) InvalidateRect(b, nullptr, TRUE); }
     set_status((g_theme == AppTheme::Dark) ? "Theme switched to Modern Dark." : "Theme switched to Classic Light.");
 }
@@ -3437,6 +3442,7 @@ DWORD WINAPI WorkerThreadProc(LPVOID param)
 
 void enable_ui_controls(BOOL enable)
 {
+    EnableWindow(g_btn_attach, enable);
     EnableWindow(g_btn_load, enable);
     EnableWindow(g_btn_triage, enable);
     EnableWindow(g_btn_search, enable);
@@ -4427,6 +4433,7 @@ HMENU create_application_menu()
 
     // 1. File Menu
     HMENU hFileMenu = CreatePopupMenu();
+    AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_ATTACH, "&Attach to Process...\tCtrl+A");
     AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_OPEN_SOURCE, "&Open Memory Source...\tCtrl+O");
     AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_TRIAGE, "Run Defensive &Triage\tCtrl+T");
     AppendMenuA(hFileMenu, MF_STRING, IDM_FILE_EXPORT_JSON, "&Export Triage JSON...\tCtrl+S");
@@ -4548,18 +4555,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         g_edit_pid = CreateWindowA("EDIT", "",
                                    WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
-                                   x, M, 64, RH, hwnd, reinterpret_cast<HMENU>(ID_EDIT_PID), hInst, nullptr);
-        x += 68;
+                                   x, M, 56, RH, hwnd, reinterpret_cast<HMENU>(ID_EDIT_PID), hInst, nullptr);
+        x += 60;
+
+        g_btn_attach = CreateWindowA("BUTTON", "Attach...",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                     x, M, 66, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_ATTACH), hInst, nullptr);
+        x += 70;
 
         g_btn_load = CreateWindowA("BUTTON", "Load",
                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                   x, M, 52, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_LOAD), hInst, nullptr);
-        x += 56;
+                                   x, M, 48, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_LOAD), hInst, nullptr);
+        x += 52;
 
         g_btn_triage = CreateWindowA("BUTTON", "Triage",
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-                                     x, M, 62, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_TRIAGE), hInst, nullptr);
-        x += 68;
+                                     x, M, 58, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_TRIAGE), hInst, nullptr);
+        x += 64;
 
         HWND lbl_pat = CreateWindowA("STATIC", "Search Hex:", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
                                      x, M, 76, RH, hwnd, nullptr, hInst, nullptr);
@@ -4567,8 +4579,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         g_edit_pattern = CreateWindowA("EDIT", "",
                                        WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
-                                       x, M, 220, RH, hwnd, reinterpret_cast<HMENU>(ID_EDIT_PATTERN), hInst, nullptr);
-        x += 224;
+                                       x, M, 200, RH, hwnd, reinterpret_cast<HMENU>(ID_EDIT_PATTERN), hInst, nullptr);
+        x += 204;
 
         g_btn_search = CreateWindowA("BUTTON", "Search",
                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
@@ -4673,7 +4685,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                      M, 0, 800, 18, hwnd, nullptr, hInst, nullptr);
 
         HWND ui_items[] = {
-            lbl_pid, g_edit_pid, g_btn_load, g_btn_triage, lbl_pat, g_edit_pattern, g_btn_search,
+            lbl_pid, g_edit_pid, g_btn_attach, g_btn_load, g_btn_triage, lbl_pat, g_edit_pattern, g_btn_search,
             g_btn_next_hit, g_chk_hits_only, g_chk_heartbeat, g_btn_diff_proc, g_btn_yara,
             g_combo_view_mode, g_combo_min_sev, g_chk_hide_clean, g_btn_export_json,
             g_lbl_hex_info, g_btn_snap, g_combo_diff, g_btn_clear_snaps,
@@ -4687,6 +4699,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         // Modernize all push buttons with sleek flat rounded styling and interactive hover effects
         make_button_modern(g_btn_triage, ModernButtonStyle::Primary);
         make_button_modern(g_btn_export_json, ModernButtonStyle::Accent);
+        make_button_modern(g_btn_attach, ModernButtonStyle::Accent);
         make_button_modern(g_btn_load, ModernButtonStyle::Standard);
         make_button_modern(g_btn_search, ModernButtonStyle::Standard);
         make_button_modern(g_btn_next_hit, ModernButtonStyle::Standard);
@@ -4703,6 +4716,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         // Build global keyboard accelerators
         ACCEL accels[] = {
+            { FCONTROL | FVIRTKEY, 'A', IDM_FILE_ATTACH },
             { FCONTROL | FVIRTKEY, 'O', IDM_FILE_OPEN_SOURCE },
             { FCONTROL | FVIRTKEY, 'T', ID_BTN_TRIAGE },
             { FCONTROL | FVIRTKEY, 'S', ID_BTN_EXPORT_JSON },
@@ -4877,7 +4891,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         int id = LOWORD(wp);
         int code = HIWORD(wp);
 
-        if (id == ID_BTN_LOAD)
+        if (id == ID_BTN_ATTACH)
+        {
+            open_attach_process_dialog(hwnd);
+        }
+        else if (id == IDM_FILE_ATTACH)
+        {
+            HWND focus = GetFocus();
+            if (focus == g_edit_pattern || focus == g_edit_hex || focus == g_edit_pid)
+            {
+                SendMessageA(focus, EM_SETSEL, 0, -1);
+            }
+            else
+            {
+                open_attach_process_dialog(hwnd);
+            }
+        }
+        else if (id == ID_BTN_LOAD)
         {
             start_worker_task(WorkerTaskType::MemoryMapScan, false);
         }
@@ -5679,7 +5709,7 @@ int run_gui(HINSTANCE hInst, int nCmdShow)
 {
     INITCOMMONCONTROLSEX icc = {};
     icc.dwSize = sizeof(icc);
-    icc.dwICC = ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES;
+    icc.dwICC = ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES | ICC_LISTVIEW_CLASSES;
     InitCommonControlsEx(&icc);
 
     HICON hIconBig = static_cast<HICON>(LoadImageA(hInst, MAKEINTRESOURCEA(IDI_APP), IMAGE_ICON,
@@ -5723,6 +5753,16 @@ int run_gui(HINSTANCE hInst, int nCmdShow)
     wcStr.hCursor = LoadCursorA(nullptr, IDC_ARROW);
     wcStr.hIcon = hIconSmall;
     RegisterClassExA(&wcStr);
+
+    WNDCLASSEXA wcAttach = {};
+    wcAttach.cbSize = sizeof(wcAttach);
+    wcAttach.lpfnWndProc = AttachDlgProc;
+    wcAttach.hInstance = hInst;
+    wcAttach.hbrBackground = nullptr;
+    wcAttach.lpszClassName = "DeadeyeAttachDlg";
+    wcAttach.hCursor = LoadCursorA(nullptr, IDC_ARROW);
+    wcAttach.hIcon = hIconSmall;
+    RegisterClassExA(&wcAttach);
 
     HWND hwnd = CreateWindowA("DeadeyeHexViewer", "Deadeye",
                               WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
