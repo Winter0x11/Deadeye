@@ -291,14 +291,20 @@ std::string escape_json(const std::string &s)
 {
     std::string out;
     out.reserve(s.size() + 16);
-    for (char c : s)
+    for (unsigned char c : s)
     {
         if (c == '\\') out += "\\\\";
         else if (c == '"') out += "\\\"";
         else if (c == '\n') out += "\\n";
         else if (c == '\r') out += "\\r";
         else if (c == '\t') out += "\\t";
-        else out += c;
+        else if (c < 0x20)
+        {
+            char esc[8];
+            std::snprintf(esc, sizeof(esc), "\\u%04X", c);
+            out += esc;
+        }
+        else out += static_cast<char>(c);
     }
     return out;
 }
