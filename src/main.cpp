@@ -61,34 +61,7 @@ static const SIZE_T CLI_CHUNK_SIZE = 1024 * 1024; // 1 MB per chunk read
 static const SIZE_T VIEW_PAGE_SIZE = 64 * 1024;   // 64 KB per GUI page
 static const size_t MAX_HITS_PER_REGION = 10000;  // Max pattern matches tracked per region
 
-// Triage Severity Scoring Weights & Thresholds
-constexpr int WEIGHT_INJECTED_PE = 50;     // MZ/PE header detected in MEM_PRIVATE
-constexpr int WEIGHT_UNLINKED_MODULE = 45; // Image region unlinked from PEB loader list
-constexpr int WEIGHT_PRIVATE_RWX = 40;     // Private memory with RWX/RXC protection
-constexpr int WEIGHT_WRITE_THEN_FLIP = 35; // AllocationProtect writable, Protect executable
-constexpr int WEIGHT_UNBACKED_EXEC = 25;   // Executable unbacked by MEM_IMAGE
-constexpr int WEIGHT_BEHAVIOR_UNPACK = 50; // Memory flipped to executable with byte changes / entropy shift
-constexpr int WEIGHT_SLEEP_OBFUSCATION = 65; // Protection/entropy oscillating across heartbeat ticks
-
-// New Static Triage Scoring Weights (Entropy Profiling)
-constexpr int WEIGHT_HIGH_ENTROPY_EXEC = 35;     // Executable region (or page) with entropy >= 7.2
-constexpr int WEIGHT_HIGH_ENTROPY_PRIVATE = 20;  // MEM_PRIVATE non-executable region >= 7.4 over at least 16 KB
-
-// Behavioral Detection Scoring Weights (Time-Series Behavior Tracker)
-constexpr int WEIGHT_SLEEP_MASK_SUSPECT = 40;    // Oscillates between low/high entropy and/or exec <-> non-exec/NOACCESS >= 3 cycles
-constexpr int WEIGHT_KEY_ROTATION_SUSPECT = 35;  // High entropy with changing content hash & repeating XOR delta
-constexpr int WEIGHT_DECRYPT_ON_WAKE = 35;       // Sharp entropy drop + new strings appearing vs baseline
-
-// Static File-Derived Triage Severity Scoring Weights (Mapped PE & Raw Files)
-constexpr int WEIGHT_STATIC_WX_SECTION = 50;        // Section marked writable and executable (W+X)
-constexpr int WEIGHT_STATIC_EP_OUTSIDE_EXEC = 45;   // Entry point outside executable sections
-constexpr int WEIGHT_STATIC_EXEC_HIGH_ENTROPY = 40; // Executable section with high Shannon entropy (>7.2)
-constexpr int WEIGHT_STATIC_NONTRIVIAL_OVERLAY = 25;// Non-trivial overlay after last section (> 512 bytes)
-
-constexpr int SEV_MIN_CRITICAL = 80;
-constexpr int SEV_MIN_HIGH = 50;
-constexpr int SEV_MIN_MEDIUM = 25;
-constexpr int SEV_MIN_LOW = 10;
+#include "core/scoring.hpp"
 
 // Control IDs for GUI child windows
 #define ID_EDIT_PID 101
@@ -5803,10 +5776,49 @@ int run_gui(HINSTANCE hInst, int nCmdShow)
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
     (void)hPrevInstance;
-    (void)lpCmdLine;
 
     // Acquire SeDebugPrivilege so elevated runs can inspect system services
     enable_debug_privilege();
+
+    if (lpCmdLine != nullptr && std::strstr(lpCmdLine, "--json") != nullptr)
+    {
+        const char *p = std::strstr(lpCmdLine, "--json");
+        p += 6;
+        while (*p == ' ') p++;
+        char pid_str[64] = {};
+        char out_path[MAX_PATH] = {};
+        if (std::sscanf(p, "%63s %259s", pid_str, out_path) == 2)
+        {
+            DWORD target_pid = 0;
+            if (parse_pid_string(pid_str, target_pid) && target_pid != 0)
+            {
+                auto live_src = std::make_shared<LiveProcessSource>(target_pid);
+                if (live_src->get_raw_handle() != nullptr)
+                {
+                    std::vector<RegionInfo> regions;
+                    std::string err;
+                    if (live_src->query_regions(regions, err))
+                    {
+                        TriageReport report = run_source_triage(live_src, regions);
+                        std::string json_data = export_triage_json(report);
+                        std::string out_file = out_path;
+                        if (out_file.size() >= 2 && out_file.front() == '"' && out_file.back() == '"')
+                        {
+                            out_file = out_file.substr(1, out_file.size() - 2);
+                        }
+                        FILE *fp = std::fopen(out_file.c_str(), "wb");
+                        if (fp != nullptr)
+                        {
+                            std::fwrite(json_data.data(), 1, json_data.size(), fp);
+                            std::fclose(fp);
+                            return 0;
+                        }
+                    }
+                }
+            }
+            return 1;
+        }
+    }
 
     return run_gui(hInstance, nCmdShow);
 }

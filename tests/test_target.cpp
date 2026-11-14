@@ -469,8 +469,13 @@ void print_banner(DWORD pid)
     std::cout << "======================================================================\n\n";
 }
 
-int main()
+int main(int argc, char *argv[])
 {
+    if (argc > 1 && (std::strcmp(argv[1], "0") == 0 || std::strcmp(argv[1], "noauto") == 0 || std::strcmp(argv[1], "pause") == 0))
+    {
+        g_auto_pilot.store(false);
+    }
+
     DWORD pid = GetCurrentProcessId();
 
     init_sleep_region();

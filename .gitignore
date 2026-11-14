@@ -2,3 +2,4 @@ build/
 *.exe
 *.o
 *.obj
+tests/triage_current.json
