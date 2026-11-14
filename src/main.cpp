@@ -147,94 +147,7 @@ static const SIZE_T VIEW_PAGE_SIZE = 64 * 1024;   // 64 KB per GUI page
 #define WM_TRIAGE_COMPLETE (WM_USER + 3)
 #define WM_BEHAVIOR_TICK_DONE (WM_USER + 4)
 
-// Tier 1: Process-Wide Memory Diff Structures
-struct ProcessRegionSnapshot
-{
-    uintptr_t base = 0;
-    SIZE_T size = 0;
-    DWORD state = 0;
-    DWORD type = 0;
-    DWORD protect = 0;
-    DWORD alloc_protect = 0;
-    uintptr_t alloc_base = 0;
-    uint64_t content_hash = 0;
-    double entropy = 0.0;
-    bool has_pe = false;
-    bool is_unbacked = false;
-    bool is_rwx = false;
-    bool is_write_then_flip = false;
-    bool is_readable = false;
-};
-
-struct ProcessSnapshotSession
-{
-    DWORD pid = 0;
-    std::string process_name;
-    std::string timestamp_str;
-    SIZE_T total_committed_bytes = 0;
-    std::vector<ProcessRegionSnapshot> regions;
-};
-
-enum class ProcessDiffKind
-{
-    Appeared,       // [NEW]
-    Disappeared,    // [REMOVED]
-    ProtectionChg,  // [PROT_CHG]
-    ContentChg,     // [MODIFIED]
-    Unchanged
-};
-
-struct ProcessDiffItem
-{
-    ProcessDiffKind kind = ProcessDiffKind::Unchanged;
-    uintptr_t base = 0;
-    SIZE_T size = 0;
-    DWORD type = 0;
-    DWORD old_protect = 0;
-    DWORD new_protect = 0;
-    double old_entropy = 0.0;
-    double new_entropy = 0.0;
-    uint64_t old_hash = 0;
-    uint64_t new_hash = 0;
-    bool has_pe = false;
-    bool is_rwx = false;
-    bool is_unbacked = false;
-    bool is_unpack = false;
-    std::string summary;
-};
-
-// Tier 1: String Extraction & Categorization
-struct RevealedString
-{
-    std::string text;
-    std::string category; // "[URL] ", "[IP]  ", "[PATH]", "[CMD] ", "[REG] ", "[STR] "
-    uintptr_t addr = 0;
-};
-
-// Tier 1: YARA Generation & False-Positive Testing
-struct YaraWildcardResult
-{
-    std::string hex_pattern;
-    size_t total_bytes = 0;
-    size_t wildcard_count = 0;
-    std::vector<std::string> wildcards_applied;
-};
-
-struct FalsePositiveMatch
-{
-    DWORD pid = 0;
-    std::string process_name;
-    uintptr_t match_addr = 0;
-};
-
-struct FalsePositiveReport
-{
-    size_t total_processes_checked = 0;
-    size_t total_processes_scanned = 0;
-    SIZE_T total_bytes_scanned = 0;
-    std::vector<FalsePositiveMatch> matches;
-    DWORD elapsed_ms = 0;
-};
+#include "core/behavior.hpp"
 
 // Application View Modes
 enum class ViewMode
@@ -244,105 +157,6 @@ enum class ViewMode
     BehaviorTracker = 2,
     StringsView = 3,
     ProcessDiff = 4
-};
-
-// ----------------------------------------------------------------------------
-// Tier 1 Behavior Analysis: Entropy, Strings, and Time-Series Behavior Tracking
-// ----------------------------------------------------------------------------
-
-struct ExtractedStringItem
-{
-    uintptr_t addr = 0;
-    std::string encoding; // "ASCII" or "UTF-16LE"
-    size_t length = 0;
-    std::string text;     // Capped to 256 chars for UI
-    std::string tag_hint; // "[URL] (hint)", "[IP] (hint)", "[DOMAIN] (hint)", "[PATH] (hint)", "[REG] (hint)"
-    uint64_t content_hash = 0; // 64-bit FNV-1a
-    bool is_new = false;
-    uintptr_t region_base = 0;
-};
-
-struct TrackedRegionKey
-{
-    uintptr_t base = 0;
-    uintptr_t alloc_base = 0;
-    uint32_t generation = 0;
-
-    bool operator==(const TrackedRegionKey &o) const
-    {
-        return base == o.base && alloc_base == o.alloc_base && generation == o.generation;
-    }
-};
-
-struct TrackedRegionKeyHash
-{
-    size_t operator()(const TrackedRegionKey &k) const
-    {
-        size_t h = std::hash<uintptr_t>()(k.base);
-        h ^= std::hash<uintptr_t>()(k.alloc_base) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<uint32_t>()(k.generation) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        return h;
-    }
-};
-
-struct RegionSampleRecord
-{
-    uint64_t timestamp_ms = 0;
-    DWORD protect = 0;
-    DWORD state = 0;
-    bool is_unreadable = false;
-    uint64_t content_hash = 0;
-    double avg_entropy = 0.0;
-    double changed_fraction = 0.0; // 0.0 to 1.0 vs previous sample
-    std::vector<uint8_t> sample_bytes; // Capped to 4096 bytes for XOR delta
-};
-
-static const size_t RING_BUFFER_CAP = 120;
-
-struct WatchedRegionState
-{
-    TrackedRegionKey key;
-    SIZE_T size = 0;
-    DWORD type = 0;
-    DWORD alloc_protect = 0;
-    bool is_pinned = false;
-    bool is_deallocated = false;
-
-    // Ring buffer of last 120 samples
-    std::vector<RegionSampleRecord> ring_samples;
-    size_t total_samples = 0;
-
-    // Behavioral Detection Findings
-    int behavior_score = 0;
-    std::vector<std::string> behavior_flags; // SLEEP_MASK_SUSPECT, KEY_ROTATION_SUSPECT, DECRYPT_ON_WAKE
-    std::string evidence_summary;
-
-    // Evidence Structs
-    struct SleepEvidence
-    {
-        int cycles = 0;
-        double period_ms = 0.0;
-        double min_entropy = 0.0;
-        double max_entropy = 0.0;
-        std::string protect_seq;
-    } sleep_evidence;
-
-    struct KeyRotationEvidence
-    {
-        double avg_entropy = 0.0;
-        double avg_changed_frac = 0.0;
-        size_t xor_period = 0;
-        std::vector<uint8_t> candidate_delta_key;
-        std::string note;
-    } key_evidence;
-
-    struct DecryptOnWakeEvidence
-    {
-        double entropy_before = 0.0;
-        double entropy_after = 0.0;
-        size_t new_strings_count = 0;
-        std::vector<std::string> sample_strings; // up to 10 strings
-    } decrypt_evidence;
 };
 
 // Strings Subsystem State
@@ -364,10 +178,6 @@ static std::atomic<bool> g_tracker_busy{false};
 static std::atomic<bool> g_target_process_exited{false};
 static size_t g_tracker_rotating_idx = 0;
 
-// Forward declarations of Behavior Analysis engine functions implemented in tier1.inl
-void run_behavior_tracker_tick(std::shared_ptr<MemorySource> source, HWND hwnd);
-void extract_all_strings_from_source(std::shared_ptr<MemorySource> source, const std::vector<RegionInfo> &regions, int selected_idx, size_t min_len);
-std::string classify_string_tag(const std::string &s);
 LRESULT CALLBACK AttachDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 void open_attach_process_dialog(HWND hParent);
 
@@ -2077,7 +1887,20 @@ DWORD WINAPI WorkerThreadProc(LPVOID param)
 
     if (res->task_type == WorkerTaskType::BehaviorTick)
     {
-        run_behavior_tracker_tick(source, hwnd);
+        BehaviorTrackerContext ctx;
+        ctx.proc = get_or_open_target_proc(source->get_pid());
+        ctx.watched_regions = &g_watched_regions;
+        ctx.region_generations = &g_region_generations;
+        ctx.regions = &g_regions;
+        ctx.triage_report = &g_triage_report;
+        ctx.string_baselines = &g_string_baselines;
+        ctx.watch_all_priv_exec = g_tracker_watch_all_priv_exec.load();
+        ctx.rotating_idx = &g_tracker_rotating_idx;
+        ctx.total_samples = &g_tracker_total_samples;
+        ctx.partial_samples = &g_tracker_partial_samples;
+        ctx.target_process_exited = &g_target_process_exited;
+
+        run_behavior_tracker_tick(source, ctx);
         g_tracker_busy.store(false);
         PostMessageA(hwnd, WM_BEHAVIOR_TICK_DONE, 0, 0);
         delete res;
@@ -2870,7 +2693,1533 @@ void copy_text_to_clipboard(HWND hwnd, const std::string &text)
     CloseClipboard();
 }
 
-#include "tier1.inl"
+void on_capture_baseline()
+{
+    if (g_current_pid == 0)
+    {
+        char pid_buf[64] = {};
+        GetWindowTextA(g_edit_pid, pid_buf, sizeof(pid_buf));
+        DWORD parsed_pid = 0;
+        if (parse_pid_string(pid_buf, parsed_pid) && parsed_pid != 0)
+        {
+            g_current_pid = parsed_pid;
+        }
+        else
+        {
+            MessageBoxA(g_hwnd_main, "Please enter a valid numeric target PID first before capturing a baseline.", "Deadeye Process Diff", MB_OK | MB_ICONWARNING);
+            return;
+        }
+    }
+
+    std::string err;
+    set_status("Capturing full process baseline snapshot (PID " + std::to_string(g_current_pid) + ")...");
+    UpdateWindow(g_lbl_status);
+
+    if (capture_process_snapshot_session(g_current_pid, g_process_baseline, err))
+    {
+        g_has_baseline = true;
+        char msg[160];
+        std::snprintf(msg, sizeof(msg), "Baseline captured: %zu committed regions (%s) for PID %u (%s)",
+                      g_process_baseline.regions.size(),
+                      fmt_size_short(g_process_baseline.total_committed_bytes).c_str(),
+                      static_cast<unsigned int>(g_process_baseline.pid),
+                      g_process_baseline.process_name.c_str());
+        set_status(msg);
+        MessageBoxA(g_hwnd_main, msg, "Deadeye Process Diff", MB_OK | MB_ICONINFORMATION);
+    }
+    else
+    {
+        set_status("[ERROR] " + err);
+        MessageBoxA(g_hwnd_main, err.c_str(), "Deadeye Process Diff Error", MB_OK | MB_ICONERROR);
+    }
+}
+
+void on_capture_diff()
+{
+    if (g_current_pid == 0)
+    {
+        char pid_buf[64] = {};
+        GetWindowTextA(g_edit_pid, pid_buf, sizeof(pid_buf));
+        DWORD parsed_pid = 0;
+        if (parse_pid_string(pid_buf, parsed_pid) && parsed_pid != 0)
+        {
+            g_current_pid = parsed_pid;
+        }
+        else
+        {
+            MessageBoxA(g_hwnd_main, "Please enter a valid numeric target PID first.", "Deadeye Process Diff", MB_OK | MB_ICONWARNING);
+            return;
+        }
+    }
+
+    if (!g_has_baseline)
+    {
+        on_capture_baseline();
+        if (g_has_baseline)
+        {
+            MessageBoxA(g_hwnd_main,
+                        "Baseline snapshot captured successfully!\n\n"
+                        "Now run your target malware sample or trigger suspicious activity,\n"
+                        "then click 'Diff Proc' again (or press Ctrl+D) to compute the diff.",
+                        "Deadeye Baseline Captured", MB_OK | MB_ICONINFORMATION);
+        }
+        return;
+    }
+
+    std::string err;
+    set_status("Capturing current process snapshot and computing diff...");
+    UpdateWindow(g_lbl_status);
+
+    if (capture_process_snapshot_session(g_current_pid, g_process_target, err))
+    {
+        g_has_target = true;
+        compute_process_diff(g_process_baseline, g_process_target, g_process_diffs);
+
+        // Switch to Process Diff view
+        g_view_mode = ViewMode::ProcessDiff;
+        SendMessageA(g_combo_view_mode, CB_SETCURSEL, 2, 0);
+        populate_region_list();
+
+        size_t new_cnt = 0, prot_cnt = 0, mod_cnt = 0, del_cnt = 0;
+        for (const auto &d : g_process_diffs)
+        {
+            if (d.kind == ProcessDiffKind::Appeared) new_cnt++;
+            else if (d.kind == ProcessDiffKind::ProtectionChg) prot_cnt++;
+            else if (d.kind == ProcessDiffKind::ContentChg) mod_cnt++;
+            else if (d.kind == ProcessDiffKind::Disappeared) del_cnt++;
+        }
+
+        char msg[220];
+        std::snprintf(msg, sizeof(msg),
+                      "Diff complete: %zu changes detected | %zu new regions, %zu protection flips, %zu modified, %zu freed",
+                      g_process_diffs.size(), new_cnt, prot_cnt, mod_cnt, del_cnt);
+        set_status(msg);
+    }
+    else
+    {
+        set_status("[ERROR] " + err);
+        MessageBoxA(g_hwnd_main, err.c_str(), "Deadeye Process Diff Error", MB_OK | MB_ICONERROR);
+    }
+}
+
+void on_save_diff_session()
+{
+    if (!g_has_baseline && !g_has_target)
+    {
+        MessageBoxA(g_hwnd_main, "No process session snapshots to save.", "Deadeye Session Export", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    const ProcessSnapshotSession &session_to_save = g_has_target ? g_process_target : g_process_baseline;
+
+    char file_buf[MAX_PATH] = {};
+    std::string def_name = "deadeye_session_" + std::to_string(session_to_save.pid) + ".json";
+    std::strncpy(file_buf, def_name.c_str(), sizeof(file_buf) - 1);
+
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_hwnd_main;
+    ofn.lpstrFilter = "JSON Session Files (*.json)\0*.json\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFile = file_buf;
+    ofn.nMaxFile = sizeof(file_buf);
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+    ofn.lpstrDefExt = "json";
+
+    if (GetSaveFileNameA(&ofn))
+    {
+        if (save_process_session_to_file(session_to_save, ofn.lpstrFile))
+        {
+            set_status("Session saved successfully to " + std::string(ofn.lpstrFile));
+            MessageBoxA(g_hwnd_main, "Process snapshot session exported successfully.", "Deadeye Session Export", MB_OK | MB_ICONINFORMATION);
+        }
+        else
+        {
+            MessageBoxA(g_hwnd_main, "Failed to write session file.", "Deadeye Session Export Error", MB_OK | MB_ICONERROR);
+        }
+    }
+}
+
+void on_load_diff_session()
+{
+    char file_buf[MAX_PATH] = {};
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_hwnd_main;
+    ofn.lpstrFilter = "JSON Session Files (*.json)\0*.json\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFile = file_buf;
+    ofn.nMaxFile = sizeof(file_buf);
+    ofn.Flags = OFN_FILEMUSTEXIST;
+    ofn.lpstrDefExt = "json";
+
+    if (GetOpenFileNameA(&ofn))
+    {
+        ProcessSnapshotSession loaded_session;
+        if (load_process_session_from_file(ofn.lpstrFile, loaded_session))
+        {
+            if (!g_has_baseline)
+            {
+                g_process_baseline = loaded_session;
+                g_has_baseline = true;
+                set_status("Loaded baseline session: " + loaded_session.process_name + " (" + std::to_string(loaded_session.regions.size()) + " regions)");
+                MessageBoxA(g_hwnd_main, ("Loaded baseline snapshot session from:\n" + std::string(ofn.lpstrFile) + "\n\nYou can now capture a live snapshot or load a second session to compare.").c_str(), "Deadeye Session Load", MB_OK | MB_ICONINFORMATION);
+            }
+            else
+            {
+                g_process_target = loaded_session;
+                g_has_target = true;
+                compute_process_diff(g_process_baseline, g_process_target, g_process_diffs);
+                g_view_mode = ViewMode::ProcessDiff;
+                SendMessageA(g_combo_view_mode, CB_SETCURSEL, 2, 0);
+                populate_region_list();
+                set_status("Loaded target session & computed diff: " + std::to_string(g_process_diffs.size()) + " changes identified.");
+                MessageBoxA(g_hwnd_main, ("Compared loaded session with baseline.\nIdentified " + std::to_string(g_process_diffs.size()) + " differences.").c_str(), "Deadeye Session Diff", MB_OK | MB_ICONINFORMATION);
+            }
+        }
+        else
+        {
+            MessageBoxA(g_hwnd_main, "Failed to parse session JSON file.", "Deadeye Session Load Error", MB_OK | MB_ICONERROR);
+        }
+    }
+}
+
+void evaluate_memory_behavior_heartbeat()
+{
+    if (g_current_pid == 0) return;
+    HANDLE proc = get_or_open_target_proc(g_current_pid);
+    if (!proc) return;
+
+    DWORD now = GetTickCount();
+    std::vector<uint8_t> read_buf(64 * 1024);
+    bool new_detection = false;
+
+    for (auto &reg : g_regions)
+    {
+        if (reg.type == MEM_IMAGE)
+            continue;
+
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQueryEx(proc, reinterpret_cast<LPCVOID>(reg.base), &mbi, sizeof(mbi)) != sizeof(mbi))
+            continue;
+
+        DWORD cur_protect = mbi.Protect;
+        if (reg.last_protect == 0)
+        {
+            reg.last_protect = reg.protect;
+            reg.last_entropy = 0.0;
+            reg.last_hash = 0;
+        }
+
+        if (cur_protect != reg.last_protect)
+        {
+            bool was_non_exec = (reg.last_protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_WRITECOPY)) != 0;
+            bool is_exec = (cur_protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0;
+
+            reg.flip_count++;
+            reg.protect_history.push_back(cur_protect);
+
+            SIZE_T to_read = std::min<SIZE_T>(reg.size, read_buf.size());
+            SIZE_T bytes_read = 0;
+            if (ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(reg.base), read_buf.data(), to_read, &bytes_read) && bytes_read > 0)
+            {
+                uint64_t cur_hash = fnv1a64(read_buf.data(), bytes_read);
+                double cur_entropy = calculate_shannon_entropy(read_buf.data(), bytes_read);
+
+                MemoryTransition tr;
+                tr.timestamp_ms = now;
+                tr.old_protect = reg.last_protect;
+                tr.new_protect = cur_protect;
+                tr.old_entropy = reg.last_entropy;
+                tr.new_entropy = cur_entropy;
+                tr.old_hash = reg.last_hash;
+                tr.new_hash = cur_hash;
+
+                // Unpack detection: non-exec -> exec, bytes mutated or entropy dropped
+                if (was_non_exec && is_exec && (cur_hash != reg.last_hash || cur_entropy < reg.last_entropy - 0.4 || reg.last_hash == 0))
+                {
+                    tr.is_unpack = true;
+                    if (!reg.behavior_unpack_detected)
+                    {
+                        reg.behavior_unpack_detected = true;
+                        new_detection = true;
+                    }
+
+                    // Extract new strings
+                    auto revealed = extract_strings_from_buffer(read_buf.data(), bytes_read, reg.base, 4);
+                    for (const auto &rs : revealed)
+                    {
+                        bool exists = false;
+                        for (const auto &prev : g_revealed_strings)
+                        {
+                            if (prev.addr == rs.addr && prev.text == rs.text)
+                            {
+                                exists = true;
+                                break;
+                            }
+                        }
+                        if (!exists)
+                        {
+                            g_revealed_strings.push_back(rs);
+                        }
+                    }
+                }
+
+                // Sleep obfuscation detection: oscillating across ticks
+                if (reg.flip_count >= 2)
+                {
+                    tr.is_sleep_cycle = true;
+                    if (!reg.sleep_obfuscation_detected)
+                    {
+                        reg.sleep_obfuscation_detected = true;
+                        new_detection = true;
+                    }
+                }
+
+                reg.transitions.push_back(tr);
+                reg.last_hash = cur_hash;
+                reg.last_entropy = cur_entropy;
+            }
+            reg.last_protect = cur_protect;
+        }
+    }
+
+    if (new_detection)
+    {
+        g_triage_report = run_process_triage(proc, g_current_pid, g_regions, nullptr, nullptr, nullptr);
+        populate_region_list();
+        set_status("[BEHAVIOR DETECTED] Unpack or sleep obfuscation transition identified during heartbeat!");
+    }
+}
+
+struct YaraDialogData
+{
+    std::string rule_text;
+    uintptr_t base_addr = 0;
+    DWORD pid = 0;
+    HWND hEditRule = nullptr;
+    HWND hEditReport = nullptr;
+    HWND hBtnTestFP = nullptr;
+    HWND hBtnCopy = nullptr;
+    HWND hBtnSave = nullptr;
+    HWND hBtnClose = nullptr;
+};
+
+LRESULT CALLBACK YaraDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    auto *data = reinterpret_cast<YaraDialogData*>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
+
+    switch (msg)
+    {
+    case WM_CREATE:
+    {
+        CREATESTRUCTA *cs = reinterpret_cast<CREATESTRUCTA*>(lp);
+        data = reinterpret_cast<YaraDialogData*>(cs->lpCreateParams);
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(data));
+
+        HINSTANCE hInst = cs->hInstance;
+
+        HWND lbl1 = CreateWindowA("STATIC", "Generated YARA Rule (Auto-Wildcarded for Displacements, Relocations & Immediates):",
+                                  WS_CHILD | WS_VISIBLE, 12, 12, 730, 18, hwnd, nullptr, hInst, nullptr);
+
+        data->hEditRule = CreateWindowA("EDIT", data->rule_text.c_str(),
+                                        WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | WS_HSCROLL |
+                                            ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_WANTRETURN,
+                                        12, 34, 740, 240, hwnd, reinterpret_cast<HMENU>(3001), hInst, nullptr);
+
+        data->hBtnTestFP = CreateWindowA("BUTTON", "Run False-Positive Test",
+                                         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                         12, 284, 200, 28, hwnd, reinterpret_cast<HMENU>(3002), hInst, nullptr);
+
+        data->hBtnCopy = CreateWindowA("BUTTON", "Copy Rule",
+                                       WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                       222, 284, 100, 28, hwnd, reinterpret_cast<HMENU>(3003), hInst, nullptr);
+
+        data->hBtnSave = CreateWindowA("BUTTON", "Save .yar File...",
+                                       WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                       332, 284, 130, 28, hwnd, reinterpret_cast<HMENU>(3004), hInst, nullptr);
+
+        data->hBtnClose = CreateWindowA("BUTTON", "Close",
+                                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                        652, 284, 100, 28, hwnd, reinterpret_cast<HMENU>(3005), hInst, nullptr);
+
+        HWND lbl2 = CreateWindowA("STATIC", "False-Positive Test Status & Clean Software Verification:",
+                                  WS_CHILD | WS_VISIBLE, 12, 322, 730, 18, hwnd, nullptr, hInst, nullptr);
+
+        data->hEditReport = CreateWindowA("EDIT", "Ready. Click 'Run False-Positive Test' to scan all active running processes on the system.",
+                                          WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL |
+                                              ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+                                          12, 344, 740, 220, hwnd, reinterpret_cast<HMENU>(3006), hInst, nullptr);
+
+        HWND ui_ctrls[] = { lbl1, data->hBtnTestFP, data->hBtnCopy, data->hBtnSave, data->hBtnClose, lbl2 };
+        for (HWND c : ui_ctrls)
+            SendMessageA(c, WM_SETFONT, reinterpret_cast<WPARAM>(g_ui_font), TRUE);
+
+        SendMessageA(data->hEditRule, WM_SETFONT, reinterpret_cast<WPARAM>(g_mono_font), TRUE);
+        SendMessageA(data->hEditReport, WM_SETFONT, reinterpret_cast<WPARAM>(g_mono_font), TRUE);
+
+        make_button_modern(data->hBtnTestFP, ModernButtonStyle::Primary);
+        make_button_modern(data->hBtnCopy, ModernButtonStyle::Standard);
+        make_button_modern(data->hBtnSave, ModernButtonStyle::Accent);
+        make_button_modern(data->hBtnClose, ModernButtonStyle::Standard);
+
+        return 0;
+    }
+
+    case WM_COMMAND:
+    {
+        int id = LOWORD(wp);
+        if (id == 3002) // Run FP Test
+        {
+            if (!data) return 0;
+            int len = GetWindowTextLengthA(data->hEditRule);
+            std::vector<char> buf(len + 1);
+            GetWindowTextA(data->hEditRule, buf.data(), len + 1);
+            std::string rule_str = buf.data();
+
+            std::string hex_str;
+            size_t str_pos = rule_str.find("strings:");
+            if (str_pos != std::string::npos)
+            {
+                size_t sig_brace_start = rule_str.find('{', str_pos);
+                if (sig_brace_start != std::string::npos)
+                {
+                    size_t sig_brace_end = rule_str.find('}', sig_brace_start);
+                    if (sig_brace_end != std::string::npos && sig_brace_end > sig_brace_start)
+                    {
+                        hex_str = rule_str.substr(sig_brace_start + 1, sig_brace_end - sig_brace_start - 1);
+                    }
+                }
+            }
+            if (hex_str.empty())
+            {
+                size_t first_brace = rule_str.find('{');
+                if (first_brace != std::string::npos)
+                {
+                    size_t second_brace = rule_str.find('{', first_brace + 1);
+                    if (second_brace != std::string::npos)
+                    {
+                        size_t second_brace_end = rule_str.find('}', second_brace);
+                        if (second_brace_end != std::string::npos && second_brace_end > second_brace)
+                        {
+                            hex_str = rule_str.substr(second_brace + 1, second_brace_end - second_brace - 1);
+                        }
+                    }
+                }
+            }
+            if (hex_str.empty())
+            {
+                hex_str = rule_str;
+            }
+
+            Pattern pat;
+            std::string perr;
+            if (!parse_pattern(hex_str, pat, perr))
+            {
+                SetWindowTextA(data->hEditReport, ("[ERROR] Invalid signature pattern: " + perr).c_str());
+                return 0;
+            }
+
+            SetWindowTextA(data->hEditReport, "Scanning all running processes on the system... Please wait...");
+            UpdateWindow(data->hEditReport);
+
+            FalsePositiveReport rep = test_rule_false_positives(pat, data->pid);
+
+            std::ostringstream ss;
+            ss << "======================================================================\r\n";
+            ss << "                     FALSE-POSITIVE TEST REPORT                       \r\n";
+            ss << "======================================================================\r\n\r\n";
+            ss << "Target PID (Excluded):      " << data->pid << "\r\n";
+            ss << "Running Processes Scanned:  " << rep.total_processes_scanned << " (out of " << rep.total_processes_checked << " total)\r\n";
+            ss << "Executable Memory Searched: " << fmt_size_short(rep.total_bytes_scanned) << "\r\n";
+            ss << "Scan Time:                  " << rep.elapsed_ms << " ms\r\n\r\n";
+
+            if (rep.matches.empty())
+            {
+                ss << ">>> RESULT: [PASSED - 0 FALSE POSITIVES] <<<\r\n";
+                ss << "The generated signature did not match any clean running software on this system.\r\n";
+                ss << "This rule is highly specific and safe for deployment in detection pipelines.\r\n";
+            }
+            else
+            {
+                ss << ">>> RESULT: [WARNING - " << rep.matches.size() << " FALSE POSITIVES DETECTED] <<<\r\n";
+                ss << "Matches were detected in clean system software:\r\n";
+                for (const auto &m : rep.matches)
+                {
+                    char abuf[32];
+                    std::snprintf(abuf, sizeof(abuf), "0x%016llX", static_cast<unsigned long long>(m.match_addr));
+                    ss << "  * " << m.process_name << " (PID " << m.pid << ") at " << abuf << "\r\n";
+                }
+                ss << "\r\nRecommendation: Restrict wildcards or include anchor instruction prefixes.\r\n";
+            }
+
+            SetWindowTextA(data->hEditReport, ss.str().c_str());
+        }
+        else if (id == 3003) // Copy Rule
+        {
+            if (!data) return 0;
+            int len = GetWindowTextLengthA(data->hEditRule);
+            std::vector<char> buf(len + 1);
+            GetWindowTextA(data->hEditRule, buf.data(), len + 1);
+            copy_text_to_clipboard(hwnd, buf.data());
+            MessageBoxA(hwnd, "YARA rule copied to clipboard.", "Deadeye YARA", MB_OK | MB_ICONINFORMATION);
+        }
+        else if (id == 3004) // Save .yar
+        {
+            if (!data) return 0;
+            int len = GetWindowTextLengthA(data->hEditRule);
+            std::vector<char> buf(len + 1);
+            GetWindowTextA(data->hEditRule, buf.data(), len + 1);
+
+            char file_buf[MAX_PATH] = "deadeye_rule.yar";
+            OPENFILENAMEA ofn = {};
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = hwnd;
+            ofn.lpstrFilter = "YARA Rules (*.yar;*.yara)\0*.yar;*.yara\0All Files (*.*)\0*.*\0";
+            ofn.lpstrFile = file_buf;
+            ofn.nMaxFile = sizeof(file_buf);
+            ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+            ofn.lpstrDefExt = "yar";
+
+            if (GetSaveFileNameA(&ofn))
+            {
+                std::ofstream f(ofn.lpstrFile, std::ios::binary);
+                if (f.is_open())
+                {
+                    f.write(buf.data(), len);
+                    MessageBoxA(hwnd, "Rule saved successfully.", "Deadeye YARA", MB_OK | MB_ICONINFORMATION);
+                }
+            }
+        }
+        else if (id == 3005) // Close
+        {
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    }
+
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORSTATIC:
+    {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        const ThemeColors &tc = get_current_theme();
+        SetTextColor(hdc, tc.text_normal);
+        SetBkColor(hdc, tc.bg_control);
+        return reinterpret_cast<INT_PTR>(g_br_control);
+    }
+
+    case WM_ERASEBKGND:
+    {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, g_br_window);
+        return 1;
+    }
+
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+
+    case WM_DESTROY:
+    {
+        HWND hOwner = GetWindow(hwnd, GW_OWNER);
+        if (hOwner)
+        {
+            EnableWindow(hOwner, TRUE);
+            SetActiveWindow(hOwner);
+        }
+        if (data) delete data;
+        return 0;
+    }
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+void open_yara_dialog(HWND hParent)
+{
+    uintptr_t target_base = 0;
+    if (g_view_mode == ViewMode::ProcessDiff)
+    {
+        if (g_selected_region < g_process_diffs.size())
+        {
+            target_base = g_process_diffs[g_selected_region].base + g_view_offset;
+        }
+    }
+    else
+    {
+        if (g_selected_region < g_regions.size())
+        {
+            target_base = g_regions[g_selected_region].base + g_view_offset;
+        }
+    }
+
+    if (target_base == 0)
+    {
+        MessageBoxA(hParent, "Please select a memory region or bytes in hex view first.", "Deadeye YARA Generator", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    std::vector<uint8_t> target_bytes;
+
+    // Check if user selected text in hex dump
+    DWORD sel_start = 0, sel_end = 0;
+    SendMessageA(g_edit_hex, EM_GETSEL, reinterpret_cast<WPARAM>(&sel_start), reinterpret_cast<LPARAM>(&sel_end));
+    if (sel_start != sel_end)
+    {
+        int len = GetWindowTextLengthA(g_edit_hex);
+        if (len > 0)
+        {
+            std::vector<char> full_text(len + 1);
+            GetWindowTextA(g_edit_hex, full_text.data(), len + 1);
+            std::string sel_text(full_text.data() + sel_start, full_text.data() + sel_end);
+
+            std::istringstream iss(sel_text);
+            std::string tok;
+            while (iss >> tok)
+            {
+                if (tok.size() == 2 && isxdigit(static_cast<unsigned char>(tok[0])) && isxdigit(static_cast<unsigned char>(tok[1])))
+                {
+                    uint8_t b = static_cast<uint8_t>(std::stoul(tok, nullptr, 16));
+                    target_bytes.push_back(b);
+                }
+            }
+        }
+    }
+
+    if (target_bytes.empty())
+    {
+        // Read 64 bytes at current view offset
+        HANDLE proc = get_or_open_target_proc(g_current_pid);
+        if (proc)
+        {
+            target_bytes.resize(64);
+            SIZE_T bytes_read = 0;
+            ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(target_base), target_bytes.data(), 64, &bytes_read);
+            target_bytes.resize(bytes_read);
+        }
+    }
+
+    if (target_bytes.empty())
+    {
+        MessageBoxA(hParent, "Could not read memory bytes at current location to generate rule.", "Deadeye YARA Generator", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    std::string rule_name = "sig_mem_pid" + std::to_string(g_current_pid) + "_" + to_hex_string(target_base).substr(8);
+    YaraWildcardResult wres = auto_wildcard_bytes(target_bytes.data(), target_bytes.size(), target_base, g_current_pid, rule_name);
+    std::string rule_text = generate_yara_rule_text(wres, target_base, g_current_pid, rule_name);
+
+    YaraDialogData *data = new YaraDialogData();
+    data->rule_text = rule_text;
+    data->base_addr = target_base;
+    data->pid = g_current_pid;
+
+    EnableWindow(hParent, FALSE);
+
+    RECT parent_rc;
+    GetWindowRect(hParent, &parent_rc);
+    int dlg_w = 780, dlg_h = 620;
+    int dlg_x = parent_rc.left + (parent_rc.right - parent_rc.left - dlg_w) / 2;
+    int dlg_y = parent_rc.top + (parent_rc.bottom - parent_rc.top - dlg_h) / 2;
+    if (dlg_x < 10) dlg_x = 10;
+    if (dlg_y < 10) dlg_y = 10;
+
+    CreateWindowExA(WS_EX_DLGMODALFRAME, "DeadeyeYaraDlg",
+                    "YARA Rule Generator & False-Positive Validator",
+                    WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                    dlg_x, dlg_y, dlg_w, dlg_h, hParent, nullptr, GetModuleHandleA(nullptr), data);
+}
+
+struct StringsDialogData
+{
+    HWND hFilterEdit = nullptr;
+    HWND hListStrings = nullptr;
+    HWND hBtnCopy = nullptr;
+    HWND hBtnExport = nullptr;
+    HWND hBtnClose = nullptr;
+};
+
+void populate_strings_view(HWND hEdit, const std::string &filter)
+{
+    std::string text;
+    for (const auto &s : g_revealed_strings)
+    {
+        if (!filter.empty() && s.text.find(filter) == std::string::npos && s.category.find(filter) == std::string::npos)
+            continue;
+
+        char abuf[32];
+        std::snprintf(abuf, sizeof(abuf), "0x%016llX", static_cast<unsigned long long>(s.addr));
+        text += s.category + "  " + abuf + "  " + s.text + "\r\n";
+    }
+    if (text.empty())
+    {
+        if (g_revealed_strings.empty())
+            text = "(No strings revealed yet. Enable Heartbeat to monitor payload unpacking/transitions.)\r\n";
+        else
+            text = "(No strings match current filter.)\r\n";
+    }
+    SetWindowTextA(hEdit, text.c_str());
+}
+
+LRESULT CALLBACK StringsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    auto *data = reinterpret_cast<StringsDialogData*>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
+
+    switch (msg)
+    {
+    case WM_CREATE:
+    {
+        CREATESTRUCTA *cs = reinterpret_cast<CREATESTRUCTA*>(lp);
+        data = reinterpret_cast<StringsDialogData*>(cs->lpCreateParams);
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(data));
+        HINSTANCE hInst = cs->hInstance;
+
+        HWND lbl1 = CreateWindowA("STATIC", "Newly Revealed Strings (Extracted after Unpack / Protection Transitions):",
+                                  WS_CHILD | WS_VISIBLE, 12, 10, 720, 18, hwnd, nullptr, hInst, nullptr);
+
+        HWND lbl_note = CreateWindowA("STATIC", "[Note: Monitored via 1-second heartbeat polling. Sub-second transitions may be missed.]",
+                                      WS_CHILD | WS_VISIBLE, 12, 30, 720, 18, hwnd, nullptr, hInst, nullptr);
+
+        HWND lbl_flt = CreateWindowA("STATIC", "Filter:", WS_CHILD | WS_VISIBLE, 12, 54, 42, 20, hwnd, nullptr, hInst, nullptr);
+
+        data->hFilterEdit = CreateWindowA("EDIT", "", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+                                          58, 52, 240, 24, hwnd, reinterpret_cast<HMENU>(4001), hInst, nullptr);
+
+        data->hBtnCopy = CreateWindowA("BUTTON", "Copy All", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                       310, 52, 90, 24, hwnd, reinterpret_cast<HMENU>(4002), hInst, nullptr);
+
+        data->hBtnExport = CreateWindowA("BUTTON", "Export TXT...", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                         408, 52, 110, 24, hwnd, reinterpret_cast<HMENU>(4003), hInst, nullptr);
+
+        data->hBtnClose = CreateWindowA("BUTTON", "Close", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                        642, 52, 90, 24, hwnd, reinterpret_cast<HMENU>(4004), hInst, nullptr);
+
+        data->hListStrings = CreateWindowA("EDIT", "",
+                                           WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | WS_HSCROLL |
+                                               ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL,
+                                           12, 84, 720, 430, hwnd, reinterpret_cast<HMENU>(4005), hInst, nullptr);
+
+        HWND ui_ctrls[] = { lbl1, lbl_note, lbl_flt, data->hFilterEdit, data->hBtnCopy, data->hBtnExport, data->hBtnClose };
+        for (HWND c : ui_ctrls)
+            SendMessageA(c, WM_SETFONT, reinterpret_cast<WPARAM>(g_ui_font), TRUE);
+
+        SendMessageA(data->hListStrings, WM_SETFONT, reinterpret_cast<WPARAM>(g_mono_font), TRUE);
+
+        make_button_modern(data->hBtnCopy, ModernButtonStyle::Standard);
+        make_button_modern(data->hBtnExport, ModernButtonStyle::Accent);
+        make_button_modern(data->hBtnClose, ModernButtonStyle::Standard);
+
+        populate_strings_view(data->hListStrings, "");
+        return 0;
+    }
+
+    case WM_COMMAND:
+    {
+        int id = LOWORD(wp);
+        int code = HIWORD(wp);
+        if (id == 4001 && code == EN_CHANGE)
+        {
+            if (!data) return 0;
+            int len = GetWindowTextLengthA(data->hFilterEdit);
+            std::vector<char> buf(len + 1);
+            GetWindowTextA(data->hFilterEdit, buf.data(), len + 1);
+            populate_strings_view(data->hListStrings, buf.data());
+        }
+        else if (id == 4002) // Copy
+        {
+            if (!data) return 0;
+            int len = GetWindowTextLengthA(data->hListStrings);
+            if (len > 0)
+            {
+                std::vector<char> buf(len + 1);
+                GetWindowTextA(data->hListStrings, buf.data(), len + 1);
+                copy_text_to_clipboard(hwnd, buf.data());
+                MessageBoxA(hwnd, "Revealed strings copied to clipboard.", "Deadeye Strings", MB_OK | MB_ICONINFORMATION);
+            }
+        }
+        else if (id == 4003) // Export
+        {
+            if (!data) return 0;
+            int len = GetWindowTextLengthA(data->hListStrings);
+            if (len > 0)
+            {
+                std::vector<char> buf(len + 1);
+                GetWindowTextA(data->hListStrings, buf.data(), len + 1);
+
+                char file_buf[MAX_PATH] = "revealed_strings.txt";
+                OPENFILENAMEA ofn = {};
+                ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner = hwnd;
+                ofn.lpstrFilter = "Text Files (*.txt)\0*.txt\0All Files (*.*)\0*.*\0";
+                ofn.lpstrFile = file_buf;
+                ofn.nMaxFile = sizeof(file_buf);
+                ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+                ofn.lpstrDefExt = "txt";
+
+                if (GetSaveFileNameA(&ofn))
+                {
+                    std::ofstream f(ofn.lpstrFile, std::ios::binary);
+                    if (f.is_open())
+                    {
+                        f.write(buf.data(), len);
+                        MessageBoxA(hwnd, "Strings exported successfully.", "Deadeye Strings", MB_OK | MB_ICONINFORMATION);
+                    }
+                }
+            }
+        }
+        else if (id == 4004) // Close
+        {
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    }
+
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORSTATIC:
+    {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        const ThemeColors &tc = get_current_theme();
+        SetTextColor(hdc, tc.text_normal);
+        SetBkColor(hdc, tc.bg_control);
+        return reinterpret_cast<INT_PTR>(g_br_control);
+    }
+
+    case WM_ERASEBKGND:
+    {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, g_br_window);
+        return 1;
+    }
+
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+
+    case WM_DESTROY:
+    {
+        HWND hOwner = GetWindow(hwnd, GW_OWNER);
+        if (hOwner)
+        {
+            EnableWindow(hOwner, TRUE);
+            SetActiveWindow(hOwner);
+        }
+        if (data) delete data;
+        return 0;
+    }
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+void open_revealed_strings_dialog(HWND hParent)
+{
+    StringsDialogData *data = new StringsDialogData();
+    EnableWindow(hParent, FALSE);
+
+    RECT parent_rc;
+    GetWindowRect(hParent, &parent_rc);
+    int dlg_w = 760, dlg_h = 560;
+    int dlg_x = parent_rc.left + (parent_rc.right - parent_rc.left - dlg_w) / 2;
+    int dlg_y = parent_rc.top + (parent_rc.bottom - parent_rc.top - dlg_h) / 2;
+    if (dlg_x < 10) dlg_x = 10;
+    if (dlg_y < 10) dlg_y = 10;
+
+    CreateWindowExA(WS_EX_DLGMODALFRAME, "DeadeyeStringsDlg",
+                    "Revealed Strings - Memory Behavior Timeline",
+                    WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                    dlg_x, dlg_y, dlg_w, dlg_h, hParent, nullptr, GetModuleHandleA(nullptr), data);
+}
+
+// ============================================================================
+// Process Attachment Dialog (Debugger-Style Process / Window Picker)
+// ============================================================================
+
+#define ID_ATTACH_SEARCH 5001
+#define ID_ATTACH_LIST 5002
+#define ID_ATTACH_WINDOWS_ONLY 5003
+#define ID_ATTACH_BTN_REFRESH 5004
+#define ID_ATTACH_BTN_ATTACH 5005
+#define ID_ATTACH_BTN_CANCEL 5006
+#define ID_ATTACH_STATUS 5007
+
+struct ProcessListEntry
+{
+    DWORD pid = 0;
+    std::string name;
+    std::string window_title;
+    std::string arch;        // "x64", "x86", or "?"
+    std::string path;
+    bool has_window = false;
+};
+
+struct AttachDialogData
+{
+    HWND hEditSearch = nullptr;
+    HWND hChkWindowsOnly = nullptr;
+    HWND hBtnRefresh = nullptr;
+    HWND hList = nullptr;
+    HWND hLblStatus = nullptr;
+    HWND hBtnAttach = nullptr;
+    HWND hBtnCancel = nullptr;
+
+    std::vector<ProcessListEntry> all_entries;
+    std::vector<ProcessListEntry> filtered_entries;
+
+    int sort_column = -1; // -1 means default: visible windows first, then name alphabetical
+    bool sort_asc = true;
+
+    bool confirmed = false;
+    DWORD selected_pid = 0;
+    std::string selected_name;
+};
+
+struct EnumWindowsAttachContext
+{
+    std::unordered_map<DWORD, std::string> pid_to_title;
+};
+
+static BOOL CALLBACK EnumWindowsAttachProc(HWND hwnd, LPARAM lParam)
+{
+    if (!IsWindowVisible(hwnd))
+        return TRUE;
+
+    if (GetWindow(hwnd, GW_OWNER) != nullptr)
+        return TRUE;
+
+    LONG_PTR ex_style = GetWindowLongPtrA(hwnd, GWL_EXSTYLE);
+    if (ex_style & WS_EX_TOOLWINDOW)
+        return TRUE;
+
+    int len = GetWindowTextLengthA(hwnd);
+    if (len <= 0)
+        return TRUE;
+
+    std::vector<char> title_buf(static_cast<size_t>(len) + 1);
+    GetWindowTextA(hwnd, title_buf.data(), len + 1);
+    std::string title = title_buf.data();
+
+    bool non_ws = false;
+    for (char c : title)
+    {
+        if (!std::isspace(static_cast<unsigned char>(c)))
+        {
+            non_ws = true;
+            break;
+        }
+    }
+    if (!non_ws)
+        return TRUE;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != 0)
+    {
+        auto *ctx = reinterpret_cast<EnumWindowsAttachContext*>(lParam);
+        auto it = ctx->pid_to_title.find(pid);
+        if (it == ctx->pid_to_title.end())
+        {
+            ctx->pid_to_title[pid] = title;
+        }
+        else if (title.length() > it->second.length())
+        {
+            ctx->pid_to_title[pid] = title;
+        }
+    }
+    return TRUE;
+}
+
+static bool is_host_64bit()
+{
+    SYSTEM_INFO si;
+    GetNativeSystemInfo(&si);
+    return (si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 ||
+            si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64);
+}
+
+static void sort_process_entries(AttachDialogData *data)
+{
+    int col = data->sort_column;
+    bool asc = data->sort_asc;
+
+    std::sort(data->all_entries.begin(), data->all_entries.end(), [col, asc](const ProcessListEntry &a, const ProcessListEntry &b) {
+        if (col == 0) // Process Name
+        {
+            std::string na = a.name, nb = b.name;
+            for (char &c : na) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            for (char &c : nb) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (na != nb) return asc ? (na < nb) : (na > nb);
+            return asc ? (a.pid < b.pid) : (a.pid > b.pid);
+        }
+        else if (col == 1) // PID
+        {
+            if (a.pid != b.pid) return asc ? (a.pid < b.pid) : (a.pid > b.pid);
+            return false;
+        }
+        else if (col == 2) // Window Title
+        {
+            std::string ta = a.window_title, tb = b.window_title;
+            for (char &c : ta) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            for (char &c : tb) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (ta != tb) return asc ? (ta < tb) : (ta > tb);
+            return asc ? (a.pid < b.pid) : (a.pid > b.pid);
+        }
+        else if (col == 3) // Arch
+        {
+            if (a.arch != b.arch) return asc ? (a.arch < b.arch) : (a.arch > b.arch);
+            return asc ? (a.pid < b.pid) : (a.pid > b.pid);
+        }
+        else if (col == 4) // Path
+        {
+            std::string pa = a.path, pb = b.path;
+            for (char &c : pa) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            for (char &c : pb) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (pa != pb) return asc ? (pa < pb) : (pa > pb);
+            return asc ? (a.pid < b.pid) : (a.pid > b.pid);
+        }
+
+        // Default sort: entries with visible windows first, then name alphabetical
+        if (a.has_window != b.has_window)
+            return a.has_window > b.has_window;
+        std::string na = a.name, nb = b.name;
+        for (char &c : na) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        for (char &c : nb) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (na != nb) return na < nb;
+        return a.pid < b.pid;
+    });
+}
+
+static void refresh_process_list(AttachDialogData *data)
+{
+    data->all_entries.clear();
+
+    EnumWindowsAttachContext wctx;
+    EnumWindows(EnumWindowsAttachProc, reinterpret_cast<LPARAM>(&wctx));
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE)
+    {
+        PROCESSENTRY32W pe;
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(hSnap, &pe))
+        {
+            bool sys_64 = is_host_64bit();
+            do
+            {
+                DWORD pid = pe.th32ProcessID;
+                if (pid == 0) // Skip System Idle Process
+                    continue;
+
+                ProcessListEntry entry;
+                entry.pid = pid;
+
+                char name_buf[MAX_PATH] = {};
+                WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, name_buf, sizeof(name_buf), nullptr, nullptr);
+                entry.name = name_buf;
+
+                auto wit = wctx.pid_to_title.find(pid);
+                if (wit != wctx.pid_to_title.end() && !wit->second.empty())
+                {
+                    entry.window_title = wit->second;
+                    entry.has_window = true;
+                }
+
+                entry.arch = "?";
+                entry.path = "";
+
+                // Query architecture and image path strictly read-only
+                HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+                if (!hProc)
+                {
+                    hProc = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+                }
+
+                if (hProc)
+                {
+                    BOOL is_wow64 = FALSE;
+                    if (IsWow64Process(hProc, &is_wow64))
+                    {
+                        if (sys_64)
+                            entry.arch = is_wow64 ? "x86" : "x64";
+                        else
+                            entry.arch = "x86";
+                    }
+
+                    char path_buf[MAX_PATH * 2] = {};
+                    DWORD path_len = static_cast<DWORD>(sizeof(path_buf));
+                    if (QueryFullProcessImageNameA(hProc, 0, path_buf, &path_len) && path_len > 0)
+                    {
+                        entry.path = path_buf;
+                    }
+                    CloseHandle(hProc);
+                }
+
+                data->all_entries.push_back(std::move(entry));
+            } while (Process32NextW(hSnap, &pe));
+        }
+        CloseHandle(hSnap);
+    }
+
+    sort_process_entries(data);
+}
+
+static void apply_process_filter(AttachDialogData *data)
+{
+    char filter_buf[256] = {};
+    if (data->hEditSearch)
+        GetWindowTextA(data->hEditSearch, filter_buf, sizeof(filter_buf));
+    std::string query = filter_buf;
+    for (char &c : query) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    while (!query.empty() && std::isspace(static_cast<unsigned char>(query.front()))) query.erase(query.begin());
+    while (!query.empty() && std::isspace(static_cast<unsigned char>(query.back()))) query.pop_back();
+
+    bool windows_only = false;
+    if (data->hChkWindowsOnly)
+        windows_only = (SendMessageA(data->hChkWindowsOnly, BM_GETCHECK, 0, 0) == BST_CHECKED);
+
+    data->filtered_entries.clear();
+    for (const auto &e : data->all_entries)
+    {
+        if (windows_only && !e.has_window)
+            continue;
+
+        if (query.empty())
+        {
+            data->filtered_entries.push_back(e);
+            continue;
+        }
+
+        // Match name
+        std::string name_lower = e.name;
+        for (char &c : name_lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (name_lower.find(query) != std::string::npos)
+        {
+            data->filtered_entries.push_back(e);
+            continue;
+        }
+
+        // Match window title
+        std::string title_lower = e.window_title;
+        for (char &c : title_lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (title_lower.find(query) != std::string::npos)
+        {
+            data->filtered_entries.push_back(e);
+            continue;
+        }
+
+        // Match decimal PID
+        std::string pid_str = std::to_string(e.pid);
+        if (pid_str.find(query) != std::string::npos)
+        {
+            data->filtered_entries.push_back(e);
+            continue;
+        }
+
+        // Match hex PID
+        char hex_buf[32];
+        snprintf(hex_buf, sizeof(hex_buf), "%lx", static_cast<unsigned long>(e.pid));
+        std::string hex_str = hex_buf;
+        if (hex_str.find(query) != std::string::npos)
+        {
+            data->filtered_entries.push_back(e);
+            continue;
+        }
+        std::string hex_0x = "0x" + hex_str;
+        if (hex_0x.find(query) != std::string::npos)
+        {
+            data->filtered_entries.push_back(e);
+            continue;
+        }
+    }
+}
+
+static void populate_attach_listview(AttachDialogData *data)
+{
+    apply_process_filter(data);
+
+    HWND hList = data->hList;
+    SendMessageA(hList, WM_SETREDRAW, FALSE, 0);
+    ListView_DeleteAllItems(hList);
+
+    for (int i = 0; i < static_cast<int>(data->filtered_entries.size()); ++i)
+    {
+        const auto &e = data->filtered_entries[static_cast<size_t>(i)];
+        LVITEMA item = {};
+        item.mask = LVIF_TEXT | LVIF_PARAM;
+        item.iItem = i;
+        item.iSubItem = 0;
+        item.pszText = const_cast<char*>(e.name.c_str());
+        item.lParam = static_cast<LPARAM>(e.pid);
+        ListView_InsertItem(hList, &item);
+
+        char pid_str[64];
+        snprintf(pid_str, sizeof(pid_str), "%lu (0x%04lX)", static_cast<unsigned long>(e.pid), static_cast<unsigned long>(e.pid));
+        ListView_SetItemText(hList, i, 1, pid_str);
+
+        ListView_SetItemText(hList, i, 2, const_cast<char*>(e.window_title.c_str()));
+        ListView_SetItemText(hList, i, 3, const_cast<char*>(e.arch.c_str()));
+        ListView_SetItemText(hList, i, 4, const_cast<char*>(e.path.c_str()));
+    }
+
+    SendMessageA(hList, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(hList, nullptr, TRUE);
+
+    if (!data->filtered_entries.empty())
+    {
+        ListView_SetItemState(hList, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    }
+
+    size_t win_count = 0;
+    for (const auto &e : data->all_entries)
+    {
+        if (e.has_window) win_count++;
+    }
+    std::string status_str = "Showing " + std::to_string(data->filtered_entries.size()) +
+                             " of " + std::to_string(data->all_entries.size()) +
+                             " processes (" + std::to_string(win_count) + " with windows)";
+    if (data->hLblStatus)
+    {
+        SetWindowTextA(data->hLblStatus, status_str.c_str());
+    }
+}
+
+static void on_attach_confirm(HWND hwnd, AttachDialogData *data)
+{
+    int sel = ListView_GetNextItem(data->hList, -1, LVNI_SELECTED);
+    if (sel < 0 && !data->filtered_entries.empty())
+    {
+        sel = 0;
+    }
+    if (sel < 0 || sel >= static_cast<int>(data->filtered_entries.size()))
+    {
+        MessageBoxA(hwnd, "Please select a target process from the list.", "Deadeye Attach", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    data->selected_pid = data->filtered_entries[static_cast<size_t>(sel)].pid;
+    data->selected_name = data->filtered_entries[static_cast<size_t>(sel)].name;
+    data->confirmed = true;
+
+    DestroyWindow(hwnd);
+}
+
+LRESULT CALLBACK AttachDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    auto *data = reinterpret_cast<AttachDialogData*>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
+
+    switch (msg)
+    {
+    case WM_CREATE:
+    {
+        CREATESTRUCTA *cs = reinterpret_cast<CREATESTRUCTA*>(lp);
+        data = reinterpret_cast<AttachDialogData*>(cs->lpCreateParams);
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(data));
+
+        HINSTANCE hInst = cs->hInstance;
+
+        HWND lbl_search = CreateWindowA("STATIC", "Search:", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
+                                        12, 14, 50, 20, hwnd, nullptr, hInst, nullptr);
+
+        data->hEditSearch = CreateWindowA("EDIT", "",
+                                          WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+                                          68, 12, 240, 24, hwnd, reinterpret_cast<HMENU>(ID_ATTACH_SEARCH), hInst, nullptr);
+
+        data->hChkWindowsOnly = CreateWindowA("BUTTON", "Processes with visible windows only",
+                                              WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+                                              320, 12, 250, 24, hwnd, reinterpret_cast<HMENU>(ID_ATTACH_WINDOWS_ONLY), hInst, nullptr);
+
+        data->hBtnRefresh = CreateWindowA("BUTTON", "Refresh",
+                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                          760, 12, 80, 24, hwnd, reinterpret_cast<HMENU>(ID_ATTACH_BTN_REFRESH), hInst, nullptr);
+
+        data->hList = CreateWindowExA(
+            0, WC_LISTVIEWA, "",
+            WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP |
+                LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+            12, 44, 830, 460, hwnd, reinterpret_cast<HMENU>(ID_ATTACH_LIST), hInst, nullptr);
+
+        SendMessageA(data->hList, LVM_SETEXTENDEDLISTVIEWSTYLE, 0,
+                     LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+
+        LVCOLUMNA col = {};
+        col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+
+        col.pszText = const_cast<char*>("Process Name");
+        col.cx = 170;
+        col.iSubItem = 0;
+        ListView_InsertColumn(data->hList, 0, &col);
+
+        col.pszText = const_cast<char*>("PID");
+        col.cx = 105;
+        col.iSubItem = 1;
+        ListView_InsertColumn(data->hList, 1, &col);
+
+        col.pszText = const_cast<char*>("Window Title");
+        col.cx = 240;
+        col.iSubItem = 2;
+        ListView_InsertColumn(data->hList, 2, &col);
+
+        col.pszText = const_cast<char*>("Arch");
+        col.cx = 60;
+        col.iSubItem = 3;
+        ListView_InsertColumn(data->hList, 3, &col);
+
+        col.pszText = const_cast<char*>("Executable Path");
+        col.cx = 240;
+        col.iSubItem = 4;
+        ListView_InsertColumn(data->hList, 4, &col);
+
+        data->hLblStatus = CreateWindowA("STATIC", "Loading processes...",
+                                         WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE | SS_ENDELLIPSIS,
+                                         12, 516, 620, 22, hwnd, reinterpret_cast<HMENU>(ID_ATTACH_STATUS), hInst, nullptr);
+
+        data->hBtnAttach = CreateWindowA("BUTTON", "Attach",
+                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                                         660, 514, 85, 26, hwnd, reinterpret_cast<HMENU>(ID_ATTACH_BTN_ATTACH), hInst, nullptr);
+
+        data->hBtnCancel = CreateWindowA("BUTTON", "Cancel",
+                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                         755, 514, 85, 26, hwnd, reinterpret_cast<HMENU>(ID_ATTACH_BTN_CANCEL), hInst, nullptr);
+
+        HWND ui_ctrls[] = { lbl_search, data->hEditSearch, data->hChkWindowsOnly, data->hBtnRefresh,
+                            data->hLblStatus, data->hBtnAttach, data->hBtnCancel };
+        for (HWND c : ui_ctrls)
+        {
+            if (c) SendMessageA(c, WM_SETFONT, reinterpret_cast<WPARAM>(g_ui_font), TRUE);
+        }
+        if (data->hList)
+        {
+            SendMessageA(data->hList, WM_SETFONT, reinterpret_cast<WPARAM>(g_ui_font), TRUE);
+        }
+
+        make_button_modern(data->hBtnAttach, ModernButtonStyle::Primary);
+        make_button_modern(data->hBtnCancel, ModernButtonStyle::Standard);
+        make_button_modern(data->hBtnRefresh, ModernButtonStyle::Standard);
+
+        const ThemeColors &tc = get_current_theme();
+        if (g_theme == AppTheme::Dark)
+        {
+            ListView_SetBkColor(data->hList, tc.bg_control);
+            ListView_SetTextBkColor(data->hList, tc.bg_control);
+            ListView_SetTextColor(data->hList, tc.text_normal);
+        }
+        else
+        {
+            ListView_SetBkColor(data->hList, RGB(255, 255, 255));
+            ListView_SetTextBkColor(data->hList, RGB(255, 255, 255));
+            ListView_SetTextColor(data->hList, RGB(20, 20, 20));
+        }
+
+        refresh_process_list(data);
+        populate_attach_listview(data);
+
+        SetFocus(data->hEditSearch);
+        return 0;
+    }
+
+    case WM_SIZE:
+    {
+        if (data && data->hList)
+        {
+            int cw = LOWORD(lp);
+            int ch = HIWORD(lp);
+            if (cw >= 400 && ch >= 250)
+            {
+                int search_w = cw - 12 - 58 - 250 - 90 - 24;
+                if (search_w < 160) search_w = 160;
+                MoveWindow(data->hEditSearch, 68, 12, search_w, 24, TRUE);
+                MoveWindow(data->hChkWindowsOnly, 68 + search_w + 12, 12, 240, 24, TRUE);
+                MoveWindow(data->hBtnRefresh, cw - 12 - 80, 12, 80, 24, TRUE);
+
+                int list_y = 44;
+                int list_h = ch - list_y - 44;
+                if (list_h < 100) list_h = 100;
+                MoveWindow(data->hList, 12, list_y, cw - 24, list_h, TRUE);
+
+                int btm_y = ch - 34;
+                MoveWindow(data->hLblStatus, 12, btm_y + 3, cw - 24 - 190, 22, TRUE);
+                MoveWindow(data->hBtnAttach, cw - 12 - 180, btm_y, 85, 26, TRUE);
+                MoveWindow(data->hBtnCancel, cw - 12 - 85, btm_y, 85, 26, TRUE);
+            }
+        }
+        return 0;
+    }
+
+    case WM_GETMINMAXINFO:
+    {
+        MINMAXINFO *mmi = reinterpret_cast<MINMAXINFO*>(lp);
+        mmi->ptMinTrackSize.x = 680;
+        mmi->ptMinTrackSize.y = 400;
+        return 0;
+    }
+
+    case WM_COMMAND:
+    {
+        int id = LOWORD(wp);
+        int code = HIWORD(wp);
+        if (id == ID_ATTACH_SEARCH && code == EN_CHANGE)
+        {
+            if (data) populate_attach_listview(data);
+        }
+        else if (id == ID_ATTACH_WINDOWS_ONLY)
+        {
+            if (data) populate_attach_listview(data);
+        }
+        else if (id == ID_ATTACH_BTN_REFRESH)
+        {
+            if (data)
+            {
+                refresh_process_list(data);
+                populate_attach_listview(data);
+            }
+        }
+        else if (id == ID_ATTACH_BTN_ATTACH || id == IDOK)
+        {
+            if (data) on_attach_confirm(hwnd, data);
+        }
+        else if (id == ID_ATTACH_BTN_CANCEL || id == IDCANCEL)
+        {
+            DestroyWindow(hwnd);
+        }
+        return 0;
+    }
+
+    case WM_NOTIFY:
+    {
+        NMHDR *nm = reinterpret_cast<NMHDR*>(lp);
+        if (nm && nm->idFrom == ID_ATTACH_LIST && data)
+        {
+            if (nm->code == NM_DBLCLK)
+            {
+                on_attach_confirm(hwnd, data);
+                return 0;
+            }
+            else if (nm->code == LVN_COLUMNCLICK)
+            {
+                NMLISTVIEW *nmlv = reinterpret_cast<NMLISTVIEW*>(lp);
+                int col = nmlv->iSubItem;
+                if (data->sort_column == col)
+                {
+                    data->sort_asc = !data->sort_asc;
+                }
+                else
+                {
+                    data->sort_column = col;
+                    data->sort_asc = true;
+                }
+                sort_process_entries(data);
+                populate_attach_listview(data);
+                return 0;
+            }
+        }
+        break;
+    }
+
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORSTATIC:
+    {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        const ThemeColors &tc = get_current_theme();
+        SetTextColor(hdc, tc.text_normal);
+        SetBkColor(hdc, tc.bg_control);
+        return reinterpret_cast<INT_PTR>(g_br_control);
+    }
+
+    case WM_ERASEBKGND:
+    {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, g_br_window);
+        return 1;
+    }
+
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+
+    case WM_DESTROY:
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+void open_attach_process_dialog(HWND hParent)
+{
+    AttachDialogData state;
+
+    RECT parent_rc = {};
+    GetWindowRect(hParent, &parent_rc);
+    int dlg_w = 860, dlg_h = 560;
+    int dlg_x = parent_rc.left + (parent_rc.right - parent_rc.left - dlg_w) / 2;
+    int dlg_y = parent_rc.top + (parent_rc.bottom - parent_rc.top - dlg_h) / 2;
+    if (dlg_x < 10) dlg_x = 10;
+    if (dlg_y < 10) dlg_y = 10;
+
+    HWND hwnd_dlg = CreateWindowExA(
+        WS_EX_DLGMODALFRAME,
+        "DeadeyeAttachDlg",
+        "Attach to Process - Deadeye",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX | WS_VISIBLE,
+        dlg_x, dlg_y, dlg_w, dlg_h,
+        hParent, nullptr, GetModuleHandleA(nullptr), &state);
+
+    if (hwnd_dlg == nullptr)
+        return;
+
+    EnableWindow(hParent, FALSE);
+
+    MSG msg;
+    while (IsWindow(hwnd_dlg) && GetMessageA(&msg, nullptr, 0, 0))
+    {
+        if (msg.message == WM_KEYDOWN)
+        {
+            if (msg.wParam == VK_ESCAPE)
+            {
+                SendMessageA(hwnd_dlg, WM_COMMAND, IDCANCEL, 0);
+                continue;
+            }
+            if (msg.wParam == VK_RETURN)
+            {
+                SendMessageA(hwnd_dlg, WM_COMMAND, IDOK, 0);
+                continue;
+            }
+            if (msg.wParam == VK_F5)
+            {
+                SendMessageA(hwnd_dlg, WM_COMMAND, ID_ATTACH_BTN_REFRESH, 0);
+                continue;
+            }
+            if (msg.wParam == VK_DOWN && GetFocus() == state.hEditSearch)
+            {
+                SetFocus(state.hList);
+                continue;
+            }
+        }
+        if (!IsDialogMessageA(hwnd_dlg, &msg))
+        {
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
+    }
+
+    EnableWindow(hParent, TRUE);
+    SetForegroundWindow(hParent);
+
+    if (state.confirmed && state.selected_pid != 0)
+    {
+        std::string pid_str = std::to_string(state.selected_pid);
+        if (g_edit_pid != nullptr)
+        {
+            SetWindowTextA(g_edit_pid, pid_str.c_str());
+        }
+
+        std::string msg_text = "Attaching to " + state.selected_name + " (PID " + pid_str + ")...";
+        set_status(msg_text);
+
+        PostMessageA(hParent, WM_COMMAND, ID_BTN_TRIAGE, 0);
+    }
+}
+
 
 struct PeMapDlgState
 {
@@ -4238,7 +5587,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (g_current_source != nullptr && g_has_selection && g_selected_region < g_regions.size())
             {
                 set_status("Extracting ASCII & UTF-16 strings from selected region...");
-                extract_all_strings_from_source(g_current_source, g_regions, static_cast<int>(g_selected_region), g_strings_min_len);
+                extract_all_strings_from_source(g_current_source, g_regions, static_cast<int>(g_selected_region), g_strings_min_len, g_extracted_strings, &g_string_baselines);
                 g_view_mode = ViewMode::StringsView;
                 SendMessageA(g_combo_view_mode, CB_SETCURSEL, 3, 0);
                 populate_region_list();
@@ -4254,7 +5603,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (g_current_source != nullptr && !g_regions.empty())
             {
                 set_status("Extracting ASCII & UTF-16 strings across all regions (capped)...");
-                extract_all_strings_from_source(g_current_source, g_regions, -1, g_strings_min_len);
+                extract_all_strings_from_source(g_current_source, g_regions, -1, g_strings_min_len, g_extracted_strings, &g_string_baselines);
                 g_view_mode = ViewMode::StringsView;
                 SendMessageA(g_combo_view_mode, CB_SETCURSEL, 3, 0);
                 populate_region_list();
