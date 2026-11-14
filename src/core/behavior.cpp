@@ -980,7 +980,7 @@ bool save_process_session_to_file(const ProcessSnapshotSession &session, const s
     out << "{\n";
     out << "  \"deadeye_session\": \"1.0\",\n";
     out << "  \"pid\": " << session.pid << ",\n";
-    out << "  \"process_name\": \"" << session.process_name << "\",\n";
+    out << "  \"process_name\": \"" << escape_json(session.process_name) << "\",\n";
     out << "  \"timestamp\": \"" << session.timestamp_str << "\",\n";
     out << "  \"total_committed_bytes\": " << session.total_committed_bytes << ",\n";
     out << "  \"region_count\": " << session.regions.size() << ",\n";
@@ -1044,21 +1044,30 @@ bool load_process_session_from_file(const std::string &filepath, ProcessSnapshot
 
         if (!in_regions_list)
         {
-            if (line.find("\"pid\":") != std::string::npos)
+            try
             {
-                session.pid = static_cast<DWORD>(std::stoul(extract_json_str_val(line, "pid")));
+                if (line.find("\"pid\":") != std::string::npos)
+                {
+                    std::string v = extract_json_str_val(line, "pid");
+                    if (!v.empty()) session.pid = static_cast<DWORD>(std::stoul(v));
+                }
+                else if (line.find("\"process_name\":") != std::string::npos)
+                {
+                    session.process_name = extract_json_str_val(line, "process_name");
+                }
+                else if (line.find("\"timestamp\":") != std::string::npos)
+                {
+                    session.timestamp_str = extract_json_str_val(line, "timestamp");
+                }
+                else if (line.find("\"total_committed_bytes\":") != std::string::npos)
+                {
+                    std::string v = extract_json_str_val(line, "total_committed_bytes");
+                    if (!v.empty()) session.total_committed_bytes = std::stoull(v);
+                }
             }
-            else if (line.find("\"process_name\":") != std::string::npos)
+            catch (const std::exception &)
             {
-                session.process_name = extract_json_str_val(line, "process_name");
-            }
-            else if (line.find("\"timestamp\":") != std::string::npos)
-            {
-                session.timestamp_str = extract_json_str_val(line, "timestamp");
-            }
-            else if (line.find("\"total_committed_bytes\":") != std::string::npos)
-            {
-                session.total_committed_bytes = std::stoull(extract_json_str_val(line, "total_committed_bytes"));
+                // Ignore malformed header field gracefully
             }
             continue;
         }
@@ -1079,43 +1088,54 @@ bool load_process_session_from_file(const std::string &filepath, ProcessSnapshot
         }
         else if (in_region)
         {
-            if (line.find("\"base\":") != std::string::npos)
+            try
             {
-                std::string v = extract_json_str_val(line, "base");
-                cur_reg.base = std::stoull(v, nullptr, 16);
+                if (line.find("\"base\":") != std::string::npos)
+                {
+                    std::string v = extract_json_str_val(line, "base");
+                    if (!v.empty()) cur_reg.base = std::stoull(v, nullptr, 16);
+                }
+                else if (line.find("\"size\":") != std::string::npos)
+                {
+                    std::string v = extract_json_str_val(line, "size");
+                    if (!v.empty()) cur_reg.size = std::stoull(v);
+                }
+                else if (line.find("\"type\":") != std::string::npos)
+                {
+                    std::string v = extract_json_str_val(line, "type");
+                    if (!v.empty()) cur_reg.type = static_cast<DWORD>(std::stoul(v));
+                }
+                else if (line.find("\"protect\":") != std::string::npos)
+                {
+                    std::string v = extract_json_str_val(line, "protect");
+                    if (!v.empty()) cur_reg.protect = static_cast<DWORD>(std::stoul(v));
+                }
+                else if (line.find("\"content_hash\":") != std::string::npos)
+                {
+                    std::string v = extract_json_str_val(line, "content_hash");
+                    if (!v.empty()) cur_reg.content_hash = std::stoull(v, nullptr, 16);
+                }
+                else if (line.find("\"entropy\":") != std::string::npos)
+                {
+                    std::string v = extract_json_str_val(line, "entropy");
+                    if (!v.empty()) cur_reg.entropy = std::stod(v);
+                }
+                else if (line.find("\"has_pe\":") != std::string::npos)
+                {
+                    cur_reg.has_pe = (extract_json_str_val(line, "has_pe") == "true");
+                }
+                else if (line.find("\"is_rwx\":") != std::string::npos)
+                {
+                    cur_reg.is_rwx = (extract_json_str_val(line, "is_rwx") == "true");
+                }
+                else if (line.find("\"is_unbacked\":") != std::string::npos)
+                {
+                    cur_reg.is_unbacked = (extract_json_str_val(line, "is_unbacked") == "true");
+                }
             }
-            else if (line.find("\"size\":") != std::string::npos)
+            catch (const std::exception &)
             {
-                cur_reg.size = std::stoull(extract_json_str_val(line, "size"));
-            }
-            else if (line.find("\"type\":") != std::string::npos)
-            {
-                cur_reg.type = static_cast<DWORD>(std::stoul(extract_json_str_val(line, "type")));
-            }
-            else if (line.find("\"protect\":") != std::string::npos)
-            {
-                cur_reg.protect = static_cast<DWORD>(std::stoul(extract_json_str_val(line, "protect")));
-            }
-            else if (line.find("\"content_hash\":") != std::string::npos)
-            {
-                std::string v = extract_json_str_val(line, "content_hash");
-                cur_reg.content_hash = std::stoull(v, nullptr, 16);
-            }
-            else if (line.find("\"entropy\":") != std::string::npos)
-            {
-                cur_reg.entropy = std::stod(extract_json_str_val(line, "entropy"));
-            }
-            else if (line.find("\"has_pe\":") != std::string::npos)
-            {
-                cur_reg.has_pe = (extract_json_str_val(line, "has_pe") == "true");
-            }
-            else if (line.find("\"is_rwx\":") != std::string::npos)
-            {
-                cur_reg.is_rwx = (extract_json_str_val(line, "is_rwx") == "true");
-            }
-            else if (line.find("\"is_unbacked\":") != std::string::npos)
-            {
-                cur_reg.is_unbacked = (extract_json_str_val(line, "is_unbacked") == "true");
+                // Skip or handle corrupt fields without crashing
             }
         }
     }
@@ -1279,18 +1299,18 @@ std::string generate_yara_rule_text(const YaraWildcardResult &wildcard_res, uint
 FalsePositiveReport test_rule_false_positives(const Pattern &pat, DWORD exclude_pid)
 {
     FalsePositiveReport report;
-    DWORD start_tick = GetTickCount();
+    ULONGLONG start_tick = GetTickCount64();
 
     if (pat.bytes.empty())
     {
-        report.elapsed_ms = GetTickCount() - start_tick;
+        report.elapsed_ms = static_cast<DWORD>(GetTickCount64() - start_tick);
         return report;
     }
 
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE)
     {
-        report.elapsed_ms = GetTickCount() - start_tick;
+        report.elapsed_ms = static_cast<DWORD>(GetTickCount64() - start_tick);
         return report;
     }
 
@@ -1331,7 +1351,7 @@ FalsePositiveReport test_rule_false_positives(const Pattern &pat, DWORD exclude_
                     if (ReadProcessMemory(hProc, mbi.BaseAddress, read_buf.data(), to_read, &bytes_read) && bytes_read >= pat.bytes.size())
                     {
                         report.total_bytes_scanned += bytes_read;
-                        std::vector<size_t> hits = find_all(read_buf.data(), bytes_read, pat);
+                        std::vector<size_t> hits = find_all(read_buf.data(), bytes_read, pat, 50);
                         for (size_t hit : hits)
                         {
                             FalsePositiveMatch m;
@@ -1357,6 +1377,6 @@ FalsePositiveReport test_rule_false_positives(const Pattern &pat, DWORD exclude_
     }
 
     CloseHandle(hSnap);
-    report.elapsed_ms = GetTickCount() - start_tick;
+    report.elapsed_ms = static_cast<DWORD>(GetTickCount64() - start_tick);
     return report;
 }

@@ -15,7 +15,7 @@ PageEntropyProfile compute_region_entropy_profile(MemorySource &source, uintptr_
         return prof;
     }
 
-    size_t num_pages = (size + 4095) / 4096;
+    size_t num_pages = (size == 0) ? 0 : ((size - 1) / 4096 + 1);
     prof.total_pages = num_pages;
 
     // Hardening: Sample up to 64 pages evenly distributed across large regions

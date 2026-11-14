@@ -42,9 +42,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         const char *p = std::strstr(lpCmdLine, "--json");
         p += 6;
         while (*p == ' ') p++;
-        char pid_str[64] = {};
-        char out_path[MAX_PATH] = {};
-        if (std::sscanf(p, "%63s %259s", pid_str, out_path) == 2)
+        std::string pid_str;
+        while (*p != '\0' && *p != ' ')
+        {
+            pid_str += *p++;
+        }
+        while (*p == ' ') p++;
+        std::string out_file;
+        if (*p == '"')
+        {
+            p++;
+            while (*p != '\0' && *p != '"')
+            {
+                out_file += *p++;
+            }
+        }
+        else
+        {
+            while (*p != '\0' && *p != ' ' && *p != '\r' && *p != '\n')
+            {
+                out_file += *p++;
+            }
+        }
+
+        if (!pid_str.empty() && !out_file.empty())
         {
             DWORD target_pid = 0;
             if (parse_pid_string(pid_str, target_pid) && target_pid != 0)
@@ -58,11 +79,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                     {
                         TriageReport report = run_source_triage(live_src, regions);
                         std::string json_data = export_triage_json(report);
-                        std::string out_file = out_path;
-                        if (out_file.size() >= 2 && out_file.front() == '"' && out_file.back() == '"')
-                        {
-                            out_file = out_file.substr(1, out_file.size() - 2);
-                        }
                         FILE *fp = std::fopen(out_file.c_str(), "wb");
                         if (fp != nullptr)
                         {

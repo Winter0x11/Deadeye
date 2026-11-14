@@ -79,7 +79,7 @@ bool parse_pattern(const std::string &input, Pattern &out, std::string &err)
 }
 
 // Searches buf[0..len) using SIMD-accelerated memchr anchored on the first literal byte.
-std::vector<size_t> find_all(const uint8_t *buf, size_t len, const Pattern &p)
+std::vector<size_t> find_all(const uint8_t *buf, size_t len, const Pattern &p, size_t max_hits)
 {
     std::vector<size_t> hits;
     size_t pl = p.bytes.size();
@@ -131,6 +131,10 @@ std::vector<size_t> find_all(const uint8_t *buf, size_t len, const Pattern &p)
         if (ok)
         {
             hits.push_back(i);
+            if (max_hits > 0 && hits.size() >= max_hits)
+            {
+                break;
+            }
         }
         ++i;
     }

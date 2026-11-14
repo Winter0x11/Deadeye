@@ -162,29 +162,41 @@ To verify that Deadeye's behavioral rules and entropy heuristics do not fire fal
 
 ## Building from Source
 
-Deadeye compiles cleanly with **zero warnings** on both MinGW GCC (`-Wall -Wextra -pedantic`) and MSVC (`/W4`).
+Deadeye features a modular C++17 architecture and compiles cleanly with **zero warnings** on both MinGW-w64 GCC (`-Wall -Wextra -pedantic`) and Microsoft Visual C++ (`/W4`).
 
-### Build with MinGW-w64 (GCC)
+### Automated Multi-Toolchain Build (`build.ps1`)
+Use the automated PowerShell build script to compile both or individual toolchains:
+```powershell
+# Build both MinGW and MSVC release binaries + test targets
+.\build.ps1
+
+# Or target a specific toolchain
+.\build.ps1 -Toolchain mingw
+.\build.ps1 -Toolchain msvc
+```
+
+### Manual Build with MinGW-w64 (GCC)
 ```powershell
 # Create build directory
 if (-not (Test-Path build)) { New-Item -ItemType Directory -Path build }
 
 # Compile resources & manifest
-windres -I src -i src/deadeye.rc -o build/deadeye_res.o
+windres -I src/resources -i src/resources/deadeye.rc -O coff -o build/deadeye_res.o
 
-# Compile fully static standalone binary
-g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 -static -static-libgcc -static-libstdc++ src/main.cpp build/deadeye_res.o -o build/deadeye.exe -mwindows -ladvapi32 -lcomctl32 -lcomdlg32 -lgdi32 -luser32
+# Compile fully static standalone binary across modular translation units
+$srcs = Get-ChildItem -Path src -Filter *.cpp -Recurse | Select-Object -ExpandProperty FullName
+g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 -static -static-libgcc -static-libstdc++ -Isrc $srcs build/deadeye_res.o -o build/deadeye.exe -mwindows -ladvapi32 -lcomctl32 -lcomdlg32 -lgdi32 -luser32
 
 # Compile test target
 g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 tests/test_target.cpp -o build/test_target.exe
 ```
 
-### Build with Microsoft Visual C++ (MSVC)
+### Manual Build with Microsoft Visual C++ (MSVC)
 ```cmd
 call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
-rc /fo build\deadeye_msvc_res.res src\deadeye.rc
-cl /std:c++17 /EHsc /W4 /O2 src\main.cpp build\deadeye_msvc_res.res /Fe:build\deadeye_msvc.exe /link /SUBSYSTEM:WINDOWS advapi32.lib comctl32.lib comdlg32.lib user32.lib gdi32.lib
-cl /std:c++17 /EHsc /W4 /O2 tests\test_target.cpp /Fe:build\test_target_msvc.exe
+rc /nologo /i src\resources /fo build\deadeye_msvc_res.res src\resources\deadeye.rc
+cl /std:c++17 /EHsc /W4 /O2 /Isrc /D_CRT_SECURE_NO_WARNINGS /DNOMINMAX /utf-8 src\main.cpp src\core\*.cpp src\gui\*.cpp build\deadeye_msvc_res.res /Fe:build\deadeye_msvc.exe /link /SUBSYSTEM:WINDOWS advapi32.lib comctl32.lib comdlg32.lib user32.lib gdi32.lib
+cl /std:c++17 /EHsc /W4 /O2 /D_CRT_SECURE_NO_WARNINGS tests\test_target.cpp /Fe:build\test_target_msvc.exe
 ```
 
 ---

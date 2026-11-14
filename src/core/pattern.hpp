@@ -20,4 +20,5 @@ struct Pattern
 bool parse_pattern(const std::string &input, Pattern &out, std::string &err);
 
 // Searches buf[0..len) using SIMD-accelerated memchr anchored on the first literal byte.
-std::vector<size_t> find_all(const uint8_t *buf, size_t len, const Pattern &p);
+// If max_hits > 0, stops searching once max_hits matches are accumulated.
+std::vector<size_t> find_all(const uint8_t *buf, size_t len, const Pattern &p, size_t max_hits = 0);

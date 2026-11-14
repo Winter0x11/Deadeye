@@ -23,6 +23,9 @@ public:
     LiveProcessSource(DWORD pid, HANDLE proc, bool take_ownership, const std::string &name = "");
     ~LiveProcessSource() override;
 
+    LiveProcessSource(const LiveProcessSource &) = delete;
+    LiveProcessSource &operator=(const LiveProcessSource &) = delete;
+
     std::string describe() const override;
     MemorySourceKind kind() const override;
     MemorySourceCapabilities capabilities() const override;

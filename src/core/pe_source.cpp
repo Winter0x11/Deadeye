@@ -35,10 +35,11 @@ static uint8_t* get_mapped_mutable_ptr_internal(std::vector<MappedPeSource::Mapp
 {
     for (auto &seg : segments)
     {
-        if (target_vaddr >= seg.vaddr && target_vaddr + needed_bytes <= seg.vaddr + seg.vsize)
+        if (target_vaddr >= seg.vaddr && needed_bytes <= seg.vsize &&
+            (target_vaddr - seg.vaddr) <= (seg.vsize - needed_bytes))
         {
             size_t offset_in_seg = static_cast<size_t>(target_vaddr - seg.vaddr);
-            if (offset_in_seg + needed_bytes <= seg.data.size())
+            if (offset_in_seg <= seg.data.size() && needed_bytes <= (seg.data.size() - offset_in_seg))
             {
                 return seg.data.data() + offset_in_seg;
             }
@@ -53,6 +54,11 @@ static void apply_base_relocations_internal(MappedPeSource *source,
                                            PeSummaryInfo &summary,
                                            uint32_t reloc_rva, uint32_t reloc_size, int64_t delta)
 {
+    if (reloc_size < sizeof(IMAGE_BASE_RELOCATION) || reloc_size > 64 * 1024 * 1024)
+    {
+        return;
+    }
+
     std::vector<uint8_t> reloc_buf(reloc_size);
     if (source->read(effective_base + reloc_rva, reloc_size, reloc_buf.data()) < sizeof(IMAGE_BASE_RELOCATION))
     {
@@ -63,7 +69,7 @@ static void apply_base_relocations_internal(MappedPeSource *source,
     while (cursor + sizeof(IMAGE_BASE_RELOCATION) <= reloc_size)
     {
         const auto *block = reinterpret_cast<const IMAGE_BASE_RELOCATION*>(reloc_buf.data() + cursor);
-        if (block->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) || cursor + block->SizeOfBlock > reloc_size)
+        if (block->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION) || block->SizeOfBlock > (reloc_size - cursor))
         {
             break;
         }

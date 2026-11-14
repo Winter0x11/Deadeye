@@ -53,7 +53,8 @@ SIZE_T scan_chunk_robust(MemorySource *source, uintptr_t chunk_addr, SIZE_T to_r
 
     if (pat != nullptr && !pat->bytes.empty())
     {
-        std::vector<size_t> hits = find_all(chunk_buf.data(), bytes_read, *pat);
+        size_t needed = (max_hits > out_hits.size()) ? (max_hits - out_hits.size() + 1) : 1;
+        std::vector<size_t> hits = find_all(chunk_buf.data(), bytes_read, *pat, needed);
         for (size_t h : hits)
         {
             if (out_hits.size() < max_hits)
