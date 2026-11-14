@@ -70,6 +70,15 @@ constexpr int WEIGHT_UNBACKED_EXEC = 25;   // Executable unbacked by MEM_IMAGE
 constexpr int WEIGHT_BEHAVIOR_UNPACK = 50; // Memory flipped to executable with byte changes / entropy shift
 constexpr int WEIGHT_SLEEP_OBFUSCATION = 65; // Protection/entropy oscillating across heartbeat ticks
 
+// New Static Triage Scoring Weights (Entropy Profiling)
+constexpr int WEIGHT_HIGH_ENTROPY_EXEC = 35;     // Executable region (or page) with entropy >= 7.2
+constexpr int WEIGHT_HIGH_ENTROPY_PRIVATE = 20;  // MEM_PRIVATE non-executable region >= 7.4 over at least 16 KB
+
+// Behavioral Detection Scoring Weights (Time-Series Behavior Tracker)
+constexpr int WEIGHT_SLEEP_MASK_SUSPECT = 40;    // Oscillates between low/high entropy and/or exec <-> non-exec/NOACCESS >= 3 cycles
+constexpr int WEIGHT_KEY_ROTATION_SUSPECT = 35;  // High entropy with changing content hash & repeating XOR delta
+constexpr int WEIGHT_DECRYPT_ON_WAKE = 35;       // Sharp entropy drop + new strings appearing vs baseline
+
 // Static File-Derived Triage Severity Scoring Weights (Mapped PE & Raw Files)
 constexpr int WEIGHT_STATIC_WX_SECTION = 50;        // Section marked writable and executable (W+X)
 constexpr int WEIGHT_STATIC_EP_OUTSIDE_EXEC = 45;   // Entry point outside executable sections
@@ -121,6 +130,8 @@ constexpr int SEV_MIN_LOW = 10;
 
 #define IDM_VIEW_TRIAGE_FINDINGS 2020
 #define IDM_VIEW_MEMORY_MAP 2021
+#define IDM_VIEW_BEHAVIOR 2023
+#define IDM_VIEW_STRINGS 2027
 #define IDM_VIEW_PROCESS_DIFF 2022
 #define IDM_VIEW_HIDE_CLEAN 2024
 #define IDM_VIEW_HITS_ONLY 2025
@@ -138,13 +149,24 @@ constexpr int SEV_MIN_LOW = 10;
 #define IDM_DIFF_LOAD_SESSION 2053
 #define IDM_DIFF_VIEW_STRINGS 2055
 
+#define IDM_BEHAVIOR_PIN 2060
+#define IDM_BEHAVIOR_WATCH_ALL_PRIV 2061
+#define IDM_BEHAVIOR_CLEAR 2062
+
+#define IDM_STRINGS_BASELINE 2070
+#define IDM_STRINGS_TOGGLE_NEW 2071
+#define IDM_STRINGS_EXTRACT_SEL 2072
+#define IDM_STRINGS_EXTRACT_ALL 2073
+
 #define IDM_HELP_HEURISTICS 2040
 #define IDM_HELP_ABOUT 2041
+#define IDM_HELP_BEHAVIOR_LIMITS 2042
 
 // Custom window messages for background worker thread scanning & triage
 #define WM_SCAN_PROGRESS (WM_USER + 1)
 #define WM_SCAN_COMPLETE (WM_USER + 2)
 #define WM_TRIAGE_COMPLETE (WM_USER + 3)
+#define WM_BEHAVIOR_TICK_DONE (WM_USER + 4)
 
 // Compiled byte pattern: mask[i] == 1 means exact byte match, 0 means wildcard (??).
 struct Pattern
@@ -196,6 +218,10 @@ struct RegionInfo
     // Static Analysis Metadata
     std::string section_name;
     double entropy = 0.0;
+    double avg_entropy = -1.0;
+    double max_entropy = -1.0;
+    std::string entropy_ascii_profile;
+    bool entropy_sampled = false;
 
     // Behavioral Timeline & Detections
     DWORD last_protect = 0;
@@ -332,6 +358,14 @@ bool query_peb_modules_x64(HANDLE proc, std::vector<LoadedModuleRange> &out_modu
 
 #include "memsource.hpp"
 
+struct RegionEntropyJson
+{
+    uintptr_t base = 0;
+    double avg_entropy = -1.0;
+    double max_entropy = -1.0;
+    std::string ascii_profile;
+};
+
 // Triage report for the entire process or memory source
 struct TriageReport
 {
@@ -343,6 +377,7 @@ struct TriageReport
     bool wow64_unsupported = false;
     std::vector<std::string> rules_not_evaluated;
     std::vector<TriageFinding> findings;
+    std::vector<RegionEntropyJson> entropy_profiles;
 };
 
 // Application View Modes
@@ -350,8 +385,144 @@ enum class ViewMode
 {
     TriageFindings = 0,
     MemoryMap = 1,
-    ProcessDiff = 2
+    BehaviorTracker = 2,
+    StringsView = 3,
+    ProcessDiff = 4
 };
+
+// ----------------------------------------------------------------------------
+// Tier 1 Behavior Analysis: Entropy, Strings, and Time-Series Behavior Tracking
+// ----------------------------------------------------------------------------
+
+struct PageEntropyProfile
+{
+    double avg_entropy = -1.0;
+    double max_entropy = -1.0;
+    std::string ascii_profile;
+    bool is_sampled = false;
+    size_t total_pages = 0;
+    size_t valid_pages = 0;
+};
+
+struct ExtractedStringItem
+{
+    uintptr_t addr = 0;
+    std::string encoding; // "ASCII" or "UTF-16LE"
+    size_t length = 0;
+    std::string text;     // Capped to 256 chars for UI
+    std::string tag_hint; // "[URL] (hint)", "[IP] (hint)", "[DOMAIN] (hint)", "[PATH] (hint)", "[REG] (hint)"
+    uint64_t content_hash = 0; // 64-bit FNV-1a
+    bool is_new = false;
+    uintptr_t region_base = 0;
+};
+
+struct TrackedRegionKey
+{
+    uintptr_t base = 0;
+    uintptr_t alloc_base = 0;
+    uint32_t generation = 0;
+
+    bool operator==(const TrackedRegionKey &o) const
+    {
+        return base == o.base && alloc_base == o.alloc_base && generation == o.generation;
+    }
+};
+
+struct TrackedRegionKeyHash
+{
+    size_t operator()(const TrackedRegionKey &k) const
+    {
+        size_t h = std::hash<uintptr_t>()(k.base);
+        h ^= std::hash<uintptr_t>()(k.alloc_base) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<uint32_t>()(k.generation) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+struct RegionSampleRecord
+{
+    uint64_t timestamp_ms = 0;
+    DWORD protect = 0;
+    DWORD state = 0;
+    bool is_unreadable = false;
+    uint64_t content_hash = 0;
+    double avg_entropy = 0.0;
+    double changed_fraction = 0.0; // 0.0 to 1.0 vs previous sample
+    std::vector<uint8_t> sample_bytes; // Capped to 4096 bytes for XOR delta
+};
+
+static const size_t RING_BUFFER_CAP = 120;
+
+struct WatchedRegionState
+{
+    TrackedRegionKey key;
+    SIZE_T size = 0;
+    DWORD type = 0;
+    DWORD alloc_protect = 0;
+    bool is_pinned = false;
+    bool is_deallocated = false;
+
+    // Ring buffer of last 120 samples
+    std::vector<RegionSampleRecord> ring_samples;
+    size_t total_samples = 0;
+
+    // Behavioral Detection Findings
+    int behavior_score = 0;
+    std::vector<std::string> behavior_flags; // SLEEP_MASK_SUSPECT, KEY_ROTATION_SUSPECT, DECRYPT_ON_WAKE
+    std::string evidence_summary;
+
+    // Evidence Structs
+    struct SleepEvidence
+    {
+        int cycles = 0;
+        double period_ms = 0.0;
+        double min_entropy = 0.0;
+        double max_entropy = 0.0;
+        std::string protect_seq;
+    } sleep_evidence;
+
+    struct KeyRotationEvidence
+    {
+        double avg_entropy = 0.0;
+        double avg_changed_frac = 0.0;
+        size_t xor_period = 0;
+        std::vector<uint8_t> candidate_delta_key;
+        std::string note;
+    } key_evidence;
+
+    struct DecryptOnWakeEvidence
+    {
+        double entropy_before = 0.0;
+        double entropy_after = 0.0;
+        size_t new_strings_count = 0;
+        std::vector<std::string> sample_strings; // up to 10 strings
+    } decrypt_evidence;
+};
+
+// Strings Subsystem State
+static std::vector<ExtractedStringItem> g_extracted_strings;
+static std::unordered_map<uintptr_t, std::unordered_set<uint64_t>> g_string_baselines;
+static bool g_strings_filter_new_only = false;
+static std::string g_strings_filter_query;
+static size_t g_strings_min_len = 6;
+
+// Behavior Tracker Subsystem State
+static std::vector<WatchedRegionState> g_watched_regions;
+static std::unordered_map<uintptr_t, uint32_t> g_region_generations;
+static std::atomic<uint32_t> g_tracker_interval_ms{1000};
+static std::atomic<uint64_t> g_tracker_total_samples{0};
+static std::atomic<uint64_t> g_tracker_partial_samples{0};
+static std::atomic<bool> g_tracker_active{false};
+static std::atomic<bool> g_tracker_watch_all_priv_exec{false};
+static std::atomic<bool> g_tracker_busy{false};
+static std::atomic<bool> g_target_process_exited{false};
+static size_t g_tracker_rotating_idx = 0;
+
+// Forward declarations of Behavior Analysis engine functions implemented in tier1.inl
+PageEntropyProfile compute_region_entropy_profile(MemorySource &source, uintptr_t base, SIZE_T size);
+void run_behavior_tracker_tick(std::shared_ptr<MemorySource> source, HWND hwnd);
+void extract_all_strings_from_source(std::shared_ptr<MemorySource> source, const std::vector<RegionInfo> &regions, int selected_idx, size_t min_len);
+std::string classify_string_tag(const std::string &s);
 
 // Application Color Themes
 enum class AppTheme
@@ -1149,7 +1320,6 @@ TriageReport run_source_triage(std::shared_ptr<MemorySource> source,
         report.rules_not_evaluated = {
             "STATIC_WX_SECTION",
             "STATIC_EP_OUTSIDE_EXEC",
-            "STATIC_EXEC_HIGH_ENTROPY",
             "STATIC_NONTRIVIAL_OVERLAY"
         };
 
@@ -1164,6 +1334,21 @@ TriageReport run_source_triage(std::shared_ptr<MemorySource> source,
                 break;
 
             RegionInfo &reg = regions[i];
+
+            // 1. Calculate Shannon entropy profile (page-wise & region aggregation)
+            PageEntropyProfile ent_prof = compute_region_entropy_profile(*source, reg.base, reg.size);
+            reg.avg_entropy = ent_prof.avg_entropy;
+            reg.max_entropy = ent_prof.max_entropy;
+            reg.entropy_ascii_profile = ent_prof.ascii_profile;
+            reg.entropy_sampled = ent_prof.is_sampled;
+            reg.entropy = (ent_prof.avg_entropy > 0.0) ? ent_prof.avg_entropy : 0.0;
+
+            RegionEntropyJson rej;
+            rej.base = reg.base;
+            rej.avg_entropy = ent_prof.avg_entropy;
+            rej.max_entropy = ent_prof.max_entropy;
+            rej.ascii_profile = ent_prof.ascii_profile;
+            report.entropy_profiles.push_back(rej);
 
             // Check for injected PE header in MEM_PRIVATE regions
             if (reg.type == MEM_PRIVATE)
@@ -1204,6 +1389,8 @@ TriageReport run_source_triage(std::shared_ptr<MemorySource> source,
             finding.protect = reg.protect;
             finding.alloc_protect = reg.alloc_protect;
             finding.severity_score = 0;
+
+            bool is_exec = (reg.protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
 
             if (reg.is_pe_in_private)
             {
@@ -1255,6 +1442,31 @@ TriageReport run_source_triage(std::shared_ptr<MemorySource> source,
                                           std::to_string(WEIGHT_SLEEP_OBFUSCATION) + ")");
             }
 
+            // New Static Triage Rule: HIGH_ENTROPY_EXEC (executable region/page with entropy >= 7.2)
+            if (is_exec && (ent_prof.max_entropy >= 7.2 || ent_prof.avg_entropy >= 7.2))
+            {
+                finding.severity_score += WEIGHT_HIGH_ENTROPY_EXEC;
+                finding.flags.push_back("HIGH_ENTROPY_EXEC");
+                char ent_buf[64];
+                std::snprintf(ent_buf, sizeof(ent_buf), "avg %.2f, max %.2f", ent_prof.avg_entropy, ent_prof.max_entropy);
+                finding.reasons.push_back(std::string("Executable region with high Shannon entropy (") + ent_buf +
+                                          " >= 7.20, possible packed/encrypted code) (+" +
+                                          std::to_string(WEIGHT_HIGH_ENTROPY_EXEC) + ")");
+            }
+
+            // New Static Triage Rule: HIGH_ENTROPY_PRIVATE (MEM_PRIVATE non-exec region >= 7.4 over at least 16 KB)
+            // Note: Does NOT flag MEM_IMAGE data sections by entropy alone (compressed resources are normal)
+            if (reg.type == MEM_PRIVATE && !is_exec && reg.size >= 16384 && ent_prof.avg_entropy >= 7.4)
+            {
+                finding.severity_score += WEIGHT_HIGH_ENTROPY_PRIVATE;
+                finding.flags.push_back("HIGH_ENTROPY_PRIVATE");
+                char ent_buf[32];
+                std::snprintf(ent_buf, sizeof(ent_buf), "avg %.2f", ent_prof.avg_entropy);
+                finding.reasons.push_back(std::string("Private non-executable buffer >= 16KB with high Shannon entropy (") +
+                                          ent_buf + " >= 7.40, possible encrypted payload or blob) (+" +
+                                          std::to_string(WEIGHT_HIGH_ENTROPY_PRIVATE) + ")");
+            }
+
             if (finding.severity_score >= SEV_MIN_CRITICAL) finding.severity_label = "CRIT";
             else if (finding.severity_score >= SEV_MIN_HIGH) finding.severity_label = "HIGH";
             else if (finding.severity_score >= SEV_MIN_MEDIUM) finding.severity_label = "MED";
@@ -1279,7 +1491,11 @@ TriageReport run_source_triage(std::shared_ptr<MemorySource> source,
             "WRITE_THEN_FLIP",
             "UNBACKED_EXEC",
             "BEHAVIOR_UNPACK",
-            "SLEEP_OBFUSCATION"
+            "SLEEP_OBFUSCATION",
+            "SLEEP_MASK_SUSPECT (requires live process)",
+            "KEY_ROTATION_SUSPECT (requires live process)",
+            "DECRYPT_ON_WAKE (requires live process)",
+            "BEHAVIOR_TRACKER (requires live process)"
         };
 
         PeSummaryInfo pe_info;
@@ -1291,6 +1507,21 @@ TriageReport run_source_triage(std::shared_ptr<MemorySource> source,
                 break;
 
             RegionInfo &reg = regions[i];
+
+            // 1. Calculate Shannon entropy profile (page-wise & region aggregation)
+            PageEntropyProfile ent_prof = compute_region_entropy_profile(*source, reg.base, reg.size);
+            reg.avg_entropy = ent_prof.avg_entropy;
+            reg.max_entropy = ent_prof.max_entropy;
+            reg.entropy_ascii_profile = ent_prof.ascii_profile;
+            reg.entropy_sampled = ent_prof.is_sampled;
+            reg.entropy = (ent_prof.avg_entropy > 0.0) ? ent_prof.avg_entropy : 0.0;
+
+            RegionEntropyJson rej;
+            rej.base = reg.base;
+            rej.avg_entropy = ent_prof.avg_entropy;
+            rej.max_entropy = ent_prof.max_entropy;
+            rej.ascii_profile = ent_prof.ascii_profile;
+            report.entropy_profiles.push_back(rej);
 
             TriageFinding finding;
             finding.region_index = i;
@@ -1329,16 +1560,16 @@ TriageReport run_source_triage(std::shared_ptr<MemorySource> source,
                 }
             }
 
-            // 3. Static Heuristic: Section with executable rights and high Shannon entropy (>7.2)
-            double ent = (reg.entropy > 0.0) ? reg.entropy : reg.last_entropy;
-            if (is_exec && ent > 7.2)
+            // 3. Static Heuristic: Section with executable rights and high Shannon entropy (>=7.2)
+            double ent = (ent_prof.max_entropy >= 7.2) ? ent_prof.max_entropy : ((reg.entropy > 0.0) ? reg.entropy : reg.last_entropy);
+            if (is_exec && ent >= 7.2)
             {
                 finding.severity_score += WEIGHT_STATIC_EXEC_HIGH_ENTROPY;
                 finding.flags.push_back("STATIC_EXEC_HIGH_ENTROPY");
                 char ent_buf[32];
                 std::snprintf(ent_buf, sizeof(ent_buf), "%.2f", ent);
                 finding.reasons.push_back(std::string("Static: Executable section with high entropy (") + ent_buf +
-                                          " > 7.20, possible packed/encrypted payload) (+" +
+                                          " >= 7.20, possible packed/encrypted payload) (+" +
                                           std::to_string(WEIGHT_STATIC_EXEC_HIGH_ENTROPY) + ")");
             }
 
@@ -1379,12 +1610,32 @@ TriageReport run_source_triage(std::shared_ptr<MemorySource> source,
             "STATIC_WX_SECTION",
             "STATIC_EP_OUTSIDE_EXEC",
             "STATIC_EXEC_HIGH_ENTROPY",
-            "STATIC_NONTRIVIAL_OVERLAY"
+            "STATIC_NONTRIVIAL_OVERLAY",
+            "SLEEP_MASK_SUSPECT (requires live process)",
+            "KEY_ROTATION_SUSPECT (requires live process)",
+            "DECRYPT_ON_WAKE (requires live process)",
+            "BEHAVIOR_TRACKER (requires live process)"
         };
 
         for (size_t i = 0; i < regions.size(); ++i)
         {
             RegionInfo &reg = regions[i];
+
+            // Calculate Shannon entropy profile
+            PageEntropyProfile ent_prof = compute_region_entropy_profile(*source, reg.base, reg.size);
+            reg.avg_entropy = ent_prof.avg_entropy;
+            reg.max_entropy = ent_prof.max_entropy;
+            reg.entropy_ascii_profile = ent_prof.ascii_profile;
+            reg.entropy_sampled = ent_prof.is_sampled;
+            reg.entropy = (ent_prof.avg_entropy > 0.0) ? ent_prof.avg_entropy : 0.0;
+
+            RegionEntropyJson rej;
+            rej.base = reg.base;
+            rej.avg_entropy = ent_prof.avg_entropy;
+            rej.max_entropy = ent_prof.max_entropy;
+            rej.ascii_profile = ent_prof.ascii_profile;
+            report.entropy_profiles.push_back(rej);
+
             TriageFinding finding;
             finding.region_index = i;
             finding.base = reg.base;
@@ -1443,6 +1694,80 @@ std::string export_triage_json(const TriageReport &report)
         json += "\"" + report.rules_not_evaluated[k] + "\"" + (k + 1 < report.rules_not_evaluated.size() ? ", " : "");
     }
     json += "],\n";
+
+    // 1. Per-region Entropy Profiles
+    json += "  \"entropy\": [\n";
+    for (size_t i = 0; i < report.entropy_profiles.size(); ++i)
+    {
+        const auto &e = report.entropy_profiles[i];
+        json += "    {\n";
+        json += "      \"base\": \"" + to_hex_string(e.base) + "\",\n";
+        json += "      \"avg_entropy\": " + ((e.avg_entropy >= 0.0) ? std::to_string(e.avg_entropy) : "-1.0") + ",\n";
+        json += "      \"max_entropy\": " + ((e.max_entropy >= 0.0) ? std::to_string(e.max_entropy) : "-1.0") + ",\n";
+        json += "      \"ascii_profile\": \"" + escape_json(e.ascii_profile) + "\"\n";
+        json += "    }" + std::string(i + 1 < report.entropy_profiles.size() ? ",\n" : "\n");
+    }
+    json += "  ],\n";
+
+    // 2. Behavioral Tracking Array (Live Sources Only)
+    json += "  \"behavior\": [\n";
+    if (report.source_kind == MemorySourceKind::Live)
+    {
+        for (size_t i = 0; i < g_watched_regions.size(); ++i)
+        {
+            const auto &w = g_watched_regions[i];
+            json += "    {\n";
+            json += "      \"base\": \"" + to_hex_string(w.key.base) + "\",\n";
+            json += "      \"alloc_base\": \"" + to_hex_string(w.key.alloc_base) + "\",\n";
+            json += "      \"generation\": " + std::to_string(w.key.generation) + ",\n";
+            json += "      \"size\": " + std::to_string(w.size) + ",\n";
+            json += "      \"pinned\": " + std::string(w.is_pinned ? "true" : "false") + ",\n";
+            json += "      \"sample_count\": " + std::to_string(w.ring_samples.size()) + ",\n";
+            json += "      \"partial_sample_count\": " + std::to_string(g_tracker_partial_samples.load()) + ",\n";
+            json += "      \"interval_ms\": " + std::to_string(g_tracker_interval_ms.load()) + ",\n";
+            json += "      \"score\": " + std::to_string(w.behavior_score) + ",\n";
+            json += "      \"flags\": [";
+            for (size_t k = 0; k < w.behavior_flags.size(); ++k)
+            {
+                json += "\"" + w.behavior_flags[k] + "\"" + (k + 1 < w.behavior_flags.size() ? ", " : "");
+            }
+            json += "],\n";
+            json += "      \"evidence\": {\n";
+            json += "        \"summary\": \"" + escape_json(w.evidence_summary) + "\",\n";
+            json += "        \"sleep_mask\": {\n";
+            json += "          \"cycle_count\": " + std::to_string(w.sleep_evidence.cycles) + ",\n";
+            json += "          \"period_ms\": " + std::to_string(w.sleep_evidence.period_ms) + ",\n";
+            json += "          \"min_entropy\": " + std::to_string(w.sleep_evidence.min_entropy) + ",\n";
+            json += "          \"max_entropy\": " + std::to_string(w.sleep_evidence.max_entropy) + ",\n";
+            json += "          \"protection_sequence\": \"" + escape_json(w.sleep_evidence.protect_seq) + "\"\n";
+            json += "        },\n";
+            json += "        \"key_rotation\": {\n";
+            json += "          \"xor_period\": " + std::to_string(w.key_evidence.xor_period) + ",\n";
+            std::string dkey_hex;
+            for (uint8_t kb : w.key_evidence.candidate_delta_key)
+            {
+                char h[4]; std::snprintf(h, sizeof(h), "%02X ", kb); dkey_hex += h;
+            }
+            json += "          \"candidate_delta_key_hex\": \"" + escape_json(dkey_hex) + "\",\n";
+            json += "          \"note\": \"" + escape_json(w.key_evidence.note) + "\"\n";
+            json += "        },\n";
+            json += "        \"decrypt_on_wake\": {\n";
+            json += "          \"entropy_before\": " + std::to_string(w.decrypt_evidence.entropy_before) + ",\n";
+            json += "          \"entropy_after\": " + std::to_string(w.decrypt_evidence.entropy_after) + ",\n";
+            json += "          \"new_strings_count\": " + std::to_string(w.decrypt_evidence.new_strings_count) + ",\n";
+            json += "          \"sample_strings\": [";
+            for (size_t s = 0; s < w.decrypt_evidence.sample_strings.size(); ++s)
+            {
+                json += "\"" + escape_json(w.decrypt_evidence.sample_strings[s]) + "\"" + (s + 1 < w.decrypt_evidence.sample_strings.size() ? ", " : "");
+            }
+            json += "]\n";
+            json += "        }\n";
+            json += "      }\n";
+            json += "    }" + std::string(i + 1 < g_watched_regions.size() ? ",\n" : "\n");
+        }
+    }
+    json += "  ],\n";
+
     json += "  \"findings_count\": " + std::to_string(report.findings.size()) + ",\n";
     json += "  \"findings\": [\n";
 
@@ -2232,6 +2557,39 @@ void update_triage_details_label(size_t reg_idx)
         return;
     }
 
+    if (g_view_mode == ViewMode::BehaviorTracker)
+    {
+        if (reg_idx < g_watched_regions.size())
+        {
+            const auto &w = g_watched_regions[reg_idx];
+            std::string text = "Behavior [Score " + std::to_string(w.behavior_score) + "]: " +
+                               (w.evidence_summary.empty() ? "Monitoring region. Samples collected: " + std::to_string(w.ring_samples.size()) : w.evidence_summary);
+            SetWindowTextA(g_lbl_triage_reasons, text.c_str());
+        }
+        else
+        {
+            SetWindowTextA(g_lbl_triage_reasons, "Behavior Details: Ready. Press Ctrl+P to pin selected region.");
+        }
+        return;
+    }
+
+    if (g_view_mode == ViewMode::StringsView)
+    {
+        if (reg_idx < g_extracted_strings.size())
+        {
+            const auto &st = g_extracted_strings[reg_idx];
+            std::string text = "String at 0x" + to_hex_string(st.addr) + " [" + st.encoding + ", len " +
+                               std::to_string(st.length) + "] " +
+                               (st.is_new ? "[NEW SINCE BASELINE] " : "") + st.tag_hint + ": " + st.text;
+            SetWindowTextA(g_lbl_triage_reasons, text.c_str());
+        }
+        else
+        {
+            SetWindowTextA(g_lbl_triage_reasons, "Strings Details: Ready. F7 to extract, Ctrl+B to set baseline.");
+        }
+        return;
+    }
+
     if (reg_idx >= g_regions.size())
     {
         SetWindowTextA(g_lbl_triage_reasons, "Details: Ready.");
@@ -2251,9 +2609,10 @@ void update_triage_details_label(size_t reg_idx)
 
     bool synthetic = (g_current_source != nullptr && g_current_source->capabilities().protection_is_synthetic);
 
+    std::string text;
     if (match != nullptr && !match->reasons.empty())
     {
-        std::string text = "Details [" + match->severity_label + " " + std::to_string(match->severity_score) + "]: ";
+        text = "Details [" + match->severity_label + " " + std::to_string(match->severity_score) + "]: ";
         for (size_t i = 0; i < match->reasons.size(); ++i)
         {
             text += match->reasons[i];
@@ -2264,18 +2623,28 @@ void update_triage_details_label(size_t reg_idx)
         {
             text = "[Synthetic Protection] " + text;
         }
-        SetWindowTextA(g_lbl_triage_reasons, text.c_str());
     }
     else
     {
-        std::string text = "Details [CLEAN 0]: Normal " + type_full(reg.type) + " memory (" +
-                           prot_full(reg.protect) + "), AllocBase " + to_hex_string(reg.alloc_base);
+        text = "Details [CLEAN 0]: Normal " + type_full(reg.type) + " memory (" +
+               prot_full(reg.protect) + "), AllocBase " + to_hex_string(reg.alloc_base);
         if (synthetic)
         {
             text = "[Synthetic Protection] " + text;
         }
-        SetWindowTextA(g_lbl_triage_reasons, text.c_str());
     }
+
+    // Append per-region average, max, and compact ASCII profile of page entropies
+    if (reg.avg_entropy >= 0.0)
+    {
+        char ent_buf[160];
+        std::snprintf(ent_buf, sizeof(ent_buf), " | Entropy: avg %.2f, max %.2f [%s]%s",
+                      reg.avg_entropy, reg.max_entropy, reg.entropy_ascii_profile.c_str(),
+                      reg.entropy_sampled ? " (sampled)" : "");
+        text += ent_buf;
+    }
+
+    SetWindowTextA(g_lbl_triage_reasons, text.c_str());
 }
 
 void populate_region_list()
@@ -2315,6 +2684,121 @@ void populate_region_list()
                               type_short(d.type).c_str(),
                               prot_short(d.new_protect ? d.new_protect : d.old_protect).c_str(),
                               d.summary.c_str());
+
+                SendMessageA(g_list_regions, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(row));
+                g_visible_indices.push_back(i);
+            }
+        }
+        SendMessageA(g_list_regions, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(g_list_regions, nullptr, TRUE);
+        return;
+    }
+
+    if (g_view_mode == ViewMode::BehaviorTracker)
+    {
+        if (g_watched_regions.empty())
+        {
+            SendMessageA(g_list_regions, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>("No watched regions. Attach live process & triage, or press Ctrl+P to pin selected region."));
+        }
+        else
+        {
+            for (size_t i = 0; i < g_watched_regions.size(); ++i)
+            {
+                const auto &w = g_watched_regions[i];
+                char sev_badge[32];
+                std::snprintf(sev_badge, sizeof(sev_badge), "[SCR %3d]", w.behavior_score);
+
+                std::string flg_str;
+                for (const auto &flg : w.behavior_flags)
+                {
+                    if (flg == "SLEEP_MASK_SUSPECT") flg_str += "!SMSP ";
+                    else if (flg == "KEY_ROTATION_SUSPECT") flg_str += "!KROT ";
+                    else if (flg == "DECRYPT_ON_WAKE") flg_str += "!DWAK ";
+                }
+                if (flg_str.empty()) flg_str = "      ";
+                while (flg_str.size() < 14) flg_str.push_back(' ');
+
+                char hbuf[32];
+                if (w.ring_samples.empty())
+                {
+                    std::strcpy(hbuf, "H:--/--");
+                }
+                else
+                {
+                    double min_e = 10.0, max_e = -1.0;
+                    for (const auto &s : w.ring_samples)
+                    {
+                        if (!s.is_unreadable)
+                        {
+                            if (s.avg_entropy < min_e) min_e = s.avg_entropy;
+                            if (s.avg_entropy > max_e) max_e = s.avg_entropy;
+                        }
+                    }
+                    if (max_e >= 0.0)
+                        std::snprintf(hbuf, sizeof(hbuf), "H:%.1f-%.1f", min_e, max_e);
+                    else
+                        std::strcpy(hbuf, "H:unreadable");
+                }
+
+                double last_chg = 0.0;
+                if (!w.ring_samples.empty()) last_chg = w.ring_samples.back().changed_fraction * 100.0;
+                DWORD last_prot = w.ring_samples.empty() ? w.alloc_protect : w.ring_samples.back().protect;
+
+                char row[256];
+                std::snprintf(row, sizeof(row), "%-11s %-14s %016llX %4zus %-11s %2dc %3.0f%% %-4s %s",
+                              sev_badge, flg_str.c_str(),
+                              static_cast<unsigned long long>(w.key.base),
+                              w.ring_samples.size(),
+                              hbuf,
+                              w.sleep_evidence.cycles,
+                              last_chg,
+                              prot_short(last_prot).c_str(),
+                              w.is_pinned ? "[PIN]" : "");
+
+                SendMessageA(g_list_regions, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(row));
+                g_visible_indices.push_back(i);
+            }
+        }
+        SendMessageA(g_list_regions, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(g_list_regions, nullptr, TRUE);
+        return;
+    }
+
+    if (g_view_mode == ViewMode::StringsView)
+    {
+        if (g_extracted_strings.empty())
+        {
+            SendMessageA(g_list_regions, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>("No strings extracted. Press F7 to extract selected region, or use Strings -> Extract All."));
+        }
+        else
+        {
+            char pat_buf[256] = {};
+            GetWindowTextA(g_edit_pattern, pat_buf, sizeof(pat_buf));
+            std::string q_str(pat_buf);
+            for (char &c : q_str) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+            for (size_t i = 0; i < g_extracted_strings.size(); ++i)
+            {
+                const auto &st = g_extracted_strings[i];
+                if (g_strings_filter_new_only && !st.is_new)
+                    continue;
+
+                if (!q_str.empty())
+                {
+                    std::string text_lower = st.text;
+                    for (char &c : text_lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    if (text_lower.find(q_str) == std::string::npos)
+                        continue;
+                }
+
+                char row[512];
+                std::snprintf(row, sizeof(row), "%016llX %-8s %-4zu %-14s %-6s %s",
+                              static_cast<unsigned long long>(st.addr),
+                              st.encoding.c_str(),
+                              st.length,
+                              st.tag_hint.c_str(),
+                              st.is_new ? "[NEW]" : "     ",
+                              st.text.c_str());
 
                 SendMessageA(g_list_regions, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(row));
                 g_visible_indices.push_back(i);
@@ -2369,6 +2853,16 @@ void populate_region_list()
                     flg_str += "!ENT ";
                 else if (flg == "STATIC_NONTRIVIAL_OVERLAY")
                     flg_str += "!OVL ";
+                else if (flg == "HIGH_ENTROPY_EXEC")
+                    flg_str += "!HENT ";
+                else if (flg == "HIGH_ENTROPY_PRIVATE")
+                    flg_str += "!HPVT ";
+                else if (flg == "SLEEP_MASK_SUSPECT")
+                    flg_str += "!SMSP ";
+                else if (flg == "KEY_ROTATION_SUSPECT")
+                    flg_str += "!KROT ";
+                else if (flg == "DECRYPT_ON_WAKE")
+                    flg_str += "!DWAK ";
             }
             if (flg_str.empty())
                 flg_str = "      ";
@@ -2460,6 +2954,13 @@ void populate_region_list()
             if (!r.section_name.empty())
             {
                 tag = " [" + r.section_name + "]" + tag;
+            }
+
+            if (r.avg_entropy >= 0.0)
+            {
+                char hbuf[32];
+                std::snprintf(hbuf, sizeof(hbuf), " H:%.1f/%.1f", r.avg_entropy, r.max_entropy);
+                tag += hbuf;
             }
 
             std::snprintf(row, sizeof(row), "%016llX %s %s %s %s%s",
@@ -2564,6 +3065,50 @@ void draw_region_list_item(DRAWITEMSTRUCT *dis)
             }
         }
     }
+    else if (g_view_mode == ViewMode::BehaviorTracker)
+    {
+        if (reg_idx < g_watched_regions.size())
+        {
+            const auto &w = g_watched_regions[reg_idx];
+            if (w.behavior_score >= SEV_MIN_CRITICAL)
+            {
+                bg_color = tc.row_pe_bg;
+                text_color = tc.row_pe_text;
+            }
+            else if (w.behavior_score >= SEV_MIN_HIGH)
+            {
+                bg_color = tc.row_rwx_bg;
+                text_color = tc.row_rwx_text;
+            }
+            else if (w.behavior_score >= SEV_MIN_MEDIUM)
+            {
+                bg_color = tc.row_flip_bg;
+                text_color = tc.row_flip_text;
+            }
+            else
+            {
+                bg_color = tc.row_priv_bg;
+                text_color = tc.row_priv_text;
+            }
+        }
+    }
+    else if (g_view_mode == ViewMode::StringsView)
+    {
+        if (reg_idx < g_extracted_strings.size())
+        {
+            const auto &st = g_extracted_strings[reg_idx];
+            if (st.is_new)
+            {
+                bg_color = tc.row_diff_new_bg;
+                text_color = tc.row_diff_new_text;
+            }
+            else
+            {
+                bg_color = tc.row_priv_bg;
+                text_color = tc.row_priv_text;
+            }
+        }
+    }
     else
     {
         if (reg_idx >= g_regions.size())
@@ -2619,7 +3164,7 @@ void draw_region_list_item(DRAWITEMSTRUCT *dis)
     FillRect(hdc, &dis->rcItem, hbr);
     DeleteObject(hbr);
 
-    char buf[256] = {};
+    char buf[512] = {};
     SendMessageA(dis->hwndItem, LB_GETTEXT, dis->itemID, reinterpret_cast<LPARAM>(buf));
 
     SetBkMode(hdc, TRANSPARENT);
@@ -2636,7 +3181,8 @@ void draw_region_list_item(DRAWITEMSTRUCT *dis)
 enum class WorkerTaskType
 {
     MemoryMapScan = 0,
-    Triage = 1
+    Triage = 1,
+    BehaviorTick = 2
 };
 
 struct WorkerTask
@@ -2722,6 +3268,15 @@ DWORD WINAPI WorkerThreadProc(LPVOID param)
             }
             return 0;
         }
+    }
+
+    if (res->task_type == WorkerTaskType::BehaviorTick)
+    {
+        run_behavior_tracker_tick(source, hwnd);
+        g_tracker_busy.store(false);
+        PostMessageA(hwnd, WM_BEHAVIOR_TICK_DONE, 0, 0);
+        delete res;
+        return 0;
     }
 
     if (res->task_type == WorkerTaskType::Triage)
@@ -2934,6 +3489,55 @@ void on_worker_completed(WorkerResult *res)
     {
         g_view_mode = ViewMode::TriageFindings;
         SendMessageA(g_combo_view_mode, CB_SETCURSEL, 0, 0);
+    }
+
+    if (g_current_source != nullptr && g_current_source->capabilities().is_live)
+    {
+        g_tracker_active.store(true);
+        g_target_process_exited.store(false);
+
+        // Build default watch set: regions with triage score >= 25 or high entropy, plus pinned or watch all priv
+        for (const auto &reg : g_regions)
+        {
+            int sev = 0;
+            for (const auto &f : g_triage_report.findings)
+            {
+                if (f.base == reg.base)
+                {
+                    sev = f.severity_score;
+                    break;
+                }
+            }
+
+            bool is_exec = (reg.protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+            bool high_ent = (reg.avg_entropy >= 7.0 || reg.max_entropy >= 7.2);
+            bool watch_all_priv = g_tracker_watch_all_priv_exec.load() && (reg.type == MEM_PRIVATE && is_exec);
+
+            if (sev >= 25 || high_ent || watch_all_priv)
+            {
+                bool exists = false;
+                for (const auto &w : g_watched_regions)
+                {
+                    if (w.key.base == reg.base && w.key.alloc_base == reg.alloc_base)
+                    {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists)
+                {
+                    WatchedRegionState nw;
+                    nw.key.base = reg.base;
+                    nw.key.alloc_base = reg.alloc_base;
+                    nw.key.generation = g_region_generations[reg.base];
+                    nw.size = reg.size;
+                    nw.type = reg.type;
+                    nw.alloc_protect = reg.alloc_protect;
+                    nw.is_pinned = false;
+                    g_watched_regions.push_back(std::move(nw));
+                }
+            }
+        }
     }
 
     populate_region_list();
@@ -3852,7 +4456,9 @@ HMENU create_application_menu()
     HMENU hViewMenu = CreatePopupMenu();
     AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_TRIAGE_FINDINGS, "&Triage Findings View\tCtrl+1");
     AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_MEMORY_MAP, "&Memory Map View\tCtrl+2");
-    AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_PROCESS_DIFF, "&Process Diff View\tCtrl+3");
+    AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_BEHAVIOR, "&Behavior Tracker View\tCtrl+3");
+    AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_STRINGS, "&Strings View\tCtrl+4");
+    AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_PROCESS_DIFF, "&Process Diff View\tCtrl+5");
     AppendMenuA(hViewMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_HIDE_CLEAN, "&Hide Clean Regions");
     AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_HITS_ONLY, "&Hits Only Filter");
@@ -3860,7 +4466,25 @@ HMENU create_application_menu()
     AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_REFRESH, "&Refresh Memory Walk\tF5");
     AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hViewMenu), "&View");
 
-    // 4. Diff Menu
+    // 4. Behavior Menu
+    HMENU hBehaviorMenu = CreatePopupMenu();
+    AppendMenuA(hBehaviorMenu, MF_STRING, IDM_BEHAVIOR_PIN, "&Pin / Unpin Selected Region\tCtrl+P");
+    AppendMenuA(hBehaviorMenu, MF_STRING, IDM_BEHAVIOR_WATCH_ALL_PRIV, "Watch &All Private Executable Regions");
+    AppendMenuA(hBehaviorMenu, MF_STRING, IDM_BEHAVIOR_CLEAR, "&Clear Sample History");
+    AppendMenuA(hBehaviorMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(hBehaviorMenu, MF_STRING, IDM_HELP_BEHAVIOR_LIMITS, "Polling &Limitations & Detection Guide...");
+    AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hBehaviorMenu), "&Behavior");
+
+    // 5. Strings Menu
+    HMENU hStringsMenu = CreatePopupMenu();
+    AppendMenuA(hStringsMenu, MF_STRING, IDM_STRINGS_BASELINE, "Set String &Baseline\tCtrl+B");
+    AppendMenuA(hStringsMenu, MF_STRING, IDM_STRINGS_TOGGLE_NEW, "Toggle &New Since Baseline Filter\tF6");
+    AppendMenuA(hStringsMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(hStringsMenu, MF_STRING, IDM_STRINGS_EXTRACT_SEL, "Extract Strings from &Selected Region\tF7");
+    AppendMenuA(hStringsMenu, MF_STRING, IDM_STRINGS_EXTRACT_ALL, "Extract Strings across &All Regions");
+    AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hStringsMenu), "&Strings");
+
+    // 6. Diff Menu
     HMENU hDiffMenu = CreatePopupMenu();
     AppendMenuA(hDiffMenu, MF_STRING, IDM_DIFF_CAPTURE_BASELINE, "Capture &Baseline Snapshot\tCtrl+B");
     AppendMenuA(hDiffMenu, MF_STRING, IDM_DIFF_CAPTURE_CURRENT, "Compare with &Current (Diff)\tCtrl+D");
@@ -3871,7 +4495,7 @@ HMENU create_application_menu()
     AppendMenuA(hDiffMenu, MF_STRING, IDM_DIFF_VIEW_STRINGS, "View Newly &Revealed Strings...\tCtrl+U");
     AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hDiffMenu), "&Diff");
 
-    // 5. Timeline Menu
+    // 7. Timeline Menu
     HMENU hTimelineMenu = CreatePopupMenu();
     AppendMenuA(hTimelineMenu, MF_STRING, IDM_TIMELINE_SNAP, "&Take Snapshot\tCtrl+N");
     AppendMenuA(hTimelineMenu, MF_STRING, IDM_TIMELINE_CLEAR, "&Clear All Snapshots");
@@ -3882,9 +4506,10 @@ HMENU create_application_menu()
     AppendMenuA(hTimelineMenu, MF_STRING, IDM_TIMELINE_NEXT_PAGE, "&Next 64K Page\tPgDn");
     AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hTimelineMenu), "&Timeline");
 
-    // 6. Help Menu
+    // 8. Help Menu
     HMENU hHelpMenu = CreatePopupMenu();
     AppendMenuA(hHelpMenu, MF_STRING, IDM_HELP_HEURISTICS, "&Defensive Heuristics Guide...");
+    AppendMenuA(hHelpMenu, MF_STRING, IDM_HELP_BEHAVIOR_LIMITS, "&Behavior Polling Limitations...");
     AppendMenuA(hHelpMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(hHelpMenu, MF_STRING, IDM_HELP_ABOUT, "&About Deadeye...");
     AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hHelpMenu), "&Help");
@@ -3979,15 +4604,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         g_combo_view_mode = CreateWindowA("COMBOBOX", "",
                                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-                                          M, r2_y, 148, 120, hwnd, reinterpret_cast<HMENU>(ID_COMBO_VIEW_MODE), hInst, nullptr);
+                                          M, r2_y, 168, 160, hwnd, reinterpret_cast<HMENU>(ID_COMBO_VIEW_MODE), hInst, nullptr);
         SendMessageA(g_combo_view_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("View: Triage Findings"));
         SendMessageA(g_combo_view_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("View: Memory Map"));
+        SendMessageA(g_combo_view_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("View: Behavior Tracker"));
+        SendMessageA(g_combo_view_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("View: Strings"));
         SendMessageA(g_combo_view_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("View: Process Diff"));
         SendMessageA(g_combo_view_mode, CB_SETCURSEL, 0, 0);
 
         g_combo_min_sev = CreateWindowA("COMBOBOX", "",
                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
-                                        M + 152, r2_y, 102, 140, hwnd, reinterpret_cast<HMENU>(ID_COMBO_MIN_SEV), hInst, nullptr);
+                                        M + 172, r2_y, 102, 140, hwnd, reinterpret_cast<HMENU>(ID_COMBO_MIN_SEV), hInst, nullptr);
         SendMessageA(g_combo_min_sev, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Min: All (0+)"));
         SendMessageA(g_combo_min_sev, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Min: Low (10+)"));
         SendMessageA(g_combo_min_sev, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Min: Med (25+)"));
@@ -3997,11 +4624,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         g_chk_hide_clean = CreateWindowA("BUTTON", "Hide clean",
                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-                                         M + 258, r2_y, 84, RH, hwnd, reinterpret_cast<HMENU>(ID_CHK_HIDE_CLEAN), hInst, nullptr);
+                                         M + 278, r2_y, 84, RH, hwnd, reinterpret_cast<HMENU>(ID_CHK_HIDE_CLEAN), hInst, nullptr);
 
         g_btn_export_json = CreateWindowA("BUTTON", "Export JSON",
                                           WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                          M + 346, r2_y, 88, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_EXPORT_JSON), hInst, nullptr);
+                                          M + 366, r2_y, 88, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_EXPORT_JSON), hInst, nullptr);
 
         // Right side timeline header controls
         g_lbl_hex_info = CreateWindowA("STATIC", "Hex View",
@@ -4087,8 +4714,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             { FCONTROL | FVIRTKEY, 'N', ID_BTN_SNAP },
             { FCONTROL | FVIRTKEY, '1', IDM_VIEW_TRIAGE_FINDINGS },
             { FCONTROL | FVIRTKEY, '2', IDM_VIEW_MEMORY_MAP },
-            { FCONTROL | FVIRTKEY, '3', IDM_VIEW_PROCESS_DIFF },
-            { FCONTROL | FVIRTKEY, 'B', IDM_DIFF_CAPTURE_BASELINE },
+            { FCONTROL | FVIRTKEY, '3', IDM_VIEW_BEHAVIOR },
+            { FCONTROL | FVIRTKEY, '4', IDM_VIEW_STRINGS },
+            { FCONTROL | FVIRTKEY, '5', IDM_VIEW_PROCESS_DIFF },
+            { FCONTROL | FVIRTKEY, 'P', IDM_BEHAVIOR_PIN },
+            { FCONTROL | FVIRTKEY, 'B', IDM_STRINGS_BASELINE },
+            { FVIRTKEY, VK_F6, IDM_STRINGS_TOGGLE_NEW },
+            { FVIRTKEY, VK_F7, IDM_STRINGS_EXTRACT_SEL },
             { FCONTROL | FVIRTKEY, 'D', IDM_DIFF_CAPTURE_CURRENT },
             { FCONTROL | FVIRTKEY, 'Y', ID_BTN_YARA },
             { FCONTROL | FVIRTKEY, 'U', IDM_DIFF_VIEW_STRINGS }
@@ -4113,7 +4745,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         CheckMenuItem(hMenu, IDM_FILE_THEME_DARK, (g_theme == AppTheme::Dark) ? MF_CHECKED : MF_UNCHECKED);
         CheckMenuItem(hMenu, IDM_VIEW_TRIAGE_FINDINGS, (g_view_mode == ViewMode::TriageFindings) ? MF_CHECKED : MF_UNCHECKED);
         CheckMenuItem(hMenu, IDM_VIEW_MEMORY_MAP, (g_view_mode == ViewMode::MemoryMap) ? MF_CHECKED : MF_UNCHECKED);
+        CheckMenuItem(hMenu, IDM_VIEW_BEHAVIOR, (g_view_mode == ViewMode::BehaviorTracker) ? MF_CHECKED : MF_UNCHECKED);
+        CheckMenuItem(hMenu, IDM_VIEW_STRINGS, (g_view_mode == ViewMode::StringsView) ? MF_CHECKED : MF_UNCHECKED);
         CheckMenuItem(hMenu, IDM_VIEW_PROCESS_DIFF, (g_view_mode == ViewMode::ProcessDiff) ? MF_CHECKED : MF_UNCHECKED);
+        CheckMenuItem(hMenu, IDM_BEHAVIOR_WATCH_ALL_PRIV, g_tracker_watch_all_priv_exec.load() ? MF_CHECKED : MF_UNCHECKED);
+        CheckMenuItem(hMenu, IDM_STRINGS_TOGGLE_NEW, g_strings_filter_new_only ? MF_CHECKED : MF_UNCHECKED);
         CheckMenuItem(hMenu, IDM_VIEW_HIDE_CLEAN, g_hide_clean ? MF_CHECKED : MF_UNCHECKED);
         CheckMenuItem(hMenu, IDM_VIEW_HITS_ONLY, (SendMessageA(g_chk_hits_only, BM_GETCHECK, 0, 0) == BST_CHECKED) ? MF_CHECKED : MF_UNCHECKED);
         CheckMenuItem(hMenu, IDM_TIMELINE_HEARTBEAT, (SendMessageA(g_chk_heartbeat, BM_GETCHECK, 0, 0) == BST_CHECKED) ? MF_CHECKED : MF_UNCHECKED);
@@ -4271,8 +4907,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         else if (id == ID_COMBO_VIEW_MODE && code == CBN_SELCHANGE)
         {
             LRESULT sel = SendMessageA(g_combo_view_mode, CB_GETCURSEL, 0, 0);
-            if (sel == 2)
+            if (sel == 4)
                 g_view_mode = ViewMode::ProcessDiff;
+            else if (sel == 3)
+                g_view_mode = ViewMode::StringsView;
+            else if (sel == 2)
+                g_view_mode = ViewMode::BehaviorTracker;
             else if (sel == 1)
                 g_view_mode = ViewMode::MemoryMap;
             else
@@ -4289,6 +4929,55 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 else
                 {
                     SetWindowTextA(g_lbl_triage_reasons, "Diff Details: No diffs. Click Diff Proc to compare.");
+                }
+            }
+            else if (g_view_mode == ViewMode::BehaviorTracker)
+            {
+                if (!g_visible_indices.empty())
+                {
+                    SendMessageA(g_list_regions, LB_SETCURSEL, 0, 0);
+                    update_triage_details_label(0);
+                    uintptr_t target_base = g_watched_regions[g_visible_indices[0]].key.base;
+                    for (size_t r = 0; r < g_regions.size(); ++r)
+                    {
+                        if (g_regions[r].base == target_base)
+                        {
+                            g_selected_region = r;
+                            g_has_selection = true;
+                            g_view_offset = 0;
+                            display_selected_region(static_cast<SIZE_T>(-1));
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    SetWindowTextA(g_lbl_triage_reasons, "Behavior Details: No regions watched. Attach live process and run triage, or press Ctrl+P to pin.");
+                }
+            }
+            else if (g_view_mode == ViewMode::StringsView)
+            {
+                if (!g_visible_indices.empty())
+                {
+                    SendMessageA(g_list_regions, LB_SETCURSEL, 0, 0);
+                    update_triage_details_label(g_visible_indices[0]);
+                    const auto &st = g_extracted_strings[g_visible_indices[0]];
+                    for (size_t r = 0; r < g_regions.size(); ++r)
+                    {
+                        if (st.addr >= g_regions[r].base && st.addr < g_regions[r].base + g_regions[r].size)
+                        {
+                            g_selected_region = r;
+                            g_has_selection = true;
+                            SIZE_T rel_off = st.addr - g_regions[r].base;
+                            g_view_offset = (rel_off / VIEW_PAGE_SIZE) * VIEW_PAGE_SIZE;
+                            display_selected_region(rel_off);
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    SetWindowTextA(g_lbl_triage_reasons, "Strings Details: No strings extracted. Press F7 to extract from selected region.");
                 }
             }
             else
@@ -4360,6 +5049,45 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                 g_has_selection = true;
                                 g_view_offset = 0;
                                 display_selected_region(static_cast<SIZE_T>(-1));
+                                break;
+                            }
+                        }
+                    }
+                }
+                else if (g_view_mode == ViewMode::BehaviorTracker)
+                {
+                    if (reg_idx < g_watched_regions.size())
+                    {
+                        update_triage_details_label(reg_idx);
+                        uintptr_t target_base = g_watched_regions[reg_idx].key.base;
+                        for (size_t r = 0; r < g_regions.size(); ++r)
+                        {
+                            if (g_regions[r].base == target_base)
+                            {
+                                g_selected_region = r;
+                                g_has_selection = true;
+                                g_view_offset = 0;
+                                display_selected_region(static_cast<SIZE_T>(-1));
+                                break;
+                            }
+                        }
+                    }
+                }
+                else if (g_view_mode == ViewMode::StringsView)
+                {
+                    if (reg_idx < g_extracted_strings.size())
+                    {
+                        update_triage_details_label(reg_idx);
+                        const auto &st = g_extracted_strings[reg_idx];
+                        for (size_t r = 0; r < g_regions.size(); ++r)
+                        {
+                            if (st.addr >= g_regions[r].base && st.addr < g_regions[r].base + g_regions[r].size)
+                            {
+                                g_selected_region = r;
+                                g_has_selection = true;
+                                SIZE_T rel_off = st.addr - g_regions[r].base;
+                                g_view_offset = (rel_off / VIEW_PAGE_SIZE) * VIEW_PAGE_SIZE;
+                                display_selected_region(rel_off);
                                 break;
                             }
                         }
@@ -4578,43 +5306,216 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         {
             open_revealed_strings_dialog(hwnd);
         }
-        else if (id == IDM_VIEW_PROCESS_DIFF)
+        else if (id == IDM_VIEW_BEHAVIOR)
         {
             SendMessageA(g_combo_view_mode, CB_SETCURSEL, 2, 0);
             SendMessageA(hwnd, WM_COMMAND, MAKEWPARAM(ID_COMBO_VIEW_MODE, CBN_SELCHANGE), reinterpret_cast<LPARAM>(g_combo_view_mode));
         }
+        else if (id == IDM_VIEW_STRINGS)
+        {
+            SendMessageA(g_combo_view_mode, CB_SETCURSEL, 3, 0);
+            SendMessageA(hwnd, WM_COMMAND, MAKEWPARAM(ID_COMBO_VIEW_MODE, CBN_SELCHANGE), reinterpret_cast<LPARAM>(g_combo_view_mode));
+        }
+        else if (id == IDM_VIEW_PROCESS_DIFF)
+        {
+            SendMessageA(g_combo_view_mode, CB_SETCURSEL, 4, 0);
+            SendMessageA(hwnd, WM_COMMAND, MAKEWPARAM(ID_COMBO_VIEW_MODE, CBN_SELCHANGE), reinterpret_cast<LPARAM>(g_combo_view_mode));
+        }
+        else if (id == IDM_BEHAVIOR_PIN)
+        {
+            if (g_has_selection && g_selected_region < g_regions.size())
+            {
+                const auto &reg = g_regions[g_selected_region];
+                auto it = std::find_if(g_watched_regions.begin(), g_watched_regions.end(),
+                    [&](const WatchedRegionState &w) { return w.key.base == reg.base && w.key.alloc_base == reg.alloc_base; });
+                if (it != g_watched_regions.end())
+                {
+                    it->is_pinned = !it->is_pinned;
+                    set_status(std::string(it->is_pinned ? "Pinned region 0x" : "Unpinned region 0x") + to_hex_string(reg.base));
+                }
+                else
+                {
+                    WatchedRegionState nw;
+                    nw.key.base = reg.base;
+                    nw.key.alloc_base = reg.alloc_base;
+                    nw.key.generation = g_region_generations[reg.base];
+                    nw.size = reg.size;
+                    nw.type = reg.type;
+                    nw.alloc_protect = reg.alloc_protect;
+                    nw.is_pinned = true;
+                    g_watched_regions.push_back(std::move(nw));
+                    set_status("Pinned and watching region 0x" + to_hex_string(reg.base));
+                }
+                if (g_view_mode == ViewMode::BehaviorTracker)
+                {
+                    populate_region_list();
+                }
+            }
+            else
+            {
+                set_status("Select a region first to pin/unpin for behavior tracking.");
+            }
+        }
+        else if (id == IDM_BEHAVIOR_WATCH_ALL_PRIV)
+        {
+            bool cur = g_tracker_watch_all_priv_exec.load();
+            g_tracker_watch_all_priv_exec.store(!cur);
+            if (!cur)
+            {
+                for (const auto &reg : g_regions)
+                {
+                    bool is_exec = (reg.protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+                    if (reg.type == MEM_PRIVATE && is_exec)
+                    {
+                        auto it = std::find_if(g_watched_regions.begin(), g_watched_regions.end(),
+                            [&](const WatchedRegionState &w) { return w.key.base == reg.base; });
+                        if (it == g_watched_regions.end())
+                        {
+                            WatchedRegionState nw;
+                            nw.key.base = reg.base;
+                            nw.key.alloc_base = reg.alloc_base;
+                            nw.key.generation = g_region_generations[reg.base];
+                            nw.size = reg.size;
+                            nw.type = reg.type;
+                            nw.alloc_protect = reg.alloc_protect;
+                            nw.is_pinned = false;
+                            g_watched_regions.push_back(std::move(nw));
+                        }
+                    }
+                }
+                set_status("Behavior Tracker: Watching all private executable regions (ON).");
+            }
+            else
+            {
+                set_status("Behavior Tracker: Watch all private executable regions (OFF).");
+            }
+            if (g_view_mode == ViewMode::BehaviorTracker)
+            {
+                populate_region_list();
+            }
+        }
+        else if (id == IDM_BEHAVIOR_CLEAR)
+        {
+            for (auto &w : g_watched_regions)
+            {
+                w.ring_samples.clear();
+                w.total_samples = 0;
+                w.behavior_score = 0;
+                w.behavior_flags.clear();
+                w.evidence_summary.clear();
+                w.sleep_evidence = {};
+                w.key_evidence = {};
+                w.decrypt_evidence = {};
+            }
+            g_tracker_total_samples.store(0);
+            g_tracker_partial_samples.store(0);
+            set_status("Behavior tracker sample history cleared.");
+            if (g_view_mode == ViewMode::BehaviorTracker)
+            {
+                populate_region_list();
+            }
+        }
+        else if (id == IDM_STRINGS_BASELINE)
+        {
+            g_string_baselines.clear();
+            for (const auto &st : g_extracted_strings)
+            {
+                g_string_baselines[st.region_base].insert(st.content_hash);
+            }
+            for (auto &st : g_extracted_strings)
+            {
+                st.is_new = false;
+            }
+            set_status("String baseline set (" + std::to_string(g_extracted_strings.size()) + " strings across " +
+                       std::to_string(g_string_baselines.size()) + " regions).");
+            if (g_view_mode == ViewMode::StringsView)
+            {
+                populate_region_list();
+            }
+        }
+        else if (id == IDM_STRINGS_TOGGLE_NEW)
+        {
+            g_strings_filter_new_only = !g_strings_filter_new_only;
+            set_status(g_strings_filter_new_only ? "Strings View: Showing only NEW strings since baseline." : "Strings View: Showing all extracted strings.");
+            if (g_view_mode == ViewMode::StringsView)
+            {
+                populate_region_list();
+            }
+        }
+        else if (id == IDM_STRINGS_EXTRACT_SEL)
+        {
+            if (g_current_source != nullptr && g_has_selection && g_selected_region < g_regions.size())
+            {
+                set_status("Extracting ASCII & UTF-16 strings from selected region...");
+                extract_all_strings_from_source(g_current_source, g_regions, static_cast<int>(g_selected_region), g_strings_min_len);
+                g_view_mode = ViewMode::StringsView;
+                SendMessageA(g_combo_view_mode, CB_SETCURSEL, 3, 0);
+                populate_region_list();
+                set_status("Extracted " + std::to_string(g_extracted_strings.size()) + " strings from region 0x" + to_hex_string(g_regions[g_selected_region].base));
+            }
+            else
+            {
+                set_status("Select a region first to extract strings.");
+            }
+        }
+        else if (id == IDM_STRINGS_EXTRACT_ALL)
+        {
+            if (g_current_source != nullptr && !g_regions.empty())
+            {
+                set_status("Extracting ASCII & UTF-16 strings across all regions (capped)...");
+                extract_all_strings_from_source(g_current_source, g_regions, -1, g_strings_min_len);
+                g_view_mode = ViewMode::StringsView;
+                SendMessageA(g_combo_view_mode, CB_SETCURSEL, 3, 0);
+                populate_region_list();
+                set_status("Extracted " + std::to_string(g_extracted_strings.size()) + " strings across " + std::to_string(g_regions.size()) + " regions.");
+            }
+            else
+            {
+                set_status("Open a memory source or triage first to extract strings.");
+            }
+        }
+        else if (id == IDM_HELP_BEHAVIOR_LIMITS)
+        {
+            std::string limits_info =
+                "Deadeye Behavior Tracker - Polling & Behavior Limitations Guide\n\n"
+                "HOW IT WORKS:\n"
+                "- User-Mode Sampling: Deadeye samples target process memory strictly via ReadProcessMemory without injecting DLLs, hooking syscalls, or pausing threads.\n"
+                "- Configurable Interval: Default sampling tick is 1000ms with a strict 50ms time budget per tick to ensure zero UI lag.\n\n"
+                "HONEST SAMPLING LIMITATIONS:\n"
+                "1. Sub-second Flips: Polling cannot guarantee detection of transitions that flip and revert in <100ms (e.g. RWX decryption that immediately flips back to RX before the next sample).\n"
+                "2. Time-Budgeted Subset: On targets with hundreds of watched regions, samples rotate across subsets within the 50ms budget; partial ticks are recorded and displayed in the status bar.\n"
+                "3. Corroboration: Detections (SLEEP_MASK_SUSPECT, KEY_ROTATION_SUSPECT, DECRYPT_ON_WAKE) combine time-series observation with static heuristics to maintain a high signal-to-noise ratio.\n\n"
+                "SHORTCUTS:\n"
+                "- Ctrl+3: Behavior Tracker View\n"
+                "- Ctrl+4: Strings View\n"
+                "- Ctrl+P: Pin / Unpin region for behavior tracking\n"
+                "- Ctrl+B: Record string baseline for decrypt-on-wake diffing\n"
+                "- F6: Toggle 'New since baseline' strings filter\n"
+                "- F7: Extract strings from selected region\n";
+            MessageBoxA(hwnd, limits_info.c_str(), "Deadeye - Polling Limitations", MB_OK | MB_ICONINFORMATION);
+        }
         else if (id == IDM_HELP_HEURISTICS)
         {
             std::string info =
-                "[+50] INJECTED_PE:\n"
-                "   MZ/PE header detected inside committed MEM_PRIVATE pages.\n"
-                "   (Reflective DLL injection, process hollowing, unhooking)\n\n"
-                "[+50] BEHAVIOR_UNPACK:\n"
-                "   Memory flipped to executable with byte mutations or entropy drop.\n"
-                "   (Payload unpacking, dynamically decoded shellcode)\n\n"
-                "[+65] SLEEP_OBFUSCATION:\n"
-                "   Region protection/entropy oscillates across heartbeat ticks.\n"
-                "   (Encrypted at rest, decrypted while running)\n\n"
-                "[+45] UNLINKED_MODULE:\n"
-                "   MEM_IMAGE allocation missing from PEB InLoadOrderModuleList.\n"
-                "   (DKOM evasion, stealth module unlinking)\n\n"
-                "[+40] PRIVATE_RWX:\n"
-                "   Committed MEM_PRIVATE page with PAGE_EXECUTE_READWRITE.\n"
-                "   (Classic shellcode staging, JIT anomaly)\n\n"
-                "[+35] WRITE_THEN_FLIP:\n"
-                "   Allocated writable (PAGE_READWRITE), currently executable (PAGE_EXECUTE_READ).\n"
-                "   (Evasive staged payload execution)\n\n"
-                "[+25] UNBACKED_EXEC:\n"
-                "   Executable memory not backed by an on-disk image file.\n\n"
+                "Live Defensive Triage Heuristics:\n"
+                "[+50] INJECTED_PE: MZ/PE header detected inside committed MEM_PRIVATE pages.\n"
+                "[+50] BEHAVIOR_UNPACK: Memory flipped to executable with byte mutations or entropy drop.\n"
+                "[+65] SLEEP_OBFUSCATION: Region protection/entropy oscillates across heartbeat ticks.\n"
+                "[+45] UNLINKED_MODULE: MEM_IMAGE allocation missing from PEB InLoadOrderModuleList.\n"
+                "[+40] PRIVATE_RWX: Committed MEM_PRIVATE page with PAGE_EXECUTE_READWRITE.\n"
+                "[+35] WRITE_THEN_FLIP: Allocated writable (PAGE_READWRITE), currently executable.\n"
+                "[+25] UNBACKED_EXEC: Executable memory not backed by an on-disk image file.\n\n"
+                "Entropy & Behavior Profiling Heuristics:\n"
+                "[+35] HIGH_ENTROPY_EXEC: Executable region/page with Shannon entropy >= 7.20.\n"
+                "[+20] HIGH_ENTROPY_PRIVATE: MEM_PRIVATE non-exec region >= 7.40 over >= 16 KB.\n"
+                "[+40] SLEEP_MASK_SUSPECT: Time-series oscillation between low/high entropy or exec/non-exec.\n"
+                "[+35] KEY_ROTATION_SUSPECT: High entropy payload with changing content hash & repeating XOR delta.\n"
+                "[+35] DECRYPT_ON_WAKE: Sharp entropy drop with newly revealed strings vs baseline.\n\n"
                 "Static Binary Heuristics (Mapped PE Offline Analysis):\n"
-                "[+50] STATIC_WX_SECTION:\n"
-                "   Section marked with both Writable and Executable rights (W+X).\n\n"
-                "[+45] STATIC_EP_OUTSIDE_EXEC:\n"
-                "   Entry point RVA is located outside all executable sections.\n\n"
-                "[+40] STATIC_EXEC_HIGH_ENTROPY:\n"
-                "   Executable section with Shannon entropy > 7.20 (packed/encrypted code).\n\n"
-                "[+25] STATIC_NONTRIVIAL_OVERLAY:\n"
-                "   Non-trivial overlay data (> 512 bytes) appended past raw section data.\n\n"
+                "[+50] STATIC_WX_SECTION: Section marked with both Writable and Executable rights (W+X).\n"
+                "[+45] STATIC_EP_OUTSIDE_EXEC: Entry point RVA is located outside all executable sections.\n"
+                "[+40] STATIC_EXEC_HIGH_ENTROPY: Executable section with Shannon entropy >= 7.20.\n"
+                "[+25] STATIC_NONTRIVIAL_OVERLAY: Non-trivial overlay data (> 512 bytes) appended past raw section data.\n\n"
                 "Severity Scoring Thresholds:\n"
                 "  * CRITICAL: Score >= 80\n"
                 "  * HIGH:     Score >= 50\n"
@@ -4672,13 +5573,76 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (wp == IDT_HEARTBEAT)
         {
             evaluate_memory_behavior_heartbeat();
-            if (g_has_selection && g_selected_region < g_regions.size())
+
+            // Behavior Tracker background worker sampling
+            if (g_tracker_active.load() && g_current_source != nullptr && g_current_source->capabilities().is_live && !g_target_process_exited.load())
+            {
+                bool expected = false;
+                if (g_tracker_busy.compare_exchange_strong(expected, true))
+                {
+                    WorkerTask *task = new WorkerTask();
+                    task->task_type = WorkerTaskType::BehaviorTick;
+                    task->hwnd = hwnd;
+                    task->source = g_current_source;
+
+                    HANDLE th = CreateThread(nullptr, 0, WorkerThreadProc, task, 0, nullptr);
+                    if (th != nullptr)
+                    {
+                        CloseHandle(th);
+                    }
+                    else
+                    {
+                        g_tracker_busy.store(false);
+                        delete task;
+                    }
+                }
+                else
+                {
+                    g_tracker_partial_samples++;
+                }
+            }
+
+            if (g_has_selection && g_selected_region < g_regions.size() && g_view_mode != ViewMode::BehaviorTracker && g_view_mode != ViewMode::StringsView)
             {
                 display_selected_region(static_cast<SIZE_T>(-1));
             }
             return 0;
         }
         break;
+
+    case WM_BEHAVIOR_TICK_DONE:
+    {
+        if (g_tracker_active.load())
+        {
+            char status_buf[256];
+            if (g_target_process_exited.load())
+            {
+                std::snprintf(status_buf, sizeof(status_buf),
+                              "Tracker: Target process exited. Total samples: %llu (partial: %llu).",
+                              static_cast<unsigned long long>(g_tracker_total_samples.load()),
+                              static_cast<unsigned long long>(g_tracker_partial_samples.load()));
+            }
+            else
+            {
+                std::snprintf(status_buf, sizeof(status_buf),
+                              "Tracker: %llu samples (%llu partial) @ %ums. Note: Polling limits apply; sub-second flips may be missed. Help: F1",
+                              static_cast<unsigned long long>(g_tracker_total_samples.load()),
+                              static_cast<unsigned long long>(g_tracker_partial_samples.load()),
+                              static_cast<unsigned int>(g_tracker_interval_ms.load()));
+            }
+            SetWindowTextA(g_lbl_status, status_buf);
+        }
+
+        if (g_view_mode == ViewMode::BehaviorTracker)
+        {
+            populate_region_list();
+            if (g_has_selection && g_selected_region < g_watched_regions.size())
+            {
+                update_triage_details_label(g_selected_region);
+            }
+        }
+        return 0;
+    }
 
     case WM_DESTROY:
         KillTimer(hwnd, IDT_HEARTBEAT);

@@ -36,6 +36,714 @@ double calculate_shannon_entropy(const uint8_t *data, size_t len)
     return entropy;
 }
 
+// Computes page-wise Shannon entropy and aggregated region metrics with compact ASCII profile.
+// Pages shorter than 512 bytes are treated as n/a ('?').
+PageEntropyProfile compute_region_entropy_profile(MemorySource &source, uintptr_t base, SIZE_T size)
+{
+    PageEntropyProfile prof;
+    if (size == 0)
+    {
+        prof.ascii_profile = "n/a";
+        return prof;
+    }
+
+    size_t num_pages = (size + 4095) / 4096;
+    prof.total_pages = num_pages;
+
+    // Hardening: Sample up to 64 pages evenly distributed across large regions
+    size_t pages_to_check = num_pages;
+    if (pages_to_check > 64)
+    {
+        pages_to_check = 64;
+        prof.is_sampled = true;
+    }
+
+    std::vector<uint8_t> page_buf(4096);
+    double sum_entropy = 0.0;
+    size_t valid_count = 0;
+    double max_ent = -1.0;
+
+    prof.ascii_profile.reserve(pages_to_check);
+
+    for (size_t k = 0; k < pages_to_check; ++k)
+    {
+        size_t page_idx = (pages_to_check == num_pages) ? k : (k * (num_pages - 1) / (pages_to_check - 1));
+        uintptr_t page_addr = base + page_idx * 4096;
+        SIZE_T bytes_left = (page_idx * 4096 < size) ? (size - page_idx * 4096) : 0;
+        SIZE_T to_read = (bytes_left < 4096) ? bytes_left : 4096;
+
+        if (to_read < 512)
+        {
+            prof.ascii_profile.push_back('?');
+            continue;
+        }
+
+        SIZE_T read_len = source.read(page_addr, to_read, page_buf.data());
+        if (read_len < 512)
+        {
+            prof.ascii_profile.push_back('?');
+            continue;
+        }
+
+        double h = calculate_shannon_entropy(page_buf.data(), read_len);
+        sum_entropy += h;
+        valid_count++;
+        if (h > max_ent)
+        {
+            max_ent = h;
+        }
+
+        // Compact ASCII profile mapping: ._-=#
+        if (h < 2.0)
+            prof.ascii_profile.push_back('.');
+        else if (h < 4.0)
+            prof.ascii_profile.push_back('_');
+        else if (h < 6.0)
+            prof.ascii_profile.push_back('-');
+        else if (h < 7.2)
+            prof.ascii_profile.push_back('=');
+        else
+            prof.ascii_profile.push_back('#');
+    }
+
+    prof.valid_pages = valid_count;
+    if (valid_count > 0)
+    {
+        prof.avg_entropy = sum_entropy / static_cast<double>(valid_count);
+        prof.max_entropy = max_ent;
+    }
+    else
+    {
+        prof.avg_entropy = -1.0;
+        prof.max_entropy = -1.0;
+        if (prof.ascii_profile.empty())
+            prof.ascii_profile = "n/a";
+    }
+
+    return prof;
+}
+
+// Light classification tags for extracted strings (labeled as hints)
+std::string classify_string_tag(const std::string &s)
+{
+    // URL
+    if (s.rfind("http://", 0) == 0 || s.rfind("https://", 0) == 0)
+        return "[URL] (hint)";
+
+    // IPv4 Literal: 4 decimal numbers separated by dots
+    size_t dots = 0;
+    bool is_ip = true;
+    for (char c : s)
+    {
+        if (c == '.') dots++;
+        else if (!std::isdigit(static_cast<unsigned char>(c))) { is_ip = false; break; }
+    }
+    if (is_ip && dots == 3 && s.size() >= 7 && s.size() <= 15)
+        return "[IP] (hint)";
+
+    // Probable Domain: ends with known TLD, contains valid domain characters
+    static const char *TLDS[] = { ".com", ".net", ".org", ".io", ".gov", ".edu", ".ru", ".cn", ".xyz", ".biz", ".info", ".online", ".site" };
+    for (const char *tld : TLDS)
+    {
+        size_t tlen = std::strlen(tld);
+        if (s.size() > tlen && s.compare(s.size() - tlen, tlen, tld) == 0)
+        {
+            bool valid = true;
+            for (char c : s)
+            {
+                if (!std::isalnum(static_cast<unsigned char>(c)) && c != '.' && c != '-')
+                { valid = false; break; }
+            }
+            if (valid) return "[DOMAIN] (hint)";
+        }
+    }
+
+    // File path hint: starts with X:\ or \\ network share
+    if ((s.size() >= 3 && std::isalpha(static_cast<unsigned char>(s[0])) && s[1] == ':' && s[2] == '\\') ||
+        (s.size() >= 2 && s[0] == '\\' && s[1] == '\\'))
+        return "[PATH] (hint)";
+
+    // Registry path hint: starts with HKEY_, HKLM\, HKCU\, or HKCR\ key
+    if (s.rfind("HKEY_", 0) == 0 || s.rfind("HKLM\\", 0) == 0 || s.rfind("HKCU\\", 0) == 0 || s.rfind("HKCR\\", 0) == 0)
+        return "[REG] (hint)";
+
+    return "              ";
+}
+
+// Extracts ASCII and UTF-16LE strings with memory/length capping and baseline comparison
+void extract_all_strings_from_source(
+    std::shared_ptr<MemorySource> source,
+    const std::vector<RegionInfo> &regions,
+    int selected_idx,
+    size_t min_len)
+{
+    g_extracted_strings.clear();
+    if (!source || regions.empty()) return;
+
+    size_t start_r = (selected_idx >= 0 && selected_idx < static_cast<int>(regions.size())) ? static_cast<size_t>(selected_idx) : 0;
+    size_t end_r = (selected_idx >= 0 && selected_idx < static_cast<int>(regions.size())) ? (start_r + 1) : regions.size();
+
+    const size_t MAX_TOTAL_STRINGS = 20000;
+    const size_t MAX_STRINGS_PER_REGION = 5000;
+
+    std::vector<uint8_t> read_buf(64 * 1024);
+
+    for (size_t r = start_r; r < end_r && g_extracted_strings.size() < MAX_TOTAL_STRINGS; ++r)
+    {
+        const auto &reg = regions[r];
+        if (reg.size == 0) continue;
+
+        size_t strings_in_reg = 0;
+        SIZE_T bytes_scanned = 0;
+        SIZE_T total_to_scan = std::min<SIZE_T>(reg.size, 1024 * 1024); // Cap scan to 1 MB per region
+
+        while (bytes_scanned < total_to_scan && strings_in_reg < MAX_STRINGS_PER_REGION && g_extracted_strings.size() < MAX_TOTAL_STRINGS)
+        {
+            SIZE_T chunk = std::min<SIZE_T>(read_buf.size(), total_to_scan - bytes_scanned);
+            SIZE_T n_read = source->read(reg.base + bytes_scanned, chunk, read_buf.data());
+            if (n_read < min_len)
+            {
+                bytes_scanned += chunk;
+                continue;
+            }
+
+            // ASCII extraction
+            std::string cur_str;
+            size_t cur_start = 0;
+            for (size_t i = 0; i < n_read; ++i)
+            {
+                uint8_t b = read_buf[i];
+                if (b >= 32 && b <= 126)
+                {
+                    if (cur_str.empty()) cur_start = i;
+                    cur_str.push_back(static_cast<char>(b));
+                }
+                else
+                {
+                    if (cur_str.size() >= min_len)
+                    {
+                        ExtractedStringItem item;
+                        item.addr = reg.base + bytes_scanned + cur_start;
+                        item.encoding = "ASCII";
+                        item.length = cur_str.size();
+                        item.tag_hint = classify_string_tag(cur_str);
+                        item.content_hash = fnv1a64(reinterpret_cast<const uint8_t*>(cur_str.data()), cur_str.size());
+                        item.region_base = reg.base;
+                        if (g_string_baselines.count(reg.base) > 0)
+                        {
+                            item.is_new = (g_string_baselines[reg.base].count(item.content_hash) == 0);
+                        }
+                        item.text = (cur_str.size() > 256) ? (cur_str.substr(0, 256) + "...") : cur_str;
+                        g_extracted_strings.push_back(item);
+                        strings_in_reg++;
+                        if (strings_in_reg >= MAX_STRINGS_PER_REGION || g_extracted_strings.size() >= MAX_TOTAL_STRINGS)
+                            break;
+                    }
+                    cur_str.clear();
+                }
+            }
+            if (cur_str.size() >= min_len && strings_in_reg < MAX_STRINGS_PER_REGION && g_extracted_strings.size() < MAX_TOTAL_STRINGS)
+            {
+                ExtractedStringItem item;
+                item.addr = reg.base + bytes_scanned + cur_start;
+                item.encoding = "ASCII";
+                item.length = cur_str.size();
+                item.tag_hint = classify_string_tag(cur_str);
+                item.content_hash = fnv1a64(reinterpret_cast<const uint8_t*>(cur_str.data()), cur_str.size());
+                item.region_base = reg.base;
+                if (g_string_baselines.count(reg.base) > 0)
+                {
+                    item.is_new = (g_string_baselines[reg.base].count(item.content_hash) == 0);
+                }
+                item.text = (cur_str.size() > 256) ? (cur_str.substr(0, 256) + "...") : cur_str;
+                g_extracted_strings.push_back(item);
+                strings_in_reg++;
+            }
+
+            // UTF-16LE extraction
+            std::string cur_wstr;
+            size_t cur_wstart = 0;
+            for (size_t i = 0; i + 1 < n_read; i += 2)
+            {
+                uint8_t c = read_buf[i];
+                uint8_t zero = read_buf[i + 1];
+                if (zero == 0 && c >= 32 && c <= 126)
+                {
+                    if (cur_wstr.empty()) cur_wstart = i;
+                    cur_wstr.push_back(static_cast<char>(c));
+                }
+                else
+                {
+                    if (cur_wstr.size() >= min_len)
+                    {
+                        ExtractedStringItem item;
+                        item.addr = reg.base + bytes_scanned + cur_wstart;
+                        item.encoding = "UTF-16";
+                        item.length = cur_wstr.size();
+                        item.tag_hint = classify_string_tag(cur_wstr);
+                        item.content_hash = fnv1a64(reinterpret_cast<const uint8_t*>(cur_wstr.data()), cur_wstr.size());
+                        item.region_base = reg.base;
+                        if (g_string_baselines.count(reg.base) > 0)
+                        {
+                            item.is_new = (g_string_baselines[reg.base].count(item.content_hash) == 0);
+                        }
+                        item.text = (cur_wstr.size() > 256) ? (cur_wstr.substr(0, 256) + "...") : cur_wstr;
+                        g_extracted_strings.push_back(item);
+                        strings_in_reg++;
+                        if (strings_in_reg >= MAX_STRINGS_PER_REGION || g_extracted_strings.size() >= MAX_TOTAL_STRINGS)
+                            break;
+                    }
+                    cur_wstr.clear();
+                }
+            }
+            if (cur_wstr.size() >= min_len && strings_in_reg < MAX_STRINGS_PER_REGION && g_extracted_strings.size() < MAX_TOTAL_STRINGS)
+            {
+                ExtractedStringItem item;
+                item.addr = reg.base + bytes_scanned + cur_wstart;
+                item.encoding = "UTF-16";
+                item.length = cur_wstr.size();
+                item.tag_hint = classify_string_tag(cur_wstr);
+                item.content_hash = fnv1a64(reinterpret_cast<const uint8_t*>(cur_wstr.data()), cur_wstr.size());
+                item.region_base = reg.base;
+                if (g_string_baselines.count(reg.base) > 0)
+                {
+                    item.is_new = (g_string_baselines[reg.base].count(item.content_hash) == 0);
+                }
+                item.text = (cur_wstr.size() > 256) ? (cur_wstr.substr(0, 256) + "...") : cur_wstr;
+                g_extracted_strings.push_back(item);
+                strings_in_reg++;
+            }
+
+            bytes_scanned += chunk;
+        }
+    }
+}
+
+// Appends sample to ring buffer (capped at 120 samples per region)
+inline void add_sample_to_ring(WatchedRegionState &wreg, const RegionSampleRecord &rec)
+{
+    if (wreg.ring_samples.size() >= RING_BUFFER_CAP)
+    {
+        wreg.ring_samples.erase(wreg.ring_samples.begin());
+    }
+    wreg.ring_samples.push_back(rec);
+    wreg.total_samples++;
+}
+
+// Forward declaration of extract_strings_from_buffer
+std::vector<RevealedString> extract_strings_from_buffer(const uint8_t *data, size_t len, uintptr_t base_addr, size_t min_len);
+
+// Evaluates behavioral detections over watched region sample history
+void evaluate_watched_region_detections(std::shared_ptr<MemorySource> source, WatchedRegionState &wreg)
+{
+    (void)source;
+    wreg.behavior_flags.clear();
+    wreg.behavior_score = 0;
+    std::string evidence_str;
+
+    if (wreg.ring_samples.size() < 2) return;
+
+    bool is_exec = (wreg.alloc_protect & (PAGE_EXECUTE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY)) != 0;
+    for (const auto &s : wreg.ring_samples)
+    {
+        if ((s.protect & (PAGE_EXECUTE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY)) != 0)
+        {
+            is_exec = true;
+            break;
+        }
+    }
+    bool is_suspicious_static = is_exec || (wreg.type == MEM_PRIVATE);
+
+    // 1. SLEEP_MASK_SUSPECT:
+    // Oscillations between low-entropy (< 5.5) and high-entropy (> 7.0),
+    // and/or protection cycles through executable <-> non-executable or NOACCESS states, at least 3 full cycles.
+    int cycles = 0;
+    double min_ent = 99.0;
+    double max_ent = -1.0;
+    std::string protect_seq;
+    DWORD last_prot = 0;
+    bool in_dormant_state = false;
+    uint64_t first_cycle_t = 0;
+    uint64_t last_cycle_t = 0;
+
+    for (size_t i = 0; i < wreg.ring_samples.size(); ++i)
+    {
+        const auto &s = wreg.ring_samples[i];
+        if (!s.is_unreadable && s.avg_entropy > 0.0)
+        {
+            if (s.avg_entropy < min_ent) min_ent = s.avg_entropy;
+            if (s.avg_entropy > max_ent) max_ent = s.avg_entropy;
+        }
+
+        if (s.protect != last_prot && s.protect != 0)
+        {
+            if (!protect_seq.empty()) protect_seq += "->";
+            protect_seq += prot_short(s.protect);
+            last_prot = s.protect;
+        }
+
+        bool cur_dormant = ((s.protect & (PAGE_NOACCESS | PAGE_READWRITE | PAGE_READONLY)) != 0) || (s.avg_entropy > 7.0);
+        bool cur_active = ((s.protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0) && (s.avg_entropy < 6.0 && s.avg_entropy > 0.0);
+
+        if (!in_dormant_state && cur_dormant)
+        {
+            in_dormant_state = true;
+        }
+        else if (in_dormant_state && cur_active)
+        {
+            cycles++;
+            in_dormant_state = false;
+            if (first_cycle_t == 0) first_cycle_t = s.timestamp_ms;
+            last_cycle_t = s.timestamp_ms;
+        }
+    }
+
+    if (min_ent > 10.0) min_ent = 0.0;
+    if (max_ent < 0.0) max_ent = 0.0;
+
+    if (cycles >= 3)
+    {
+        double period_ms = (cycles > 1 && last_cycle_t > first_cycle_t) ?
+            static_cast<double>(last_cycle_t - first_cycle_t) / static_cast<double>(cycles - 1) : 2000.0;
+
+        wreg.sleep_evidence.cycles = cycles;
+        wreg.sleep_evidence.period_ms = period_ms;
+        wreg.sleep_evidence.min_entropy = min_ent;
+        wreg.sleep_evidence.max_entropy = max_ent;
+        wreg.sleep_evidence.protect_seq = protect_seq;
+
+        int score = is_suspicious_static ? WEIGHT_SLEEP_MASK_SUSPECT : (WEIGHT_SLEEP_MASK_SUSPECT / 2);
+        wreg.behavior_score += score;
+        wreg.behavior_flags.push_back("SLEEP_MASK_SUSPECT");
+
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "[SLEEP_MASK] %d cycles (~%.0fms), H: %.2f-%.2f, Seq: %s",
+                      cycles, period_ms, min_ent, max_ent, protect_seq.c_str());
+        if (!evidence_str.empty()) evidence_str += " | ";
+        evidence_str += buf;
+    }
+
+    // 2. KEY_ROTATION_SUSPECT:
+    // High entropy while content hash changes with large changed-byte fraction.
+    // XOR delta image check: test repeating period P in [1, 64].
+    const RegionSampleRecord *s1 = nullptr;
+    const RegionSampleRecord *s2 = nullptr;
+
+    for (auto it = wreg.ring_samples.rbegin(); it != wreg.ring_samples.rend(); ++it)
+    {
+        if (!it->is_unreadable && it->avg_entropy >= 6.8 && it->sample_bytes.size() >= 256)
+        {
+            if (!s2)
+            {
+                s2 = &(*it);
+            }
+            else if (!s1)
+            {
+                if (it->content_hash != s2->content_hash && it->changed_fraction >= 0.25)
+                {
+                    s1 = &(*it);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (s1 && s2)
+    {
+        size_t L = std::min(s1->sample_bytes.size(), s2->sample_bytes.size());
+        if (L >= 256)
+        {
+            std::vector<uint8_t> delta(L);
+            for (size_t i = 0; i < L; ++i)
+            {
+                delta[i] = s1->sample_bytes[i] ^ s2->sample_bytes[i];
+            }
+
+            size_t best_period = 0;
+            for (size_t P = 1; P <= 64 && P < L / 2; ++P)
+            {
+                size_t comparisons = L - P;
+                size_t matches = 0;
+                for (size_t i = 0; i < comparisons; ++i)
+                {
+                    if (delta[i] == delta[i + P])
+                        matches++;
+                }
+                if (matches == comparisons && comparisons >= 128)
+                {
+                    best_period = P;
+                    break;
+                }
+            }
+
+            if (best_period > 0)
+            {
+                wreg.key_evidence.xor_period = best_period;
+                wreg.key_evidence.avg_entropy = s2->avg_entropy;
+                wreg.key_evidence.avg_changed_frac = s2->changed_fraction;
+                wreg.key_evidence.candidate_delta_key.assign(delta.begin(), delta.begin() + best_period);
+                wreg.key_evidence.note = "Candidate delta key represents XOR difference between consecutive states, not recovered plaintext key.";
+
+                int score = is_suspicious_static ? WEIGHT_KEY_ROTATION_SUSPECT : (WEIGHT_KEY_ROTATION_SUSPECT / 2);
+                wreg.behavior_score += score;
+                wreg.behavior_flags.push_back("KEY_ROTATION_SUSPECT");
+
+                std::string key_hex;
+                for (size_t b = 0; b < best_period && b < 16; ++b)
+                {
+                    char h[4];
+                    std::snprintf(h, sizeof(h), "%02X ", delta[b]);
+                    key_hex += h;
+                }
+
+                char buf[256];
+                std::snprintf(buf, sizeof(buf), "[KEY_ROTATION] re-keyed with repeating XOR key, period %zu, candidate delta key bytes: %s(note: delta key)",
+                              best_period, key_hex.c_str());
+                if (!evidence_str.empty()) evidence_str += " | ";
+                evidence_str += buf;
+            }
+        }
+    }
+
+    // 3. DECRYPT_ON_WAKE:
+    // Entropy drops sharply (high -> low) and new strings appear vs baseline.
+    for (size_t i = 1; i < wreg.ring_samples.size(); ++i)
+    {
+        const auto &prev = wreg.ring_samples[i - 1];
+        const auto &curr = wreg.ring_samples[i];
+        if (!prev.is_unreadable && !curr.is_unreadable &&
+            prev.avg_entropy >= 6.8 && curr.avg_entropy <= 5.8 && (prev.avg_entropy - curr.avg_entropy) >= 1.2)
+        {
+            if (g_string_baselines.count(wreg.key.base) > 0)
+            {
+                const auto &base_set = g_string_baselines[wreg.key.base];
+                auto revealed = extract_strings_from_buffer(curr.sample_bytes.data(), curr.sample_bytes.size(), wreg.key.base, 6);
+                size_t new_count = 0;
+                std::vector<std::string> sample_strs;
+                for (const auto &rs : revealed)
+                {
+                    uint64_t h = fnv1a64(reinterpret_cast<const uint8_t*>(rs.text.data()), rs.text.size());
+                    if (base_set.count(h) == 0)
+                    {
+                        new_count++;
+                        if (sample_strs.size() < 10)
+                        {
+                            sample_strs.push_back(rs.text);
+                        }
+                    }
+                }
+
+                if (new_count > 0)
+                {
+                    wreg.decrypt_evidence.entropy_before = prev.avg_entropy;
+                    wreg.decrypt_evidence.entropy_after = curr.avg_entropy;
+                    wreg.decrypt_evidence.new_strings_count = new_count;
+                    wreg.decrypt_evidence.sample_strings = sample_strs;
+
+                    int score = is_suspicious_static ? WEIGHT_DECRYPT_ON_WAKE : (WEIGHT_DECRYPT_ON_WAKE / 2);
+                    wreg.behavior_score += score;
+                    wreg.behavior_flags.push_back("DECRYPT_ON_WAKE");
+
+                    char buf[256];
+                    std::snprintf(buf, sizeof(buf), "[DECRYPT_ON_WAKE] H: %.2f->%.2f, %zu new strings vs baseline",
+                                  prev.avg_entropy, curr.avg_entropy, new_count);
+                    if (!evidence_str.empty()) evidence_str += " | ";
+                    evidence_str += buf;
+                    break;
+                }
+            }
+        }
+    }
+
+    wreg.evidence_summary = evidence_str;
+}
+
+// Background worker thread behavior sampling tick
+void run_behavior_tracker_tick(std::shared_ptr<MemorySource> source, HWND hwnd)
+{
+    (void)hwnd;
+    if (!source || !source->capabilities().is_live) return;
+    DWORD pid = source->get_pid();
+    if (pid == 0) return;
+
+    HANDLE proc = get_or_open_target_proc(pid);
+    if (!proc)
+    {
+        g_target_process_exited.store(true);
+        return;
+    }
+
+    DWORD exit_code = 0;
+    if (GetExitCodeProcess(proc, &exit_code) && exit_code != STILL_ACTIVE)
+    {
+        g_target_process_exited.store(true);
+        return;
+    }
+
+    // Populate initial watch set if empty
+    if (g_watched_regions.empty() && !g_regions.empty())
+    {
+        for (const auto &reg : g_regions)
+        {
+            bool is_exec = (reg.protect & (PAGE_EXECUTE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY)) != 0;
+            bool high_ent = (reg.avg_entropy >= 7.2 || reg.max_entropy >= 7.2);
+            bool priv_exec = (reg.type == MEM_PRIVATE && is_exec);
+
+            int sev = 0;
+            for (const auto &f : g_triage_report.findings)
+            {
+                if (f.base == reg.base) { sev = f.severity_score; break; }
+            }
+
+            if (sev >= 25 || high_ent || (g_tracker_watch_all_priv_exec.load() && priv_exec))
+            {
+                WatchedRegionState ws;
+                ws.key.base = reg.base;
+                ws.key.alloc_base = reg.alloc_base;
+                ws.key.generation = g_region_generations[reg.base];
+                ws.size = reg.size;
+                ws.type = reg.type;
+                ws.alloc_protect = reg.alloc_protect;
+                ws.is_pinned = false;
+                g_watched_regions.push_back(ws);
+            }
+        }
+    }
+
+    size_t N = g_watched_regions.size();
+    if (N == 0) return;
+
+    auto tick_start = std::chrono::steady_clock::now();
+    g_tracker_total_samples++;
+    bool was_partial = false;
+    uint64_t now_ms = static_cast<uint64_t>(GetTickCount64());
+
+    size_t start_idx = g_tracker_rotating_idx % N;
+    size_t sampled_in_tick = 0;
+
+    for (size_t step = 0; step < N; ++step)
+    {
+        size_t idx = (start_idx + step) % N;
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - tick_start).count();
+        if (elapsed_ms >= 50 && sampled_in_tick > 0)
+        {
+            was_partial = true;
+            g_tracker_rotating_idx = idx;
+            break;
+        }
+
+        WatchedRegionState &wreg = g_watched_regions[idx];
+        if (wreg.is_deallocated) continue;
+
+        sampled_in_tick++;
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (VirtualQueryEx(proc, reinterpret_cast<LPCVOID>(wreg.key.base), &mbi, sizeof(mbi)) != sizeof(mbi))
+        {
+            wreg.is_deallocated = true;
+            RegionSampleRecord rec;
+            rec.timestamp_ms = now_ms;
+            rec.state = MEM_FREE;
+            rec.is_unreadable = true;
+            add_sample_to_ring(wreg, rec);
+            continue;
+        }
+
+        if (mbi.State == MEM_FREE)
+        {
+            wreg.is_deallocated = true;
+            RegionSampleRecord rec;
+            rec.timestamp_ms = now_ms;
+            rec.state = MEM_FREE;
+            rec.is_unreadable = true;
+            add_sample_to_ring(wreg, rec);
+            continue;
+        }
+
+        // Handle size or allocation base change without mixing up identities
+        if (reinterpret_cast<uintptr_t>(mbi.AllocationBase) != wreg.key.alloc_base || mbi.RegionSize != wreg.size)
+        {
+            g_region_generations[wreg.key.base]++;
+            wreg.key.alloc_base = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
+            wreg.key.generation = g_region_generations[wreg.key.base];
+            wreg.size = mbi.RegionSize;
+        }
+
+        RegionSampleRecord rec;
+        rec.timestamp_ms = now_ms;
+        rec.protect = mbi.Protect;
+        rec.state = mbi.State;
+
+        // If NOACCESS or GUARD, record without attempting read
+        if ((mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0)
+        {
+            rec.is_unreadable = true;
+            rec.content_hash = 0;
+            rec.avg_entropy = 0.0;
+            rec.changed_fraction = 0.0;
+            add_sample_to_ring(wreg, rec);
+            evaluate_watched_region_detections(source, wreg);
+            continue;
+        }
+
+        // Readable: Read capped bytes (up to 64 KB)
+        SIZE_T to_read = (wreg.size < 64 * 1024) ? wreg.size : (64 * 1024);
+        std::vector<uint8_t> read_buf(to_read);
+        SIZE_T bytes_read = 0;
+        if (ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(wreg.key.base), read_buf.data(), to_read, &bytes_read) && bytes_read >= 512)
+        {
+            rec.is_unreadable = false;
+            rec.content_hash = fnv1a64(read_buf.data(), bytes_read);
+            rec.avg_entropy = calculate_shannon_entropy(read_buf.data(), bytes_read);
+
+            SIZE_T save_len = (bytes_read < 4096) ? bytes_read : 4096;
+            rec.sample_bytes.assign(read_buf.data(), read_buf.data() + save_len);
+
+            if (!wreg.ring_samples.empty())
+            {
+                const RegionSampleRecord *prev = nullptr;
+                for (auto it = wreg.ring_samples.rbegin(); it != wreg.ring_samples.rend(); ++it)
+                {
+                    if (!it->is_unreadable && !it->sample_bytes.empty())
+                    {
+                        prev = &(*it);
+                        break;
+                    }
+                }
+                if (prev != nullptr)
+                {
+                    size_t cmp_len = std::min(rec.sample_bytes.size(), prev->sample_bytes.size());
+                    if (cmp_len > 0)
+                    {
+                        size_t diff_bytes = 0;
+                        for (size_t i = 0; i < cmp_len; ++i)
+                        {
+                            if (rec.sample_bytes[i] != prev->sample_bytes[i])
+                                diff_bytes++;
+                        }
+                        rec.changed_fraction = static_cast<double>(diff_bytes) / static_cast<double>(cmp_len);
+                    }
+                }
+            }
+        }
+        else
+        {
+            rec.is_unreadable = true;
+        }
+
+        add_sample_to_ring(wreg, rec);
+        evaluate_watched_region_detections(source, wreg);
+    }
+
+    if (was_partial)
+    {
+        g_tracker_partial_samples++;
+    }
+    else
+    {
+        g_tracker_rotating_idx = (start_idx + sampled_in_tick) % N;
+    }
+}
+
 std::string categorize_extracted_string(const std::string &s)
 {
     if (s.rfind("http://", 0) == 0 || s.rfind("https://", 0) == 0 || s.rfind("ftp://", 0) == 0 ||

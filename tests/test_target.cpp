@@ -51,6 +51,22 @@ static std::atomic<uint64_t> g_beacon_seq{0};
 static uint8_t *g_dynamic_buf = nullptr;
 static const SIZE_T DYNAMIC_BUF_SIZE = 64 * 1024;
 
+// Mode 5: High Entropy Executable Buffer (HIGH_ENTROPY_EXEC)
+static uint8_t *g_high_ent_exec_buf = nullptr;
+static const SIZE_T HIGH_ENT_EXEC_SIZE = 64 * 1024;
+
+// Mode 6: Sleep-mask simulation with rotating 8-byte XOR key (SLEEP_MASK_SUSPECT & KEY_ROTATION_SUSPECT)
+static uint8_t *g_sleepmask_rot_buf = nullptr;
+static const SIZE_T SLEEPMASK_ROT_SIZE = 64 * 1024;
+static std::atomic<int> g_sleepmask_rot_cycle{0};
+static std::atomic<bool> g_sleepmask_is_sleeping{false};
+static uint8_t g_current_xor_key[8] = {0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE};
+
+// Mode 7: Decrypt-on-wake strings (DECRYPT_ON_WAKE)
+static uint8_t *g_decrypt_on_wake_buf = nullptr;
+static const SIZE_T DECRYPT_ON_WAKE_SIZE = 64 * 1024;
+static std::atomic<bool> g_decrypt_is_decrypted{false};
+
 static std::atomic<bool> g_running{true};
 static std::atomic<bool> g_auto_pilot{true};
 
@@ -277,6 +293,148 @@ void toggle_dynamic_region()
     }
 }
 
+// 6. Setup High Entropy Executable Region (Mode 5: HIGH_ENTROPY_EXEC)
+void init_high_entropy_exec_region()
+{
+    g_high_ent_exec_buf = static_cast<uint8_t*>(VirtualAlloc(nullptr, HIGH_ENT_EXEC_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READ));
+    if (!g_high_ent_exec_buf) return;
+
+    // Fill with high-entropy pseudo-random bytes (Shannon entropy ~7.95)
+    uint32_t seed = 0x1337BEEF;
+    for (size_t i = 0; i < HIGH_ENT_EXEC_SIZE; ++i)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        g_high_ent_exec_buf[i] = static_cast<uint8_t>(seed >> 24);
+    }
+}
+
+// 7. Setup Sleep-Mask Simulation with Rotating 8-byte XOR Key (Mode 6: SLEEP_MASK_SUSPECT & KEY_ROTATION_SUSPECT)
+void init_sleepmask_rot_region()
+{
+    g_sleepmask_rot_buf = static_cast<uint8_t*>(VirtualAlloc(nullptr, SLEEPMASK_ROT_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!g_sleepmask_rot_buf) return;
+
+    // Fill with high-entropy encrypted shellcode template
+    uint32_t seed = 0x98765432;
+    for (size_t i = 0; i < SLEEPMASK_ROT_SIZE; ++i)
+    {
+        seed = seed * 1103515245u + 12345u;
+        g_sleepmask_rot_buf[i] = static_cast<uint8_t>(seed >> 16);
+    }
+    for (size_t i = 0; i < SLEEPMASK_ROT_SIZE; ++i)
+    {
+        g_sleepmask_rot_buf[i] ^= g_current_xor_key[i % 8];
+    }
+
+    DWORD old_prot = 0;
+    VirtualProtect(g_sleepmask_rot_buf, SLEEPMASK_ROT_SIZE, PAGE_EXECUTE_READ, &old_prot);
+    g_sleepmask_is_sleeping.store(false);
+}
+
+void trigger_sleepmask_rot_cycle()
+{
+    if (!g_sleepmask_rot_buf) return;
+    DWORD old_prot = 0;
+    bool sleeping = g_sleepmask_is_sleeping.load();
+
+    if (!sleeping)
+    {
+        // Active -> Sleep: Flip protection to PAGE_NOACCESS
+        VirtualProtect(g_sleepmask_rot_buf, SLEEPMASK_ROT_SIZE, PAGE_NOACCESS, &old_prot);
+        g_sleepmask_is_sleeping.store(true);
+        int cyc = g_sleepmask_rot_cycle.fetch_add(1);
+        std::cout << "  [SLEEP-MASK] -> Dormant state | Protection: PAGE_NOACCESS (Cycle #" << cyc + 1 << ")\n";
+    }
+    else
+    {
+        // Sleep -> Active: Reprotect to RW to rotate XOR key, then flip back to RX
+        VirtualProtect(g_sleepmask_rot_buf, SLEEPMASK_ROT_SIZE, PAGE_READWRITE, &old_prot);
+
+        // Rotate 8-byte XOR key (delta key has period 8)
+        uint8_t delta_key[8] = {0x24, 0x18, 0x5A, 0x33, 0x7E, 0x91, 0x4D, 0x82};
+        for (size_t i = 0; i < SLEEPMASK_ROT_SIZE; ++i)
+        {
+            g_sleepmask_rot_buf[i] ^= delta_key[i % 8];
+        }
+        for (int k = 0; k < 8; ++k)
+        {
+            g_current_xor_key[k] ^= delta_key[k];
+        }
+
+        VirtualProtect(g_sleepmask_rot_buf, SLEEPMASK_ROT_SIZE, PAGE_EXECUTE_READ, &old_prot);
+        g_sleepmask_is_sleeping.store(false);
+        std::cout << "  [SLEEP-MASK] -> Active state | Key rotated (period 8) | Protection: PAGE_EXECUTE_READ\n";
+    }
+}
+
+// 8. Setup Decrypt-on-Wake Strings Region (Mode 7: DECRYPT_ON_WAKE)
+void init_decrypt_on_wake_region()
+{
+    g_decrypt_on_wake_buf = static_cast<uint8_t*>(VirtualAlloc(nullptr, DECRYPT_ON_WAKE_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (!g_decrypt_on_wake_buf) return;
+
+    // Encrypted state initially (high entropy ~7.90)
+    uint32_t seed = 0xDEADBEEF;
+    for (size_t i = 0; i < DECRYPT_ON_WAKE_SIZE; ++i)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        g_decrypt_on_wake_buf[i] = static_cast<uint8_t>(seed >> 24);
+    }
+    g_decrypt_is_decrypted.store(false);
+}
+
+void trigger_decrypt_on_wake()
+{
+    if (!g_decrypt_on_wake_buf) return;
+    bool is_dec = g_decrypt_is_decrypted.load();
+
+    if (!is_dec)
+    {
+        // Decrypt into cleartext strings (entropy drops sharply from ~7.90 to ~3.20)
+        std::memset(g_decrypt_on_wake_buf, 0x20, DECRYPT_ON_WAKE_SIZE);
+
+        const char *c2_url = "https://c2-covert-apt.darknet.org/gateway/sync";
+        const char *c2_ip = "198.51.100.177";
+        const char *exfil_path = "C:\\Windows\\Temp\\exfil_archive.dat";
+        const char *cmd_exec = "cmd.exe /c whoami & net user & tasklist";
+        const char *reg_key = "HKLM\\System\\CurrentControlSet\\Services\\DeadeyeSim";
+
+        std::memcpy(g_decrypt_on_wake_buf + 256, c2_url, std::strlen(c2_url) + 1);
+        std::memcpy(g_decrypt_on_wake_buf + 512, c2_ip, std::strlen(c2_ip) + 1);
+        std::memcpy(g_decrypt_on_wake_buf + 768, exfil_path, std::strlen(exfil_path) + 1);
+        std::memcpy(g_decrypt_on_wake_buf + 1024, cmd_exec, std::strlen(cmd_exec) + 1);
+        std::memcpy(g_decrypt_on_wake_buf + 1280, reg_key, std::strlen(reg_key) + 1);
+
+        const wchar_t *w_domain = L"internal-ad.corp-defense.network";
+        std::memcpy(g_decrypt_on_wake_buf + 1536, w_domain, (wcslen(w_domain) + 1) * sizeof(wchar_t));
+
+        DWORD old_prot = 0;
+        VirtualProtect(g_decrypt_on_wake_buf, DECRYPT_ON_WAKE_SIZE, PAGE_EXECUTE_READ, &old_prot);
+        g_decrypt_is_decrypted.store(true);
+
+        std::cout << "\n>>> [DECRYPT-ON-WAKE TRIGGERED] <<<\n";
+        std::cout << "  * Decrypted cleartext C2 strings (Entropy dropped: 7.90 -> 3.20)\n";
+        std::cout << "  * Protection flipped to PAGE_EXECUTE_READ\n";
+        std::cout << "  * Deadeye detection: Check Behavior View (Ctrl+3) for DECRYPT_ON_WAKE (+35 pts)\n";
+        std::cout << "    and Strings View (Ctrl+4) with 'New since baseline' (F6)!\n\n";
+    }
+    else
+    {
+        // Re-encrypt buffer back to high entropy
+        DWORD old_prot = 0;
+        VirtualProtect(g_decrypt_on_wake_buf, DECRYPT_ON_WAKE_SIZE, PAGE_READWRITE, &old_prot);
+        uint32_t seed = 0xCAFEBABE;
+        for (size_t i = 0; i < DECRYPT_ON_WAKE_SIZE; ++i)
+        {
+            seed = seed * 1664525u + 1013904223u;
+            g_decrypt_on_wake_buf[i] = static_cast<uint8_t>(seed >> 24);
+        }
+        VirtualProtect(g_decrypt_on_wake_buf, DECRYPT_ON_WAKE_SIZE, PAGE_EXECUTE_READ, &old_prot);
+        g_decrypt_is_decrypted.store(false);
+        std::cout << "  [RE-ENCRYPTED] Buffer returned to encrypted state (H >= 7.90).\n";
+    }
+}
+
 void print_banner(DWORD pid)
 {
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -294,13 +452,19 @@ void print_banner(DWORD pid)
     std::cout << "  [2] Dynamic Unpack Region:     " << to_hex_ptr(g_unpack_buf) << " (64 KB, packed -> cleartext + IOCs)\n";
     std::cout << "  [3] Injected PE in Private:    " << to_hex_ptr(g_pe_in_priv_buf) << " (64 KB, MZ/PE in MEM_PRIVATE)\n";
     std::cout << "  [4] Live Beacon State:         " << to_hex_ptr(g_beacon_buf) << " (32 KB, in-place mutating)\n";
+    std::cout << "  [5] High Entropy Executable:   " << to_hex_ptr(g_high_ent_exec_buf) << " (64 KB, H ~ 7.95, RX)\n";
+    std::cout << "  [6] Sleep-Mask Rotating XOR:   " << to_hex_ptr(g_sleepmask_rot_buf) << " (64 KB, period 8 XOR key, NOACCESS <-> RX)\n";
+    std::cout << "  [7] Decrypt-On-Wake Region:    " << to_hex_ptr(g_decrypt_on_wake_buf) << " (64 KB, H 7.9 -> 3.2 drop + C2 strings)\n";
     std::cout << "----------------------------------------------------------------------\n";
     std::cout << "Controls:\n";
-    std::cout << "  [A] Toggle Auto-pilot loop (Sleep cycling + Beacon mutations) [Currently: ON]\n";
+    std::cout << "  [A] Toggle Auto-pilot loop (Sleep cycling, Key rotation, Beacon mutations) [Currently: ON]\n";
     std::cout << "  [1] Trigger Live Unpack Transition (Reveals C2 strings, flips RW->RX)\n";
     std::cout << "  [2] Trigger Sleep Obfuscation Cycle (Encrypt/Decrypt payload)\n";
     std::cout << "  [3] Toggle Dynamic Staging Buffer (Allocates [+NEW] or Frees [-FREED])\n";
     std::cout << "  [4] Mutate Beacon Memory Now\n";
+    std::cout << "  [5] Re-randomize High Entropy Executable Buffer (H >= 7.90)\n";
+    std::cout << "  [6] Trigger Sleep-Mask Rotating XOR Cycle (NOACCESS <-> RX, Key Period 8)\n";
+    std::cout << "  [7] Trigger Decrypt-On-Wake Transition (Sharp entropy drop + C2 strings)\n";
     std::cout << "  [Q] Exit Test Target\n";
     std::cout << "======================================================================\n\n";
 }
@@ -313,6 +477,9 @@ int main()
     init_unpack_region();
     init_injected_pe_region();
     init_beacon_region();
+    init_high_entropy_exec_region();
+    init_sleepmask_rot_region();
+    init_decrypt_on_wake_region();
 
     print_banner(pid);
 
@@ -336,6 +503,12 @@ int main()
             if (tick_counter % 8 == 0)
             {
                 toggle_sleep_obfuscation();
+            }
+
+            // Auto sleep-mask rotating key cycle every 3s
+            if (tick_counter % 6 == 0)
+            {
+                trigger_sleepmask_rot_cycle();
             }
 
             // Auto unpack trigger after 10 seconds if not already triggered
@@ -380,6 +553,19 @@ int main()
                 mutate_beacon_region();
                 std::cout << "  [MUTATED] Beacon heartbeat memory mutated.\n";
             }
+            else if (ch == '5')
+            {
+                init_high_entropy_exec_region();
+                std::cout << "  [RE-SEEDED] High entropy executable region refreshed.\n";
+            }
+            else if (ch == '6')
+            {
+                trigger_sleepmask_rot_cycle();
+            }
+            else if (ch == '7')
+            {
+                trigger_decrypt_on_wake();
+            }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
@@ -395,6 +581,9 @@ int main()
     if (g_pe_in_priv_buf) VirtualFree(g_pe_in_priv_buf, 0, MEM_RELEASE);
     if (g_beacon_buf) VirtualFree(g_beacon_buf, 0, MEM_RELEASE);
     if (g_dynamic_buf) VirtualFree(g_dynamic_buf, 0, MEM_RELEASE);
+    if (g_high_ent_exec_buf) VirtualFree(g_high_ent_exec_buf, 0, MEM_RELEASE);
+    if (g_sleepmask_rot_buf) VirtualFree(g_sleepmask_rot_buf, 0, MEM_RELEASE);
+    if (g_decrypt_on_wake_buf) VirtualFree(g_decrypt_on_wake_buf, 0, MEM_RELEASE);
 
     std::cout << "Test target exited cleanly.\n";
     return 0;

@@ -1,80 +1,84 @@
 # Deadeye
 
-**Deadeye** is an advanced Windows process memory triage scanner, detection-engineering toolkit, and behavioral diff timeline built in modern C++17 and native Win32.
+**Deadeye** is an advanced Windows process memory triage scanner, detection-engineering toolkit, and behavioral memory tracker built in modern C++17 and native Win32.
 
-Designed for reverse engineers, threat hunters, and detection engineers, Deadeye bridges the gap between memory analysis and rule deployment: generate auto-wildcarded YARA rules from hex selections, instantly validate them against clean running processes to verify zero false positives, diff entire process address spaces before and after running malware, and monitor unpacking transitions in real time without pausing or attaching a debugger.
+Designed for reverse engineers, threat hunters, and detection engineers, Deadeye bridges the gap between memory triage and production detection engineering: inspect live processes or offline PE layouts as mapped in memory, track behavioral memory transitions over time (sleep-masking, XOR key rotation, decrypt-on-wake), extract C2 strings revealed after decryption, generate auto-wildcarded YARA rules from hex selections, and validate them against running processes with instant false-positive tests—strictly read-only, with zero third-party dependencies.
 
 ---
 
 ## Key Detection & Analysis Capabilities
 
-### 1. Hex Selection to YARA Rule with Live False-Positive Testing
-Select any sequence of bytes in the hex viewer (or press `Ctrl+Y`) to generate an optimized YARA signature with architecture-aware wildcarding:
-- **Intelligent Relocation Wildcarding**: Automatically replaces volatile bytes that change across compilations:
+### 1. Behavior Tracker & Time-Series Memory Analysis (Live Sources, `Ctrl+3`)
+On a configurable interval (250ms to 5s, default 1000ms, with a non-blocking 50ms time budget per tick), Deadeye's background worker thread samples a watch set of suspicious regions into a 120-sample ring buffer, evaluating dynamic payload lifecycle behaviors:
+- **Sleep-Mask Suspect (`SLEEP_MASK_SUSPECT`, +40 pts)**: Detects memory regions whose protection or entropy oscillates across sleep cycles (e.g. `PAGE_EXECUTE_READ` active $\leftrightarrow$ `PAGE_NOACCESS` or `PAGE_READWRITE` dormant $\ge 3$ full cycles). Calculates period estimate, min/max entropy, and protection sequence.
+- **Key-Rotation Suspect (`KEY_ROTATION_SUSPECT`, +35 pts)**: Identifies encrypted regions whose content mutates while remaining high-entropy ($H \ge 6.8$). Automatically analyzes XOR delta images ($D[i] = A[i] \oplus B[i]$) for repeating periods $P \in [1, 64]$ and outputs candidate delta key bytes.
+- **Decrypt-on-Wake (`DECRYPT_ON_WAKE`, +35 pts)**: Catches payloads decrypting in place: flags regions where Shannon entropy drops sharply (e.g. $7.9 \to 3.2$) and newly exposed strings appear compared to baseline.
+- **Watch Set Management**: Automatically tracks regions with triage score $\ge 25$ or high entropy; user can pin/unpin any region (`Ctrl+P`) or toggle "Watch all private executable" regions.
+
+> [!IMPORTANT]
+> **Polling Limitations & Sampling Honesty**: Deadeye operates strictly in user mode via standard Win32 `ReadProcessMemory` and `VirtualQueryEx`. It **never** injects DLLs, installs page guard hooks, or suspends threads. Periodic polling (default 1000ms) may miss transient sub-second memory transitions executed and reverted in <100ms. Detections combine time-series evidence with static indicators to maintain maximum signal-to-noise ratio.
+
+### 2. Shannon Entropy Profiling & Visualization
+- **Page-Wise Entropy**: Calculates Shannon entropy (bits/byte) per 4 KB page across memory regions (pages < 512 bytes reported as `n/a`). Large regions are evenly sampled (up to 64 pages) to prevent UI stutter.
+- **Compact ASCII Profile**: Visualizes page-level entropy density directly in the memory map and details line using compact glyphs (`._-=#`).
+- **Static Entropy Rules**:
+  - `HIGH_ENTROPY_EXEC` (+35 pts): Executable region or page with entropy $\ge 7.20$ (packed/encrypted code).
+  - `HIGH_ENTROPY_PRIVATE` (+20 pts): `MEM_PRIVATE` non-executable buffer $\ge 16\text{ KB}$ with entropy $\ge 7.40$ (encrypted payload blob or stager). *Note: Does not flag `MEM_IMAGE` data sections by entropy alone (compressed resources are normal).*
+
+### 3. String Extraction & "New Since Baseline" Tracking (`Ctrl+4`)
+- **ASCII & UTF-16LE Extraction**: Scans regions for printable strings (configurable min length, default 6) with safety caps (20,000 total strings, 5,000 per region, 256 chars per line).
+- **String Baseline Diffing (`Ctrl+B`)**: Captures a hash set of strings per region. Switching on the "New since baseline" filter (`F6`) reveals URLs, IPs, domains, and configuration blocks decrypted by malware after execution.
+- **Classification Hints**: Automated heuristic tagging for `[URL] (hint)`, `[IP] (hint)`, `[DOMAIN] (hint)`, `[PATH] (hint)`, and `[REG] (hint)`.
+- **Direct Navigation**: Clicking any extracted string automatically jumps the hex view directly to its virtual address.
+
+### 4. Hex Selection to YARA Rule with Live False-Positive Testing (`Ctrl+Y`)
+Select any byte sequence in the hex viewer to generate an optimized YARA signature with compiler-aware wildcarding:
+- **Intelligent Relocation Wildcarding**: Automatically masks volatile addresses and offsets:
   - Relative CALL / JMP displacements (`E8 ?? ?? ?? ??`, `E9 ?? ?? ?? ??`)
   - Conditional near jumps (`0F 80..8F ?? ?? ?? ??`)
-  - x64 RIP-relative displacements (ModR/M `[rip + disp32]` with disp32 masked)
+  - x64 RIP-relative displacements (ModR/M `[rip + disp32]`)
   - 64-bit immediate constants and address relocations (`48 B8..BF ??..??`)
-- **Built-in False-Positive Validator**: Click **Run False-Positive Test** directly inside Deadeye. It scans the executable memory of every active running process on the host machine using SIMD-accelerated pattern matching. If a signature matches benign software (e.g. `svchost.exe`, `explorer.exe`), it reports the exact PID, process name, and match address so you can refine your rule before deployment.
+- **Built-in False-Positive Validator**: Scans the executable memory of every active running process on the host using SIMD-accelerated pattern matching. Reports matching PIDs and process names so you can refine rules before deployment.
 
-### 2. Process-Wide Memory Diff & Offline Analysis Sessions
-Deadeye captures the full virtual address space (region map, memory states, page protections, Shannon entropy, and FNV-1a content hashes) before and after running a suspicious sample:
-- **Comprehensive State Diffs**: Highlights regions that:
-  - `[+NEW   ]`: Newly allocated / committed memory (e.g. injected payloads, shellcode buffers).
-  - `[!PROT  ]`: Protection transitions (e.g. `RW` flipped to `RX` or `RWX`).
+### 5. MemorySource Abstraction & Offline Mapped PE Inspection (`Ctrl+O`)
+- Open raw PE files (`.exe`, `.dll`, `.sys`) laid out in virtual memory exactly as the Windows loader maps them:
+  - Headers mapped at base, sections aligned to `SectionAlignment`, zero-filled padding, unmapped gaps marked unreadable.
+  - Section characteristics translated to synthetic protections (`PAGE_READONLY`, `PAGE_READWRITE`, `PAGE_EXECUTE_READ`, `PAGE_EXECUTE_READWRITE`).
+  - Base relocation engine: applies `IMAGE_REL_BASED_HIGHLOW` and `DIR64` when mapped base differs from `ImageBase`.
+  - PE Summary panel: machine, subsystem, ImageBase, Entry Point RVA, section count, overlay size, and flags if EP is outside executable sections.
+
+### 6. Process-Wide Memory Diff & Timeline Diffing (`Ctrl+5`)
+- Capture full virtual address space snapshots before and after running samples:
+  - `[+NEW   ]`: Newly allocated/committed memory (injected payloads, shellcode buffers).
+  - `[!PROT  ]`: Protection transitions (`RW` flipped to `RX` or `RWX`).
   - `[~MODIF ]`: Existing regions whose content was mutated or decrypted in place.
   - `[-FREED ]`: Deallocated or unmapped regions.
-- **Offline Session Files**: Save snapshot sessions to standard JSON (`.json`) files so team members can inspect and diff process states offline or across triage sandboxes.
-
-### 3. Behavioral Memory Timeline & Unpack Detection
-On an optional 1-second heartbeat timer, Deadeye tracks per-region transitions, entropy shifts, and content mutations:
-- **Unpack Detection (`BEHAVIOR_UNPACK`, +50 pts)**: Automatically detects when a non-executable region (`RW` / `RO`) flips to executable (`RX` / `RWX`) and its content changes or entropy drops (payload unpacked into memory).
-- **Sleep Obfuscation Detection (`SLEEP_OBFUSCATION`, +65 pts)**: Identifies regions whose protection or entropy oscillates across ticks (e.g., encrypted at rest during sleep cycles, decrypted while active).
-- **"New Strings After Unpack" (`Ctrl+U`)**: Automatically extracts ASCII and UTF-16LE strings revealed following protection flips. Categorizes indicators into badges: `[URL]`, `[IP]`, `[PATH]`, `[CMD]`, `[REG]`, and `[STR]` for immediate extraction of C2 configurations.
-- > [!IMPORTANT]
-  > **Polling Notice**: Periodic heartbeat polling operates on a 1-second interval. Very fast, sub-second unpack-and-reprotect transitions may execute between polling ticks. Deadeye is designed to provide lightweight, non-invasive observation without the overhead or evasion triggers of kernel drivers or active debugger hooks.
-
----
-
-## Quick Install (One-Line Command)
-
-Run this command in **PowerShell** (no admin rights or external runtimes required):
-
-```powershell
-irm https://raw.githubusercontent.com/Winter0x11/Deadeye/main/install.ps1 | iex
-```
-
-> [!NOTE]
-> If running from **Command Prompt (CMD)** or the **Windows Run Dialog (`Win + R`)**, prepend `powershell`:
-> ```cmd
-> powershell -ep bypass -c "irm https://raw.githubusercontent.com/Winter0x11/Deadeye/main/install.ps1 | iex"
-> ```
-
-**What this one-liner does automatically:**
-1. Resolves the latest release binary from GitHub.
-2. Downloads and extracts `deadeye.exe` to `%LOCALAPPDATA%\Deadeye`.
-3. Adds Deadeye to your user `PATH` (so you can run `deadeye` from any command prompt).
-4. Creates a Windows Start Menu shortcut.
-5. Immediately launches Deadeye.
-
-> [!TIP]
-> **Zero External Dependencies**: Deadeye is compiled with fully static C++ runtimes (`-static -static-libgcc -static-libstdc++`). It runs out-of-the-box on clean Windows 10 & 11 installations with zero Visual C++ Redistributable or MinGW DLL requirements.
+- Save and load diff sessions to JSON for offline comparison across sandbox runs.
 
 ---
 
 ## Defensive Triage Heuristics & Additive Scoring
 
-Deadeye inspects target processes in a background worker thread and computes an **additive threat severity score** for every committed memory region:
+Deadeye inspects memory sources in a background worker thread and computes an **additive threat severity score** for every region:
 
-| Detection Rule | Additive Weight | Description |
-|:---|:---:|:---|
-| `SLEEP_OBFUSCATION` | **+65** | Region protection/entropy oscillates across heartbeat ticks (payload encrypted at rest, decrypted while active). |
-| `INJECTED_PE` | **+50** | Valid DOS (`MZ`) and NT (`PE\0\0`) headers detected within `MEM_PRIVATE` pages (reflective DLL loading, process hollowing, unhooking stubs). |
-| `BEHAVIOR_UNPACK` | **+50** | Region flipped from non-executable to executable with byte mutations or entropy drop. |
-| `UNLINKED_MODULE` | **+45** | Committed `MEM_IMAGE` allocation missing from the 64-bit PEB loader list (`InLoadOrderModuleList`), indicating DKOM evasion. |
-| `PRIVATE_RWX` | **+40** | Region marked `MEM_PRIVATE` with `PAGE_EXECUTE_READWRITE` or `PAGE_EXECUTE_WRITECOPY` protection. |
-| `WRITE_THEN_FLIP` | **+35** | `AllocationProtect` was writable (`PAGE_READWRITE`), current `Protect` is executable (`PAGE_EXECUTE_READ`). Staged payload execution. |
-| `UNBACKED_EXEC` | **+25** | Executable memory not backed by a verified disk image (`MEM_MAPPED` or `MEM_PRIVATE` with execution rights). |
+| Detection Rule | Additive Weight | Category | Description |
+|:---|:---:|:---:|:---|
+| `SLEEP_OBFUSCATION` | **+65** | Heartbeat Timeline | Region protection/entropy oscillates across heartbeat ticks. |
+| `INJECTED_PE` | **+50** | Live Triage | Valid DOS (`MZ`) and NT (`PE\0\0`) headers detected within `MEM_PRIVATE` pages. |
+| `BEHAVIOR_UNPACK` | **+50** | Heartbeat Timeline | Region flipped from non-executable to executable with byte mutations or entropy drop. |
+| `UNLINKED_MODULE` | **+45** | Live Triage | Committed `MEM_IMAGE` allocation missing from the PEB `InLoadOrderModuleList`. |
+| `PRIVATE_RWX` | **+40** | Live Triage | Region marked `MEM_PRIVATE` with `PAGE_EXECUTE_READWRITE` or `PAGE_EXECUTE_WRITECOPY`. |
+| `SLEEP_MASK_SUSPECT` | **+40** | Behavior Tracker | Time-series oscillation between low/high entropy or exec/non-exec across $\ge 3$ cycles. |
+| `KEY_ROTATION_SUSPECT` | **+35** | Behavior Tracker | High-entropy payload with mutating content hash and repeating XOR delta key period $P \in [1, 64]$. |
+| `DECRYPT_ON_WAKE` | **+35** | Behavior Tracker | Sharp entropy drop ($>1.2$) with newly revealed strings appearing vs baseline. |
+| `HIGH_ENTROPY_EXEC` | **+35** | Entropy Triage | Executable region/page with Shannon entropy $\ge 7.20$ (packed/encrypted code). |
+| `WRITE_THEN_FLIP` | **+35** | Live Triage | `AllocationProtect` was writable (`PAGE_READWRITE`), current `Protect` is executable (`PAGE_EXECUTE_READ`). |
+| `HIGH_ENTROPY_PRIVATE` | **+20** | Entropy Triage | `MEM_PRIVATE` non-executable buffer $\ge 16\text{ KB}$ with Shannon entropy $\ge 7.40$. |
+| `UNBACKED_EXEC` | **+25** | Live Triage | Executable memory not backed by a verified disk image. |
+| `STATIC_WX_SECTION` | **+50** | Offline Mapped PE | Section marked with both Writable and Executable rights (W+X). |
+| `STATIC_EP_OUTSIDE_EXEC`| **+45** | Offline Mapped PE | Entry point RVA is located outside all executable sections. |
+| `STATIC_EXEC_HIGH_ENTROPY`| **+40** | Offline Mapped PE | Executable section with Shannon entropy $\ge 7.20$. |
+| `STATIC_NONTRIVIAL_OVERLAY`| **+25** | Offline Mapped PE | Non-trivial overlay data (> 512 bytes) appended past raw section data. |
 
 ### Severity Bands
 - **CRITICAL (`CRIT`)**: Score &ge; **80**
@@ -85,52 +89,91 @@ Deadeye inspects target processes in a background worker thread and computes an 
 
 ---
 
-## Features & UI Overview
+## Strict Read-Only Guarantee
 
-- **Pure Windows Subsystem Application**: Built strictly as a native GUI binary (`/SUBSYSTEM:WINDOWS`, `-mwindows`). No console flashing on launch, zero command-line baggage.
-- **Three Core View Modes**:
-  - **Triage Findings (`Ctrl+1`)**: Displays all evaluated regions sorted strictly by threat severity descending (`[SEV SCORE] FLAGS ADDRESS SIZE TYPE PROT`).
-  - **Memory Map (`Ctrl+2`)**: Linear address walk showing all committed pages with hit badges, snapshot counters, and detection flags.
-  - **Process Diff View (`Ctrl+3`)**: Comprehensive before-and-after difference list highlighting `[+NEW]`, `[!PROT]`, `[~MODIF]`, and `[-FREED]` regions.
-- **Menu Bar & Global Accelerators**:
-  - **File**: Attach to Self (`Ctrl+Alt+S`), Run Defensive Triage (`Ctrl+T`), Export Triage JSON (`Ctrl+S`), Theme (`Light` / `Dark`), Exit (`Alt+F4`).
-  - **Edit**: Copy Region Address (`Ctrl+C`), Copy Hex Dump (`Ctrl+Shift+C`), Find Hex Pattern (`Ctrl+F`), Find Next Hit (`F3`), **Generate YARA Rule (`Ctrl+Y`)**.
-  - **View**: Triage Findings (`Ctrl+1`), Memory Map (`Ctrl+2`), Process Diff View (`Ctrl+3`), Hide Clean Regions, Hits Only Filter, Refresh (`F5`).
-  - **Diff**: Capture Baseline (`Ctrl+B`), Compare with Current (`Ctrl+D`), Save Diff Session, Load Diff Session, **View Newly Revealed Strings (`Ctrl+U`)**.
-  - **Timeline**: Take Snapshot (`Ctrl+N`), Clear All Snapshots, Live Memory Heartbeat, Previous/Next 64 KB Page (`PgUp` / `PgDn`).
-  - **Help**: Defensive Heuristics Reference Guide, About Deadeye.
-- **Modern Fluent UI Engine**:
-  - Smooth rounded buttons with interactive hover/click feedback.
-  - Full High-DPI and PerMonitorV2 awareness with embedded Common-Controls v6 manifest.
-  - Dual Dark and Light color palettes for both high-contrast lab work and presentation environments.
-- **Zero Third-Party Dependencies**: Native C++17 and standard Win32 API (`user32`, `gdi32`, `advapi32`, `comctl32`, `comdlg32`).
+Deadeye is built exclusively for defensive analysis, triage, and detection engineering:
+- **No Memory Writes**: Target process memory is never modified.
+- **No DLL Injection**: No modules or hooks are loaded into target processes.
+- **No Thread Suspension**: Targets continue running undisturbed; Deadeye never suspends or freezes target threads.
+- **Zero Offensive Capabilities**: No exploitation, shellcode injection, or evasion features.
+
+---
+
+## UI Views & Navigation Shortcuts
+
+| Shortcut | View / Action | Description |
+|:---|:---|:---|
+| `Ctrl+1` | **Triage Findings View** | Lists all evaluated regions sorted strictly by threat severity descending. |
+| `Ctrl+2` | **Memory Map View** | Linear address walk showing all committed pages with entropy and hit badges. |
+| `Ctrl+3` | **Behavior Tracker View** | Monitored regions showing samples, cycles, changed %, and detection flags. |
+| `Ctrl+4` | **Strings View** | Extracted strings with encoding, length, classification tag, and jump-to-hex. |
+| `Ctrl+5` | **Process Diff View** | State diff view highlighting `[+NEW]`, `[!PROT]`, `[~MODIF]`, and `[-FREED]` regions. |
+| `Ctrl+P` | **Pin / Unpin Region** | Adds or removes selected region from the active behavior tracking watch set. |
+| `Ctrl+B` | **Set String Baseline** | Records string content hash baseline for decrypt-on-wake detection. |
+| `F6` | **Toggle New Strings** | Filters Strings View to show only strings that appeared after baseline. |
+| `F7` | **Extract Strings** | Extracts ASCII and UTF-16LE strings from the selected memory region. |
+| `Ctrl+Y` | **Generate YARA Rule** | Opens YARA rule generator with auto-wildcarding and false-positive tester. |
+| `Ctrl+S` | **Export Triage JSON** | Exports full JSON report including entropy profiles, findings, and behavior array. |
+| `Ctrl+O` | **Open Memory Source** | Select a live process or pick a PE file (`.exe`/`.dll`/`.sys`) to inspect as mapped memory. |
+| `F5` | **Refresh Memory Walk** | Reloads target process virtual memory allocations. |
+
+---
+
+## Verification & Test Target (`tests/test_target.cpp`)
+
+A standalone simulation binary `build/test_target.exe` is provided to test and verify every Deadeye detection rule under controlled conditions.
+
+### Available Test Modes
+
+| Mode | Key | Behavior | Expected Deadeye Detection |
+|:---:|:---:|:---|:---|
+| **1** | `1` | **Dynamic Unpack Transition**: Decrypts payload into memory, embeds C2 URLs/IPs/paths, flips `PAGE_READWRITE` $\to$ `PAGE_EXECUTE_READ`. | `BEHAVIOR_UNPACK` (+50), `WRITE_THEN_FLIP` (+35); strings revealed in `Ctrl+4`. |
+| **2** | `2` | **Sleep Obfuscation Cycle**: Alternates between encrypted at rest (`PAGE_READWRITE`) and decrypted active (`PAGE_EXECUTE_READ`). | `SLEEP_OBFUSCATION` (+65) in timeline. |
+| **3** | `3` | **Dynamic Allocation / Deallocation**: Allocates or frees a 64 KB RWX buffer. | Process Diff shows `[+NEW]` or `[-FREED]`. |
+| **4** | `4` | **Live Mutating Beacon**: Updates sequence numbers and randomizes buffer bytes. | Process Diff shows `[~MODIF]`. |
+| **5** | `5` | **High Entropy Executable Buffer**: Allocates a 64 KB `PAGE_EXECUTE_READ` buffer with Shannon entropy $\approx 7.95$. | `HIGH_ENTROPY_EXEC` (+35), ASCII profile `#####...`. |
+| **6** | `6` | **Sleep-Mask with Rotating XOR Key**: Payload cycles through `PAGE_NOACCESS` and `PAGE_EXECUTE_READ`, rotating an 8-byte XOR key. | `SLEEP_MASK_SUSPECT` (+40), `KEY_ROTATION_SUSPECT` (+35) with candidate XOR delta key period 8. |
+| **7** | `7` | **Decrypt-On-Wake**: Encrypted buffer ($H \approx 7.90$) decrypts to cleartext C2 strings ($H \approx 3.20$). | `DECRYPT_ON_WAKE` (+35); newly decrypted strings highlighted in `Ctrl+4`. |
+
+### False-Positive Testing Guide
+To verify that Deadeye's behavioral rules and entropy heuristics do not fire falsely on clean software:
+1. Launch a major web browser (Google Chrome, Microsoft Edge, or Mozilla Firefox) and open multiple tabs.
+2. Launch a .NET application (e.g. PowerShell or a Visual Studio / C# app with active JIT memory).
+3. Attach Deadeye to the browser process and the .NET process with the Behavior Tracker active for 60 seconds.
+4. **Verification**: Confirm that benign JIT code regions and normal stack allocations do not trigger `SLEEP_MASK_SUSPECT` or `KEY_ROTATION_SUSPECT`.
 
 ---
 
 ## Building from Source
 
-### Repository
-```powershell
-git clone https://github.com/Winter0x11/Deadeye.git
-cd Deadeye
-```
+Deadeye compiles cleanly with **zero warnings** on both MinGW GCC (`-Wall -Wextra -pedantic`) and MSVC (`/W4`).
 
 ### Build with MinGW-w64 (GCC)
 ```powershell
 # Create build directory
 if (-not (Test-Path build)) { New-Item -ItemType Directory -Path build }
 
-# Compile Windows resources & Common-Controls v6 / DPI manifest
+# Compile resources & manifest
 windres -I src -i src/deadeye.rc -o build/deadeye_res.o
 
-# Compile fully static standalone binary (zero external DLL requirements)
+# Compile fully static standalone binary
 g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 -static -static-libgcc -static-libstdc++ src/main.cpp build/deadeye_res.o -o build/deadeye.exe -mwindows -ladvapi32 -lcomctl32 -lcomdlg32 -lgdi32 -luser32
+
+# Compile test target
+g++ -std=c++17 -m64 -Wall -Wextra -pedantic -O2 tests/test_target.cpp -o build/test_target.exe
+```
+
+### Build with Microsoft Visual C++ (MSVC)
+```cmd
+call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
+rc /fo build\deadeye_msvc_res.res src\deadeye.rc
+cl /std:c++17 /EHsc /W4 /O2 src\main.cpp build\deadeye_msvc_res.res /Fe:build\deadeye_msvc.exe /link /SUBSYSTEM:WINDOWS advapi32.lib comctl32.lib comdlg32.lib user32.lib gdi32.lib
+cl /std:c++17 /EHsc /W4 /O2 tests\test_target.cpp /Fe:build\test_target_msvc.exe
 ```
 
 ---
 
-## Pre-Built Releases & CI/CD
+## Pre-Built Releases
 
-Pre-compiled standalone 64-bit binaries are published on GitHub:
-- **Release Bundle**: `Deadeye-v1.0.1-windows-x64.zip` containing `deadeye.exe` and documentation.
-- **Automated CI/CD**: Pushing any version tag (e.g. `git tag -a v1.0.1 -m "Release v1.0.1"` followed by `git push origin main --tags`) automatically triggers GitHub Actions to compile, test, package, and publish release assets via [`.github/workflows/release.yml`](.github/workflows/release.yml).
+Standalone 64-bit releases:
+- **Release Bundle**: `Deadeye-v1.0.3-windows-x64.zip` containing `deadeye.exe`, `test_target.exe`, and documentation.
