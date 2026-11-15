@@ -2,11 +2,25 @@
 
 **Windows process memory inspection and analysis.**
 
+## Quick install
+
+Open PowerShell and run:
+
+```powershell
+irm https://raw.githubusercontent.com/Winter0x11/Deadeye/main/install.ps1 | iex
+```
+
+The installer downloads the latest Windows x64 release, installs Deadeye for the current user, adds it to your user PATH, creates a Start Menu shortcut, and launches the application. Administrator access is not normally required.
+
+Want to inspect the installer first? [View install.ps1](https://github.com/Winter0x11/Deadeye/blob/main/install.ps1).
+
+Prefer a manual download? [Get the latest release](https://github.com/Winter0x11/Deadeye/releases/latest).
+
+---
+
 Deadeye is a native C++17 tool for inspecting the virtual memory of running Windows processes and examining PE files as they would appear when mapped into memory. It brings process selection, memory maps, hex inspection, string extraction, memory comparison, and optional behavioral analysis into one desktop application.
 
-It is built for developers, reverse engineers, security researchers, and anyone who needs to understand what a Windows process has in memory.
-
-[**Download the latest release**](https://github.com/Winter0x11/Deadeye/releases/latest)
+It is built for developers, reverse engineers, security researchers, and anyone who needs to understand what a Windows process has in its memory.
 
 ---
 
