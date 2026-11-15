@@ -181,6 +181,7 @@ void populate_region_list()
 
     if (get_app_state().view_mode == ViewMode::BehaviorTracker)
     {
+        std::lock_guard<std::mutex> lock(get_app_state().state_mutex);
         if (get_app_state().watched_regions.empty())
         {
             SendMessageA(get_app_state().list_regions, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>("No watched regions. Attach live process & triage, or press Ctrl+P to pin selected region."));
@@ -554,6 +555,7 @@ void draw_region_list_item(DRAWITEMSTRUCT *dis)
     }
     else if (get_app_state().view_mode == ViewMode::BehaviorTracker)
     {
+        std::lock_guard<std::mutex> lock(get_app_state().state_mutex);
         if (reg_idx < get_app_state().watched_regions.size())
         {
             const auto &w = get_app_state().watched_regions[reg_idx];

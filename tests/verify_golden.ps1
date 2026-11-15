@@ -26,7 +26,7 @@ if (-not (Test-Path $goldenJson)) {
 
 # 1. Start test_target with auto-pilot paused (all modes pre-allocated)
 $proc = Start-Process -FilePath $testTargetExe -ArgumentList "0" -PassThru
-Start-Sleep -Milliseconds 600
+Start-Sleep -Milliseconds 1200
 $targetPid = $proc.Id
 
 try {

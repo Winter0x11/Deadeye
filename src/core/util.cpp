@@ -204,18 +204,21 @@ bool is_unbacked_exec(DWORD type, DWORD protect)
 // Checks if buffer starts with a valid DOS ("MZ") and PE NT ("PE\0\0") header.
 bool has_pe_header(const uint8_t *buf, size_t len)
 {
-    if (len < 0x40)
+    if (len < 0x40 || buf == nullptr)
         return false;
     if (buf[0] != 0x4D || buf[1] != 0x5A)
         return false;
-    uint32_t e_lfanew = 0;
+    int32_t e_lfanew = 0;
     std::memcpy(&e_lfanew, buf + 0x3C, sizeof(e_lfanew));
-    if (e_lfanew < 0x40 || static_cast<uint64_t>(e_lfanew) + 4 > len)
+    if (e_lfanew < 0x40 || e_lfanew > 0x10000000)
         return false;
-    return (buf[e_lfanew] == 'P' &&
-            buf[e_lfanew + 1] == 'E' &&
-            buf[e_lfanew + 2] == '\0' &&
-            buf[e_lfanew + 3] == '\0');
+    uint64_t pe_offset = static_cast<uint64_t>(static_cast<uint32_t>(e_lfanew));
+    if (pe_offset + 4 > len)
+        return false;
+    return (buf[pe_offset] == 'P' &&
+            buf[pe_offset + 1] == 'E' &&
+            buf[pe_offset + 2] == '\0' &&
+            buf[pe_offset + 3] == '\0');
 }
 
 // Attempts to enable SeDebugPrivilege for inspecting elevated/service processes.

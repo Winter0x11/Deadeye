@@ -187,7 +187,10 @@ DWORD WINAPI WorkerThreadProc(LPVOID param)
         ctx.partial_samples = &get_app_state().tracker_partial_samples;
         ctx.target_process_exited = &get_app_state().target_process_exited;
 
-        run_behavior_tracker_tick(source, ctx);
+        {
+            std::lock_guard<std::mutex> lock(get_app_state().state_mutex);
+            run_behavior_tracker_tick(source, ctx);
+        }
         get_app_state().tracker_busy.store(false);
         PostMessageA(hwnd, WM_BEHAVIOR_TICK_DONE, 0, 0);
         delete res;

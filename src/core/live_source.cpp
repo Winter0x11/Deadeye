@@ -2,6 +2,7 @@
 // Deadeye Defensive Triage Live Process MemorySource
 #include "core/live_source.hpp"
 #include <cstring>
+#include <unordered_set>
 
 typedef NTSTATUS(NTAPI *pfnNtQueryInformationProcess)(
     HANDLE, ULONG, PVOID, ULONG, PULONG);
@@ -65,9 +66,17 @@ bool query_peb_modules_x64(HANDLE proc, std::vector<LoadedModuleRange> &out_modu
         return false;
     }
 
+    std::unordered_set<uintptr_t> visited_nodes;
     size_t count = 0;
     while (curr != head && count < 500)
     {
+        // Validate user-mode pointer bounds
+        if (curr < 0x10000 || curr > 0x7FFFFFFFFFFF)
+            break;
+        if (visited_nodes.count(curr) > 0)
+            break;
+        visited_nodes.insert(curr);
+
         uintptr_t flink = 0;
         uintptr_t dll_base = 0;
         ULONG size_of_image = 0;
@@ -78,22 +87,25 @@ bool query_peb_modules_x64(HANDLE proc, std::vector<LoadedModuleRange> &out_modu
             break;
         if (flink == 0 || flink == curr)
             break;
-        ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(curr + 0x30), &dll_base, sizeof(dll_base), &bytes_read);
-        ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(curr + 0x40), &size_of_image, sizeof(size_of_image), &bytes_read);
-        ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(curr + 0x58), &name_len, sizeof(name_len), &bytes_read);
-        ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(curr + 0x60), &name_buf_ptr, sizeof(name_buf_ptr), &bytes_read);
 
-        if (dll_base != 0)
+        if (ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(curr + 0x30), &dll_base, sizeof(dll_base), &bytes_read) &&
+            dll_base != 0)
         {
+            ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(curr + 0x40), &size_of_image, sizeof(size_of_image), &bytes_read);
+            ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(curr + 0x58), &name_len, sizeof(name_len), &bytes_read);
+            ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(curr + 0x60), &name_buf_ptr, sizeof(name_buf_ptr), &bytes_read);
+
             LoadedModuleRange mod;
             mod.base = dll_base;
             mod.size = size_of_image;
-            if (name_buf_ptr != 0 && name_len > 0 && name_len < 512)
+            if (name_buf_ptr >= 0x10000 && name_buf_ptr <= 0x7FFFFFFFFFFF && name_len > 0 && name_len < 512)
             {
                 std::vector<wchar_t> wbuf(name_len / 2 + 1, 0);
-                ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(name_buf_ptr),
-                                  wbuf.data(), name_len, &bytes_read);
-                mod.name = wbuf.data();
+                if (ReadProcessMemory(proc, reinterpret_cast<LPCVOID>(name_buf_ptr),
+                                      wbuf.data(), name_len, &bytes_read) && bytes_read > 0)
+                {
+                    mod.name = wbuf.data();
+                }
             }
             out_modules.push_back(mod);
         }

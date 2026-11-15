@@ -369,16 +369,17 @@ std::shared_ptr<MappedPeSource> MappedPeSource::open(
 
     // 2. Build Section Segments
     const size_t sec_table_offset = opt_offset + file_hdr->SizeOfOptionalHeader;
-    if (sec_table_offset + file_hdr->NumberOfSections * sizeof(IMAGE_SECTION_HEADER) > file_size)
+    if (sec_table_offset + static_cast<size_t>(file_hdr->NumberOfSections) * sizeof(IMAGE_SECTION_HEADER) > file_size)
     {
         summary.parse_warning = "Section header table truncated at EOF.";
     }
 
     uint64_t max_raw_section_end = copy_hdr_len;
+    uint64_t total_section_alloc_bytes = aligned_hdr_vsize;
 
     for (WORD i = 0; i < file_hdr->NumberOfSections; ++i)
     {
-        size_t cur_sec_off = sec_table_offset + i * sizeof(IMAGE_SECTION_HEADER);
+        size_t cur_sec_off = sec_table_offset + static_cast<size_t>(i) * sizeof(IMAGE_SECTION_HEADER);
         if (cur_sec_off + sizeof(IMAGE_SECTION_HEADER) > file_size)
             break;
 
@@ -386,6 +387,13 @@ std::shared_ptr<MappedPeSource> MappedPeSource::open(
 
         char sec_name_buf[9] = {};
         std::memcpy(sec_name_buf, sec_hdr->Name, 8);
+
+        // Guard against integer overflow in effective virtual address
+        if (UINTPTR_MAX - eff_base < sec_hdr->VirtualAddress)
+        {
+            summary.parse_warning = "Section " + std::string(sec_name_buf) + " VirtualAddress causes address overflow.";
+            continue;
+        }
 
         MappedSegment sec_seg;
         sec_seg.name = sec_name_buf;
@@ -395,9 +403,47 @@ std::shared_ptr<MappedPeSource> MappedPeSource::open(
         sec_seg.is_header = false;
 
         SIZE_T raw_vsize = (sec_hdr->Misc.VirtualSize != 0) ? sec_hdr->Misc.VirtualSize : sec_hdr->SizeOfRawData;
+        if (raw_vsize > MAX_PE_FILE_SIZE)
+        {
+            summary.parse_warning = "Section " + std::string(sec_name_buf) + " size capped to safety limit.";
+            raw_vsize = static_cast<SIZE_T>(MAX_PE_FILE_SIZE);
+        }
+
         SIZE_T aligned_vsize = static_cast<SIZE_T>(align_up_val(raw_vsize, section_align));
+        if (aligned_vsize > MAX_PE_FILE_SIZE)
+        {
+            aligned_vsize = static_cast<SIZE_T>(MAX_PE_FILE_SIZE);
+        }
+
+        total_section_alloc_bytes += aligned_vsize;
+        if (total_section_alloc_bytes > MAX_PE_FILE_SIZE * 2)
+        {
+            summary.parse_warning = "Cumulative section allocations exceeded memory limit; remaining sections truncated.";
+            break;
+        }
+
+        // Detect overlapping sections
+        for (const auto &prev_seg : src->m_segments)
+        {
+            if (!prev_seg.is_header &&
+                sec_seg.vaddr < (prev_seg.vaddr + prev_seg.vsize) &&
+                (sec_seg.vaddr + aligned_vsize) > prev_seg.vaddr)
+            {
+                summary.parse_warning = "Overlapping sections detected: " + prev_seg.name + " and " + sec_seg.name;
+                break;
+            }
+        }
+
         sec_seg.vsize = aligned_vsize;
-        sec_seg.data.resize(aligned_vsize, 0);
+        try
+        {
+            sec_seg.data.resize(aligned_vsize, 0);
+        }
+        catch (const std::bad_alloc &)
+        {
+            summary.parse_warning = "Memory allocation failed for section " + std::string(sec_name_buf);
+            break;
+        }
 
         if (sec_hdr->PointerToRawData < file_size && sec_hdr->SizeOfRawData > 0)
         {

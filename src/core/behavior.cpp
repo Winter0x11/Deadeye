@@ -184,9 +184,11 @@ void extract_all_strings_from_source(
     int selected_idx,
     size_t min_len,
     std::vector<ExtractedStringItem> &out_strings,
-    const std::unordered_map<uintptr_t, std::unordered_set<uint64_t>> *baselines)
+    const std::unordered_map<uintptr_t, std::unordered_set<uint64_t>> *baselines,
+    bool *out_was_truncated)
 {
     out_strings.clear();
+    if (out_was_truncated) *out_was_truncated = false;
     if (!source || regions.empty()) return;
 
     size_t start_r = (selected_idx >= 0 && selected_idx < static_cast<int>(regions.size())) ? static_cast<size_t>(selected_idx) : 0;
@@ -204,7 +206,13 @@ void extract_all_strings_from_source(
 
         size_t strings_in_reg = 0;
         SIZE_T bytes_scanned = 0;
-        SIZE_T total_to_scan = std::min<SIZE_T>(reg.size, 1024 * 1024); // Cap scan to 1 MB per region
+        SIZE_T total_to_scan = std::min<SIZE_T>(reg.size, 4 * 1024 * 1024); // Cap scan to 4 MB per region
+        if (reg.size > total_to_scan && out_was_truncated)
+        {
+            *out_was_truncated = true;
+        }
+
+        const SIZE_T OVERLAP_LEN = 256;
 
         while (bytes_scanned < total_to_scan && strings_in_reg < MAX_STRINGS_PER_REGION && out_strings.size() < MAX_TOTAL_STRINGS)
         {
@@ -246,84 +254,64 @@ void extract_all_strings_from_source(
                         out_strings.push_back(item);
                         strings_in_reg++;
                         if (strings_in_reg >= MAX_STRINGS_PER_REGION || out_strings.size() >= MAX_TOTAL_STRINGS)
+                        {
+                            if (out_was_truncated) *out_was_truncated = true;
                             break;
+                        }
                     }
                     cur_str.clear();
                 }
             }
-            if (cur_str.size() >= min_len && strings_in_reg < MAX_STRINGS_PER_REGION && out_strings.size() < MAX_TOTAL_STRINGS)
-            {
-                ExtractedStringItem item;
-                item.addr = reg.base + bytes_scanned + cur_start;
-                item.encoding = "ASCII";
-                item.length = cur_str.size();
-                item.tag_hint = classify_string_tag(cur_str);
-                item.content_hash = fnv1a64(reinterpret_cast<const uint8_t*>(cur_str.data()), cur_str.size());
-                item.region_base = reg.base;
-                if (baselines && baselines->count(reg.base) > 0)
-                {
-                    item.is_new = (baselines->at(reg.base).count(item.content_hash) == 0);
-                }
-                item.text = (cur_str.size() > 256) ? (cur_str.substr(0, 256) + "...") : cur_str;
-                out_strings.push_back(item);
-                strings_in_reg++;
-            }
 
-            // UTF-16LE extraction
-            std::string cur_wstr;
-            size_t cur_wstart = 0;
-            for (size_t i = 0; i + 1 < n_read; i += 2)
+            // UTF-16LE extraction (both even and odd alignments)
+            for (size_t pass = 0; pass < 2; ++pass)
             {
-                uint8_t c = read_buf[i];
-                uint8_t zero = read_buf[i + 1];
-                if (zero == 0 && c >= 32 && c <= 126)
+                std::string cur_wstr;
+                size_t cur_wstart = 0;
+                for (size_t i = pass; i + 1 < n_read; i += 2)
                 {
-                    if (cur_wstr.empty()) cur_wstart = i;
-                    cur_wstr.push_back(static_cast<char>(c));
-                }
-                else
-                {
-                    if (cur_wstr.size() >= min_len)
+                    uint8_t c = read_buf[i];
+                    uint8_t zero = read_buf[i + 1];
+                    if (zero == 0 && c >= 32 && c <= 126)
                     {
-                        ExtractedStringItem item;
-                        item.addr = reg.base + bytes_scanned + cur_wstart;
-                        item.encoding = "UTF-16";
-                        item.length = cur_wstr.size();
-                        item.tag_hint = classify_string_tag(cur_wstr);
-                        item.content_hash = fnv1a64(reinterpret_cast<const uint8_t*>(cur_wstr.data()), cur_wstr.size());
-                        item.region_base = reg.base;
-                        if (baselines && baselines->count(reg.base) > 0)
-                        {
-                            item.is_new = (baselines->at(reg.base).count(item.content_hash) == 0);
-                        }
-                        item.text = (cur_wstr.size() > 256) ? (cur_wstr.substr(0, 256) + "...") : cur_wstr;
-                        out_strings.push_back(item);
-                        strings_in_reg++;
-                        if (strings_in_reg >= MAX_STRINGS_PER_REGION || out_strings.size() >= MAX_TOTAL_STRINGS)
-                            break;
+                        if (cur_wstr.empty()) cur_wstart = i;
+                        cur_wstr.push_back(static_cast<char>(c));
                     }
-                    cur_wstr.clear();
+                    else
+                    {
+                        if (cur_wstr.size() >= min_len)
+                        {
+                            ExtractedStringItem item;
+                            item.addr = reg.base + bytes_scanned + cur_wstart;
+                            item.encoding = (pass == 0) ? "UTF-16LE" : "UTF-16LE (odd)";
+                            item.length = cur_wstr.size();
+                            item.tag_hint = classify_string_tag(cur_wstr);
+                            item.content_hash = fnv1a64(reinterpret_cast<const uint8_t*>(cur_wstr.data()), cur_wstr.size());
+                            item.region_base = reg.base;
+                            if (baselines && baselines->count(reg.base) > 0)
+                            {
+                                item.is_new = (baselines->at(reg.base).count(item.content_hash) == 0);
+                            }
+                            item.text = (cur_wstr.size() > 256) ? (cur_wstr.substr(0, 256) + "...") : cur_wstr;
+                            out_strings.push_back(item);
+                            strings_in_reg++;
+                            if (strings_in_reg >= MAX_STRINGS_PER_REGION || out_strings.size() >= MAX_TOTAL_STRINGS)
+                            {
+                                if (out_was_truncated) *out_was_truncated = true;
+                                break;
+                            }
+                        }
+                        cur_wstr.clear();
+                    }
                 }
-            }
-            if (cur_wstr.size() >= min_len && strings_in_reg < MAX_STRINGS_PER_REGION && out_strings.size() < MAX_TOTAL_STRINGS)
-            {
-                ExtractedStringItem item;
-                item.addr = reg.base + bytes_scanned + cur_wstart;
-                item.encoding = "UTF-16";
-                item.length = cur_wstr.size();
-                item.tag_hint = classify_string_tag(cur_wstr);
-                item.content_hash = fnv1a64(reinterpret_cast<const uint8_t*>(cur_wstr.data()), cur_wstr.size());
-                item.region_base = reg.base;
-                if (baselines && baselines->count(reg.base) > 0)
-                {
-                    item.is_new = (baselines->at(reg.base).count(item.content_hash) == 0);
-                }
-                item.text = (cur_wstr.size() > 256) ? (cur_wstr.substr(0, 256) + "...") : cur_wstr;
-                out_strings.push_back(item);
-                strings_in_reg++;
             }
 
-            bytes_scanned += chunk;
+            if (bytes_scanned + n_read >= total_to_scan)
+                break;
+
+            // Overlap by OVERLAP_LEN bytes to avoid losing boundary strings
+            SIZE_T advance = (n_read > OVERLAP_LEN) ? (n_read - OVERLAP_LEN) : n_read;
+            bytes_scanned += advance;
         }
     }
 }

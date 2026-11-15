@@ -213,7 +213,8 @@ void extract_all_strings_from_source(
     int selected_idx,
     size_t min_len,
     std::vector<ExtractedStringItem> &out_strings,
-    const std::unordered_map<uintptr_t, std::unordered_set<uint64_t>> *baselines = nullptr);
+    const std::unordered_map<uintptr_t, std::unordered_set<uint64_t>> *baselines = nullptr,
+    bool *out_was_truncated = nullptr);
 
 // Ring buffer sample management
 void add_sample_to_ring(WatchedRegionState &wreg, const RegionSampleRecord &rec);

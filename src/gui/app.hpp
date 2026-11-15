@@ -13,6 +13,7 @@
 #include <unordered_set>
 #include <memory>
 #include <atomic>
+#include <mutex>
 
 #include "core/memsource.hpp"
 #include "core/triage.hpp"
@@ -166,6 +167,7 @@ struct AppState
     // Worker thread & async
     HANDLE h_worker_thread = nullptr;
     std::atomic<bool> scan_abort{false};
+    std::mutex state_mutex;
 };
 
 AppState& get_app_state();
