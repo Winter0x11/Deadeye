@@ -10,7 +10,7 @@ Open PowerShell and run:
 irm https://raw.githubusercontent.com/Winter0x11/Deadeye/main/install.ps1 | iex
 ```
 
-The installer downloads the latest Windows x64 release, installs Deadeye for the current user, adds it to your user PATH, creates a Start Menu shortcut, and launches the application. Administrator access is not normally required.
+The installer downloads the latest Windows x64 release, installs Deadeye for the current user, adds it to your user PATH, creates a Start Menu shortcut, and launches the application. If Deadeye is already running, the installer stops it before updating. Administrator access is not normally required.
 
 Want to inspect the installer first? [View install.ps1](https://github.com/Winter0x11/Deadeye/blob/main/install.ps1).
 
