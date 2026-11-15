@@ -11,7 +11,6 @@
 #include "gui/controls.hpp"
 #include "gui/menu.hpp"
 #include "gui/attach_dialog.hpp"
-#include "gui/yara_dialog.hpp"
 #include "gui/strings_dialog.hpp"
 #include "gui/pe_options_dialog.hpp"
 
@@ -115,7 +114,7 @@ void apply_theme_switch(HWND hwnd, AppTheme new_theme)
     if (get_app_state().edit_hex) InvalidateRect(get_app_state().edit_hex, nullptr, TRUE);
     if (get_app_state().lbl_triage_reasons) InvalidateRect(get_app_state().lbl_triage_reasons, nullptr, TRUE);
     if (get_app_state().lbl_status) InvalidateRect(get_app_state().lbl_status, nullptr, TRUE);
-    HWND btns[] = { get_app_state().btn_attach, get_app_state().btn_load, get_app_state().btn_triage, get_app_state().btn_search, get_app_state().btn_next_hit, get_app_state().btn_export_json, get_app_state().btn_snap, get_app_state().btn_clear_snaps, get_app_state().btn_prev_page, get_app_state().btn_next_page, get_app_state().btn_diff_proc, get_app_state().btn_yara };
+    HWND btns[] = { get_app_state().btn_attach, get_app_state().btn_load, get_app_state().btn_triage, get_app_state().btn_search, get_app_state().btn_next_hit, get_app_state().btn_export_json, get_app_state().btn_snap, get_app_state().btn_clear_snaps, get_app_state().btn_prev_page, get_app_state().btn_next_page, get_app_state().btn_diff_proc };
     for (HWND b : btns) { if (b) InvalidateRect(b, nullptr, TRUE); }
     set_status((get_app_state().theme == AppTheme::Dark) ? "Theme switched to Modern Dark." : "Theme switched to Classic Light.");
 }
@@ -1206,10 +1205,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
                                         0, 0, 66, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_DIFF_PROC), hInst, nullptr);
 
-        get_app_state().btn_yara = CreateWindowA("BUTTON", "YARA",
-                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
-                                   0, 0, 64, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_YARA), hInst, nullptr);
-
         // Row 2: Filter Bar (Left side) & Hex Timeline Bar (Right side)
         int r2_y = M + RH + 6;
 
@@ -1286,7 +1281,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         HWND ui_items[] = {
             get_app_state().lbl_pid, get_app_state().edit_pid, get_app_state().btn_attach, get_app_state().btn_load, get_app_state().btn_triage,
             get_app_state().lbl_pat, get_app_state().edit_pattern, get_app_state().btn_search, get_app_state().btn_next_hit, get_app_state().chk_hits_only,
-            get_app_state().chk_heartbeat, get_app_state().btn_diff_proc, get_app_state().btn_yara,
+            get_app_state().chk_heartbeat, get_app_state().btn_diff_proc,
             get_app_state().combo_view_mode, get_app_state().combo_min_sev, get_app_state().chk_hide_clean, get_app_state().btn_export_json,
             get_app_state().lbl_hex_info, get_app_state().btn_snap, get_app_state().combo_diff, get_app_state().btn_clear_snaps,
             get_app_state().btn_prev_page, get_app_state().btn_next_page, get_app_state().lbl_triage_reasons, get_app_state().lbl_status};
@@ -1308,7 +1303,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         make_button_modern(get_app_state().btn_prev_page, ModernButtonStyle::Standard);
         make_button_modern(get_app_state().btn_next_page, ModernButtonStyle::Standard);
         make_button_modern(get_app_state().btn_diff_proc, ModernButtonStyle::Accent);
-        make_button_modern(get_app_state().btn_yara, ModernButtonStyle::Primary);
 
         // Attach application menu bar
         HMENU hMenu = create_application_menu();
@@ -1450,11 +1444,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         // Group C: Right Action / Tools Controls (Right-aligned, backwards)
         int r_tools = w - M;
-
-        int btn_yara_w = 64;
-        int btn_yara_x = r_tools - btn_yara_w;
-        MoveWindow(get_app_state().btn_yara, btn_yara_x, M, btn_yara_w, RH, TRUE);
-        r_tools = btn_yara_x - 4;
 
         int btn_diff_w = 66;
         int btn_diff_x = r_tools - btn_diff_w;
@@ -2002,10 +1991,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         {
             on_capture_diff();
         }
-        else if (id == ID_BTN_YARA || id == IDM_EDIT_GENERATE_YARA)
-        {
-            open_yara_dialog(hwnd);
-        }
         else if (id == IDM_DIFF_CAPTURE_BASELINE)
         {
             on_capture_baseline();
@@ -2423,16 +2408,6 @@ int run_gui(HINSTANCE hInst, int nCmdShow)
     wc.hIcon = hIconBig;
     wc.hIconSm = hIconSmall;
     RegisterClassExA(&wc);
-
-    WNDCLASSEXA wcYara = {};
-    wcYara.cbSize = sizeof(wcYara);
-    wcYara.lpfnWndProc = YaraDlgProc;
-    wcYara.hInstance = hInst;
-    wcYara.hbrBackground = nullptr;
-    wcYara.lpszClassName = "DeadeyeYaraDlg";
-    wcYara.hCursor = LoadCursorA(nullptr, IDC_ARROW);
-    wcYara.hIcon = hIconSmall;
-    RegisterClassExA(&wcYara);
 
     WNDCLASSEXA wcStr = {};
     wcStr.cbSize = sizeof(wcStr);

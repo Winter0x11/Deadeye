@@ -2,7 +2,7 @@
 
 **Deadeye** is an advanced Windows process memory triage scanner, detection-engineering toolkit, and behavioral memory tracker built in modern C++17 and native Win32.
 
-Designed for reverse engineers, threat hunters, and detection engineers, Deadeye bridges the gap between memory triage and production detection engineering: inspect live processes or offline PE layouts as mapped in memory, track behavioral memory transitions over time (sleep-masking, XOR key rotation, decrypt-on-wake), extract C2 strings revealed after decryption, generate auto-wildcarded YARA rules from hex selections, and validate them against running processes with instant false-positive tests—strictly read-only, with zero third-party dependencies.
+Designed for developers, reverse engineers, security researchers, and systems programmers, Deadeye bridges the gap between memory inspection and diagnostic analysis: inspect live processes or offline PE layouts as mapped in memory, track behavioral memory transitions over time (sleep-masking, XOR key rotation, decrypt-on-wake), extract strings revealed after decryption, capture snapshots, and diff process memory state—strictly read-only, with zero third-party dependencies.
 
 ---
 
@@ -31,16 +31,7 @@ On a configurable interval (250ms to 5s, default 1000ms, with a non-blocking 50m
 - **Classification Hints**: Automated heuristic tagging for `[URL] (hint)`, `[IP] (hint)`, `[DOMAIN] (hint)`, `[PATH] (hint)`, and `[REG] (hint)`.
 - **Direct Navigation**: Clicking any extracted string automatically jumps the hex view directly to its virtual address.
 
-### 4. Hex Selection to YARA Rule with Live False-Positive Testing (`Ctrl+Y`)
-Select any byte sequence in the hex viewer to generate an optimized YARA signature with compiler-aware wildcarding:
-- **Intelligent Relocation Wildcarding**: Automatically masks volatile addresses and offsets:
-  - Relative CALL / JMP displacements (`E8 ?? ?? ?? ??`, `E9 ?? ?? ?? ??`)
-  - Conditional near jumps (`0F 80..8F ?? ?? ?? ??`)
-  - x64 RIP-relative displacements (ModR/M `[rip + disp32]`)
-  - 64-bit immediate constants and address relocations (`48 B8..BF ??..??`)
-- **Built-in False-Positive Validator**: Scans the executable memory of every active running process on the host using SIMD-accelerated pattern matching. Reports matching PIDs and process names so you can refine rules before deployment.
-
-### 5. Process Attachment Dialog (Debugger-Style Process / Window Picker, `Ctrl+A`)
+### 4. Process Attachment Dialog (Debugger-Style Process / Window Picker, `Ctrl+A`)
 Attach to any running process or desktop application just like a native debugger:
 - **Intuitive Windowed Priority**: Processes with visible top-level windows (Notepad, Chrome, Spotify, test targets) are automatically elevated to the top of the list with their active window titles displayed.
 - **Rich Multi-Column Process List**:
@@ -128,7 +119,6 @@ Deadeye is built exclusively for defensive analysis, triage, and detection engin
 | `Ctrl+B` | **Set String Baseline** | Records string content hash baseline for decrypt-on-wake detection. |
 | `F6` | **Toggle New Strings** | Filters Strings View to show only strings that appeared after baseline. |
 | `F7` | **Extract Strings** | Extracts ASCII and UTF-16LE strings from the selected memory region. |
-| `Ctrl+Y` | **Generate YARA Rule** | Opens YARA rule generator with auto-wildcarding and false-positive tester. |
 | `Ctrl+S` | **Export Triage JSON** | Exports full JSON report including entropy profiles, findings, and behavior array. |
 | `Ctrl+O` | **Open Memory Source** | Select a live process or pick a PE file (`.exe`/`.dll`/`.sys`) to inspect as mapped memory. |
 | `F5` | **Refresh Memory Walk** | Reloads target process virtual memory allocations. |

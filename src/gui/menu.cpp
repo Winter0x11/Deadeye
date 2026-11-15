@@ -37,8 +37,6 @@ HMENU create_application_menu()
     AppendMenuA(hEditMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(hEditMenu, MF_STRING, IDM_EDIT_FIND_PATTERN, "&Find Hex Pattern...\tCtrl+F");
     AppendMenuA(hEditMenu, MF_STRING, IDM_EDIT_FIND_NEXT, "Find &Next Hit\tF3");
-    AppendMenuA(hEditMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuA(hEditMenu, MF_STRING, IDM_EDIT_GENERATE_YARA, "Generate &YARA Rule from Selection...\tCtrl+Y");
     AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hEditMenu), "&Edit");
 
     // 3. View Menu
@@ -129,7 +127,6 @@ HACCEL create_application_accelerators()
         { FVIRTKEY, VK_F6, IDM_STRINGS_TOGGLE_NEW },
         { FVIRTKEY, VK_F7, IDM_STRINGS_EXTRACT_SEL },
         { FCONTROL | FVIRTKEY, 'D', IDM_DIFF_CAPTURE_CURRENT },
-        { FCONTROL | FVIRTKEY, 'Y', ID_BTN_YARA },
         { FCONTROL | FVIRTKEY, 'U', IDM_DIFF_VIEW_STRINGS }
     };
     return CreateAcceleratorTableA(accels, static_cast<int>(sizeof(accels) / sizeof(accels[0])));

@@ -1,5 +1,5 @@
 // src/core/behavior.hpp
-// Deadeye Defensive Triage Behavior Analysis, Diffing, and YARA Generation
+// Deadeye Defensive Triage Behavior Analysis and Diffing
 #pragma once
 
 #ifndef NOMINMAX
@@ -98,31 +98,6 @@ struct RevealedString
     std::string text;
     std::string category; // "[URL] ", "[IP]  ", "[PATH]", "[CMD] ", "[REG] ", "[STR] "
     uintptr_t addr = 0;
-};
-
-// Tier 1: YARA Generation & False-Positive Testing
-struct YaraWildcardResult
-{
-    std::string hex_pattern;
-    size_t total_bytes = 0;
-    size_t wildcard_count = 0;
-    std::vector<std::string> wildcards_applied;
-};
-
-struct FalsePositiveMatch
-{
-    DWORD pid = 0;
-    std::string process_name;
-    uintptr_t match_addr = 0;
-};
-
-struct FalsePositiveReport
-{
-    size_t total_processes_checked = 0;
-    size_t total_processes_scanned = 0;
-    SIZE_T total_bytes_scanned = 0;
-    std::vector<FalsePositiveMatch> matches;
-    DWORD elapsed_ms = 0;
 };
 
 // ----------------------------------------------------------------------------
@@ -289,21 +264,3 @@ bool save_process_session_to_file(
 bool load_process_session_from_file(
     const std::string &filepath,
     ProcessSnapshotSession &session);
-
-// YARA rule generation & testing
-YaraWildcardResult auto_wildcard_bytes(
-    const uint8_t *bytes,
-    size_t len,
-    uintptr_t base_addr = 0,
-    DWORD pid = 0,
-    const std::string &rule_name = "");
-
-std::string generate_yara_rule_text(
-    const YaraWildcardResult &wildcard_res,
-    uintptr_t base_addr,
-    DWORD pid,
-    const std::string &rule_name);
-
-FalsePositiveReport test_rule_false_positives(
-    const Pattern &pat,
-    DWORD exclude_pid);

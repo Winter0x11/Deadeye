@@ -96,7 +96,6 @@ struct AppState
     HWND chk_hits_only = nullptr;
     HWND chk_heartbeat = nullptr;
     HWND btn_diff_proc = nullptr;
-    HWND btn_yara = nullptr;
     HWND combo_view_mode = nullptr;
     HWND combo_min_sev = nullptr;
     HWND chk_hide_clean = nullptr;
