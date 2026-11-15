@@ -33,6 +33,7 @@ struct ProcessListEntry
     std::string name;
     std::string window_title;
     std::string arch;        // "x64", "x86", or "?"
+    SIZE_T working_set_mb = 0;
     std::string path;
     bool has_window = false;
 };
@@ -480,6 +481,8 @@ LRESULT CALLBACK AttachDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         make_button_modern(data->hBtnAttach, ModernButtonStyle::Primary);
         make_button_modern(data->hBtnCancel, ModernButtonStyle::Standard);
         make_button_modern(data->hBtnRefresh, ModernButtonStyle::Standard);
+        make_checkbox_modern(data->hChkWindowsOnly);
+        set_window_dark_mode(hwnd, get_app_state().theme == AppTheme::Dark);
 
         const ThemeColors &tc = get_theme_colors(get_app_state().theme);
         if (get_app_state().theme == AppTheme::Dark)
@@ -572,6 +575,52 @@ LRESULT CALLBACK AttachDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_NOTIFY:
     {
         NMHDR *nm = reinterpret_cast<NMHDR*>(lp);
+        if (data && data->hList)
+        {
+            HWND hHdr = ListView_GetHeader(data->hList);
+            if (nm && nm->hwndFrom == hHdr && nm->code == NM_CUSTOMDRAW)
+            {
+                if (get_app_state().theme == AppTheme::Dark)
+                {
+                    NMCUSTOMDRAW *cd = reinterpret_cast<NMCUSTOMDRAW*>(lp);
+                    if (cd->dwDrawStage == CDDS_PREPAINT)
+                    {
+                        return CDRF_NOTIFYITEMDRAW;
+                    }
+                    else if (cd->dwDrawStage == CDDS_ITEMPREPAINT)
+                    {
+                        const ThemeColors &tc = get_theme_colors(AppTheme::Dark);
+                        HBRUSH hbr = CreateSolidBrush(RGB(45, 45, 48));
+                        FillRect(cd->hdc, &cd->rc, hbr);
+                        DeleteObject(hbr);
+
+                        HPEN pen = CreatePen(PS_SOLID, 1, RGB(65, 65, 70));
+                        HGDIOBJ oldPen = SelectObject(cd->hdc, pen);
+                        MoveToEx(cd->hdc, cd->rc.right - 1, cd->rc.top + 2, nullptr);
+                        LineTo(cd->hdc, cd->rc.right - 1, cd->rc.bottom - 2);
+                        MoveToEx(cd->hdc, cd->rc.left, cd->rc.bottom - 1, nullptr);
+                        LineTo(cd->hdc, cd->rc.right, cd->rc.bottom - 1);
+                        SelectObject(cd->hdc, oldPen);
+                        DeleteObject(pen);
+
+                        HDITEMA hdi = {};
+                        hdi.mask = HDI_TEXT;
+                        char buf[128] = {};
+                        hdi.pszText = buf;
+                        hdi.cchTextMax = sizeof(buf);
+                        Header_GetItem(hHdr, cd->dwItemSpec, &hdi);
+
+                        SetBkMode(cd->hdc, TRANSPARENT);
+                        SetTextColor(cd->hdc, tc.text_normal);
+                        SelectObject(cd->hdc, get_app_state().ui_font);
+                        RECT trc = cd->rc;
+                        trc.left += 6;
+                        DrawTextA(cd->hdc, buf, -1, &trc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+                        return CDRF_SKIPDEFAULT;
+                    }
+                }
+            }
+        }
         if (nm && nm->idFrom == ID_ATTACH_LIST && data)
         {
             if (nm->code == NM_DBLCLK)
@@ -601,13 +650,23 @@ LRESULT CALLBACK AttachDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     case WM_CTLCOLOREDIT:
+    {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        const ThemeColors &tc = get_theme_colors(get_app_state().theme);
+        SetBkMode(hdc, OPAQUE);
+        SetTextColor(hdc, tc.text_normal);
+        SetBkColor(hdc, tc.bg_control);
+        return reinterpret_cast<INT_PTR>(get_app_state().br_control);
+    }
+
     case WM_CTLCOLORSTATIC:
     {
         HDC hdc = reinterpret_cast<HDC>(wp);
         const ThemeColors &tc = get_theme_colors(get_app_state().theme);
+        SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, tc.text_normal);
-        SetBkColor(hdc, tc.bg_control);
-        return reinterpret_cast<INT_PTR>(get_app_state().br_control);
+        SetBkColor(hdc, tc.bg_window);
+        return reinterpret_cast<INT_PTR>(get_app_state().br_window);
     }
 
     case WM_ERASEBKGND:

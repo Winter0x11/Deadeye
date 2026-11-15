@@ -35,6 +35,9 @@ HMENU create_application_menu()
     AppendMenuA(hEditMenu, MF_STRING, IDM_EDIT_COPY_ADDR, "&Copy Region Address\tCtrl+C");
     AppendMenuA(hEditMenu, MF_STRING, IDM_EDIT_COPY_HEX, "Copy &Hex Dump\tCtrl+Shift+C");
     AppendMenuA(hEditMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(hEditMenu, MF_STRING, IDM_EDIT_GOTO, "&Go To Address / Offset...\tCtrl+G");
+    AppendMenuA(hEditMenu, MF_STRING, IDM_EDIT_EXPORT_REGION, "&Export Selected Region Binary...\tCtrl+E");
+    AppendMenuA(hEditMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(hEditMenu, MF_STRING, IDM_EDIT_FIND_PATTERN, "&Find Hex Pattern...\tCtrl+F");
     AppendMenuA(hEditMenu, MF_STRING, IDM_EDIT_FIND_NEXT, "Find &Next Hit\tF3");
     AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hEditMenu), "&Edit");
@@ -71,16 +74,21 @@ HMENU create_application_menu()
     AppendMenuA(hStringsMenu, MF_STRING, IDM_STRINGS_EXTRACT_ALL, "Extract Strings across &All Regions");
     AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hStringsMenu), "&Strings");
 
-    // 6. Diff Menu
+    // 6. Diff & Snapshot Menu
     HMENU hDiffMenu = CreatePopupMenu();
-    AppendMenuA(hDiffMenu, MF_STRING, IDM_DIFF_CAPTURE_BASELINE, "Capture &Baseline Snapshot\tCtrl+B");
+    AppendMenuA(hDiffMenu, MF_STRING, IDM_SNAP_CAPTURE, "&Capture Process Snapshot (A/B)...");
+    AppendMenuA(hDiffMenu, MF_STRING, IDM_SNAP_COMPARE, "Byte-Level &Compare Snapshots...");
+    AppendMenuA(hDiffMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(hDiffMenu, MF_STRING, IDM_SNAP_NEXT_DIFF, "&Next Changed Range\tF8");
+    AppendMenuA(hDiffMenu, MF_STRING, IDM_SNAP_PREV_DIFF, "&Previous Changed Range\tShift+F8");
+    AppendMenuA(hDiffMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(hDiffMenu, MF_STRING, IDM_SNAP_SAVE, "&Save Snapshot to .desnap File...");
+    AppendMenuA(hDiffMenu, MF_STRING, IDM_SNAP_LOAD, "&Load Snapshot from .desnap File...");
+    AppendMenuA(hDiffMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(hDiffMenu, MF_STRING, IDM_DIFF_CAPTURE_BASELINE, "Capture Legacy &Baseline Snapshot\tCtrl+B");
     AppendMenuA(hDiffMenu, MF_STRING, IDM_DIFF_CAPTURE_CURRENT, "Compare with &Current (Diff)\tCtrl+D");
-    AppendMenuA(hDiffMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuA(hDiffMenu, MF_STRING, IDM_DIFF_SAVE_SESSION, "&Save Diff Session to JSON...");
-    AppendMenuA(hDiffMenu, MF_STRING, IDM_DIFF_LOAD_SESSION, "&Load Diff Session from JSON...");
-    AppendMenuA(hDiffMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(hDiffMenu, MF_STRING, IDM_DIFF_VIEW_STRINGS, "View Newly &Revealed Strings...\tCtrl+U");
-    AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hDiffMenu), "&Diff");
+    AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hDiffMenu), "&Snapshots");
 
     // 7. Timeline Menu
     HMENU hTimelineMenu = CreatePopupMenu();
@@ -116,6 +124,10 @@ HACCEL create_application_accelerators()
         { FVIRTKEY, VK_F5, ID_BTN_LOAD },
         { FCONTROL | FVIRTKEY, 'C', IDM_EDIT_COPY_ADDR },
         { FCONTROL | FSHIFT | FVIRTKEY, 'C', IDM_EDIT_COPY_HEX },
+        { FCONTROL | FVIRTKEY, 'G', IDM_EDIT_GOTO },
+        { FCONTROL | FVIRTKEY, 'E', IDM_EDIT_EXPORT_REGION },
+        { FVIRTKEY, VK_F8, IDM_SNAP_NEXT_DIFF },
+        { FSHIFT | FVIRTKEY, VK_F8, IDM_SNAP_PREV_DIFF },
         { FCONTROL | FVIRTKEY, 'N', ID_BTN_SNAP },
         { FCONTROL | FVIRTKEY, '1', IDM_VIEW_TRIAGE_FINDINGS },
         { FCONTROL | FVIRTKEY, '2', IDM_VIEW_MEMORY_MAP },

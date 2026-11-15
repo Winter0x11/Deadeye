@@ -62,9 +62,40 @@ static LRESULT CALLBACK PeMapDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             305, 120, 95, 30, hwnd, reinterpret_cast<HMENU>(IDCANCEL), GetModuleHandleA(nullptr), nullptr);
         SendMessageA(btn_cancel, WM_SETFONT, reinterpret_cast<WPARAM>(app.ui_font), TRUE);
 
+        make_button_modern(btn_ok, ModernButtonStyle::Primary);
+        make_button_modern(btn_cancel, ModernButtonStyle::Standard);
+        make_checkbox_modern(state->h_chk_relocs);
+        set_window_dark_mode(hwnd, app.theme == AppTheme::Dark);
+
         SetFocus(state->h_edit_base);
         SendMessageA(state->h_edit_base, EM_SETSEL, 0, -1);
         return 0;
+    }
+    case WM_CTLCOLOREDIT:
+    {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        const ThemeColors &tc = get_theme_colors(get_app_state().theme);
+        SetBkMode(hdc, OPAQUE);
+        SetTextColor(hdc, tc.text_normal);
+        SetBkColor(hdc, tc.bg_control);
+        return reinterpret_cast<INT_PTR>(get_app_state().br_control);
+    }
+    case WM_CTLCOLORSTATIC:
+    {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        const ThemeColors &tc = get_theme_colors(get_app_state().theme);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, tc.text_normal);
+        SetBkColor(hdc, tc.bg_window);
+        return reinterpret_cast<INT_PTR>(get_app_state().br_window);
+    }
+    case WM_ERASEBKGND:
+    {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, get_app_state().br_window);
+        return 1;
     }
     case WM_COMMAND:
     {

@@ -311,4 +311,225 @@ void make_button_modern(HWND btn, ModernButtonStyle style, AppTheme theme) {
     SetPropA(btn, DEADEYE_BTN_PROP, reinterpret_cast<HANDLE>(data));
 }
 
+// ----------------------------------------------------------------------------
+// Modern Checkbox Rendering Engine
+// ----------------------------------------------------------------------------
+struct ModernCheckboxData {
+    WNDPROC old_proc = nullptr;
+    bool is_hovered = false;
+    bool is_checked = false;
+};
+
+static const char* const DEADEYE_CHK_PROP = "DEADEYE_MODERN_CHK_DATA";
+
+static LRESULT CALLBACK ModernCheckboxSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    ModernCheckboxData* data = reinterpret_cast<ModernCheckboxData*>(GetPropA(hwnd, DEADEYE_CHK_PROP));
+    if (data == nullptr) {
+        return DefWindowProcA(hwnd, msg, wp, lp);
+    }
+
+    switch (msg) {
+    case WM_MOUSEMOVE: {
+        if (!data->is_hovered) {
+            data->is_hovered = true;
+            TRACKMOUSEEVENT tme = {};
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hwnd;
+            TrackMouseEvent(&tme);
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        break;
+    }
+
+    case WM_MOUSELEAVE: {
+        data->is_hovered = false;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        break;
+    }
+
+    case WM_SETCURSOR: {
+        if (IsWindowEnabled(hwnd)) {
+            SetCursor(LoadCursorA(nullptr, IDC_HAND));
+            return TRUE;
+        }
+        break;
+    }
+
+    case BM_GETCHECK:
+        return data->is_checked ? BST_CHECKED : BST_UNCHECKED;
+
+    case BM_SETCHECK:
+        data->is_checked = (wp == BST_CHECKED);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+
+    case WM_LBUTTONDOWN:
+        SetCapture(hwnd);
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+
+    case WM_LBUTTONUP: {
+        if (GetCapture() == hwnd) {
+            ReleaseCapture();
+            POINT pt = { (short)LOWORD(lp), (short)HIWORD(lp) };
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            if (PtInRect(&rc, pt) && IsWindowEnabled(hwnd)) {
+                data->is_checked = !data->is_checked;
+                HWND parent = GetParent(hwnd);
+                if (parent) {
+                    SendMessageA(parent, WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(hwnd), BN_CLICKED), reinterpret_cast<LPARAM>(hwnd));
+                }
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    }
+
+    case WM_NCDESTROY: {
+        WNDPROC old_proc = data->old_proc;
+        RemovePropA(hwnd, DEADEYE_CHK_PROP);
+        delete data;
+        return CallWindowProcA(old_proc, hwnd, msg, wp, lp);
+    }
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        int w = rc.right - rc.left;
+        int h = rc.bottom - rc.top;
+
+        if (w <= 0 || h <= 0) {
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        HDC memDC = CreateCompatibleDC(hdc);
+        HBITMAP memBmp = CreateCompatibleBitmap(hdc, w, h);
+        HGDIOBJ oldBmp = SelectObject(memDC, memBmp);
+
+        AppState &state = get_app_state();
+        const ThemeColors& tc = get_theme_colors(state.theme);
+        bool is_dark = (state.theme == AppTheme::Dark);
+        bool is_enabled = (IsWindowEnabled(hwnd) != FALSE);
+
+        // Fill background with window theme color
+        HBRUSH brParent = CreateSolidBrush(tc.bg_window);
+        FillRect(memDC, &rc, brParent);
+        DeleteObject(brParent);
+
+        // Draw checkbox box
+        const int box_size = 14;
+        int box_x = rc.left + 2;
+        int box_y = rc.top + (h - box_size) / 2;
+        RECT box_rc = { box_x, box_y, box_x + box_size, box_y + box_size };
+
+        COLORREF box_bg, box_border, text_color;
+        if (!is_enabled) {
+            box_bg     = is_dark ? RGB(35, 35, 38) : RGB(240, 240, 240);
+            box_border = is_dark ? RGB(60, 60, 65) : RGB(200, 200, 200);
+            text_color = tc.text_muted;
+        } else if (data->is_checked) {
+            box_bg     = is_dark ? RGB(0, 120, 215) : RGB(0, 102, 204);
+            box_border = box_bg;
+            text_color = tc.text_normal;
+        } else {
+            box_bg     = is_dark ? RGB(45, 45, 48) : RGB(255, 255, 255);
+            box_border = data->is_hovered ? (is_dark ? RGB(100, 180, 255) : RGB(0, 120, 215))
+                                          : (is_dark ? RGB(90, 90, 95)    : RGB(170, 175, 185));
+            text_color = tc.text_normal;
+        }
+
+        HBRUSH brBox = CreateSolidBrush(box_bg);
+        HPEN penBorder = CreatePen(PS_SOLID, 1, box_border);
+        HGDIOBJ oldBr = SelectObject(memDC, brBox);
+        HGDIOBJ oldPen = SelectObject(memDC, penBorder);
+
+        RoundRect(memDC, box_rc.left, box_rc.top, box_rc.right, box_rc.bottom, 4, 4);
+
+        SelectObject(memDC, oldPen);
+        SelectObject(memDC, oldBr);
+        DeleteObject(penBorder);
+        DeleteObject(brBox);
+
+        // Draw crisp checkmark if checked
+        if (data->is_checked) {
+            HPEN penCheck = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
+            HGDIOBJ oldCheckPen = SelectObject(memDC, penCheck);
+
+            MoveToEx(memDC, box_x + 3, box_y + 7, nullptr);
+            LineTo(memDC, box_x + 6, box_y + 10);
+            LineTo(memDC, box_x + 11, box_y + 4);
+
+            SelectObject(memDC, oldCheckPen);
+            DeleteObject(penCheck);
+        }
+
+        // Draw label text
+        char text_buf[128] = {};
+        GetWindowTextA(hwnd, text_buf, sizeof(text_buf));
+
+        RECT text_rc = rc;
+        text_rc.left = box_x + box_size + 6;
+
+        SetBkMode(memDC, TRANSPARENT);
+        SetTextColor(memDC, text_color);
+        HGDIOBJ oldFont = SelectObject(memDC, state.ui_font);
+
+        DrawTextA(memDC, text_buf, -1, &text_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+        BitBlt(hdc, 0, 0, w, h, memDC, 0, 0, SRCCOPY);
+
+        SelectObject(memDC, oldFont);
+        SelectObject(memDC, oldBmp);
+        DeleteObject(memBmp);
+        DeleteDC(memDC);
+
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    }
+
+    return CallWindowProcA(data->old_proc, hwnd, msg, wp, lp);
+}
+
+void make_checkbox_modern(HWND chk) {
+    if (chk == nullptr) return;
+    ModernCheckboxData* existing = reinterpret_cast<ModernCheckboxData*>(GetPropA(chk, DEADEYE_CHK_PROP));
+    if (existing != nullptr) {
+        return;
+    }
+    ModernCheckboxData* data = new ModernCheckboxData();
+    data->is_hovered = false;
+    data->is_checked = (SendMessageA(chk, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    data->old_proc = reinterpret_cast<WNDPROC>(
+        SetWindowLongPtrA(chk, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(ModernCheckboxSubclassProc))
+    );
+    SetPropA(chk, DEADEYE_CHK_PROP, reinterpret_cast<HANDLE>(data));
+}
+
+void set_window_dark_mode(HWND hwnd, bool dark) {
+    if (hwnd == nullptr) return;
+    HMODULE hDwm = GetModuleHandleA("dwmapi.dll");
+    if (!hDwm) hDwm = LoadLibraryA("dwmapi.dll");
+    if (hDwm) {
+        typedef HRESULT(WINAPI *pfnDwmSetWindowAttribute)(HWND, DWORD, LPCVOID, DWORD);
+        pfnDwmSetWindowAttribute pSetAtt = reinterpret_cast<pfnDwmSetWindowAttribute>(
+            reinterpret_cast<void*>(GetProcAddress(hDwm, "DwmSetWindowAttribute")));
+        if (pSetAtt) {
+            BOOL val = dark ? TRUE : FALSE;
+            if (FAILED(pSetAtt(hwnd, 20, &val, sizeof(val)))) {
+                pSetAtt(hwnd, 19, &val, sizeof(val));
+            }
+        }
+    }
+}
+
 } // namespace gui

@@ -32,6 +32,7 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <fstream>
 
 #ifndef IDI_APP
 #define IDI_APP 101
@@ -109,13 +110,26 @@ void apply_theme_switch(HWND hwnd, AppTheme new_theme)
 {
     get_app_state().theme = new_theme;
     update_theme_brushes();
+    set_window_dark_mode(hwnd, new_theme == AppTheme::Dark);
+
     InvalidateRect(hwnd, nullptr, TRUE);
-    if (get_app_state().list_regions) InvalidateRect(get_app_state().list_regions, nullptr, TRUE);
-    if (get_app_state().edit_hex) InvalidateRect(get_app_state().edit_hex, nullptr, TRUE);
-    if (get_app_state().lbl_triage_reasons) InvalidateRect(get_app_state().lbl_triage_reasons, nullptr, TRUE);
-    if (get_app_state().lbl_status) InvalidateRect(get_app_state().lbl_status, nullptr, TRUE);
-    HWND btns[] = { get_app_state().btn_attach, get_app_state().btn_load, get_app_state().btn_triage, get_app_state().btn_search, get_app_state().btn_next_hit, get_app_state().btn_export_json, get_app_state().btn_snap, get_app_state().btn_clear_snaps, get_app_state().btn_prev_page, get_app_state().btn_next_page, get_app_state().btn_diff_proc };
-    for (HWND b : btns) { if (b) InvalidateRect(b, nullptr, TRUE); }
+    HWND all_ctrls[] = {
+        get_app_state().lbl_pid, get_app_state().edit_pid, get_app_state().btn_attach, get_app_state().btn_load, get_app_state().btn_triage,
+        get_app_state().lbl_pat, get_app_state().edit_pattern, get_app_state().btn_search, get_app_state().btn_next_hit, get_app_state().chk_hits_only,
+        get_app_state().chk_heartbeat, get_app_state().btn_diff_proc,
+        get_app_state().combo_view_mode, get_app_state().combo_min_sev, get_app_state().chk_hide_clean, get_app_state().btn_export_json,
+        get_app_state().lbl_hex_info, get_app_state().btn_snap, get_app_state().combo_diff, get_app_state().btn_clear_snaps,
+        get_app_state().btn_prev_page, get_app_state().btn_next_page, get_app_state().list_regions, get_app_state().edit_hex,
+        get_app_state().lbl_triage_reasons, get_app_state().lbl_status
+    };
+    for (HWND c : all_ctrls)
+    {
+        if (c)
+        {
+            InvalidateRect(c, nullptr, TRUE);
+            UpdateWindow(c);
+        }
+    }
     set_status((get_app_state().theme == AppTheme::Dark) ? "Theme switched to Modern Dark." : "Theme switched to Classic Light.");
 }
 
@@ -883,6 +897,487 @@ void on_load_diff_session()
     }
 }
 
+void on_capture_snapshot_dialog()
+{
+    auto src = get_active_source();
+    if (!src)
+    {
+        MessageBoxA(get_app_state().hwnd_main, "Please attach to a process or open a memory source first.", "Capture Snapshot", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    core::SnapshotCaptureOptions opts;
+    char snap_name[64];
+    std::snprintf(snap_name, sizeof(snap_name), "Snapshot %zu", get_app_state().snapshot_store.size() + 1);
+    opts.name = snap_name;
+
+    if (get_app_state().has_selection && get_app_state().selected_region < get_app_state().regions.size())
+    {
+        opts.target_region_bases.push_back(get_app_state().regions[get_app_state().selected_region].base);
+    }
+    else
+    {
+        opts.capture_all_readable = true;
+    }
+
+    core::ProcessSnapshot snap;
+    std::string err;
+    HANDLE hProc = (src->capabilities().is_live) ? get_or_open_target_proc(src->get_pid()) : nullptr;
+    if (core::capture_snapshot(src, opts, snap, err, hProc))
+    {
+        get_app_state().snapshot_store.push_back(std::move(snap));
+        const auto &s = get_app_state().snapshot_store.back();
+        std::string msg = "Captured snapshot '" + s.metadata.name + "': " +
+                          std::to_string(s.regions.size()) + " region(s), " +
+                          std::to_string(s.metadata.total_bytes_captured / 1024) + " KB.";
+        set_status(msg);
+        MessageBoxA(get_app_state().hwnd_main, msg.c_str(), "Snapshot Captured", MB_OK | MB_ICONINFORMATION);
+    }
+    else
+    {
+        set_status("[ERROR] " + err);
+        MessageBoxA(get_app_state().hwnd_main, err.c_str(), "Snapshot Capture Error", MB_OK | MB_ICONERROR);
+    }
+}
+
+void on_save_snapshot_dialog()
+{
+    if (get_app_state().snapshot_store.empty())
+    {
+        MessageBoxA(get_app_state().hwnd_main, "No snapshots captured yet. Capture a snapshot first.", "Save Snapshot", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    const auto &snap = get_app_state().snapshot_store.back();
+    char file_buf[MAX_PATH] = {};
+    std::string def_name = snap.metadata.id + ".desnap";
+    std::strncpy(file_buf, def_name.c_str(), sizeof(file_buf) - 1);
+
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = get_app_state().hwnd_main;
+    ofn.lpstrFilter = "Deadeye Snapshot (*.desnap)\0*.desnap\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFile = file_buf;
+    ofn.nMaxFile = sizeof(file_buf);
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+    ofn.lpstrDefExt = "desnap";
+
+    if (GetSaveFileNameA(&ofn))
+    {
+        std::string err;
+        if (core::save_snapshot_to_file(snap, ofn.lpstrFile, err))
+        {
+            set_status("Saved snapshot to " + std::string(ofn.lpstrFile));
+            MessageBoxA(get_app_state().hwnd_main, "Snapshot saved successfully.", "Save Snapshot", MB_OK | MB_ICONINFORMATION);
+        }
+        else
+        {
+            MessageBoxA(get_app_state().hwnd_main, err.c_str(), "Save Snapshot Error", MB_OK | MB_ICONERROR);
+        }
+    }
+}
+
+void on_load_snapshot_dialog()
+{
+    char file_buf[MAX_PATH] = {};
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = get_app_state().hwnd_main;
+    ofn.lpstrFilter = "Deadeye Snapshot (*.desnap)\0*.desnap\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFile = file_buf;
+    ofn.nMaxFile = sizeof(file_buf);
+    ofn.Flags = OFN_FILEMUSTEXIST;
+    ofn.lpstrDefExt = "desnap";
+
+    if (GetOpenFileNameA(&ofn))
+    {
+        core::ProcessSnapshot snap;
+        std::string err;
+        if (core::load_snapshot_from_file(ofn.lpstrFile, snap, err))
+        {
+            get_app_state().snapshot_store.push_back(std::move(snap));
+            const auto &s = get_app_state().snapshot_store.back();
+            std::string msg = "Loaded snapshot '" + s.metadata.name + "': " +
+                              std::to_string(s.regions.size()) + " regions, PID " +
+                              std::to_string(s.metadata.pid) + ", captured at " + s.metadata.timestamp_str;
+            set_status(msg);
+            MessageBoxA(get_app_state().hwnd_main, msg.c_str(), "Snapshot Loaded", MB_OK | MB_ICONINFORMATION);
+        }
+        else
+        {
+            MessageBoxA(get_app_state().hwnd_main, err.c_str(), "Load Snapshot Error", MB_OK | MB_ICONERROR);
+        }
+    }
+}
+
+void on_compare_snapshots_dialog()
+{
+    if (get_app_state().snapshot_store.size() < 2)
+    {
+        MessageBoxA(get_app_state().hwnd_main,
+                    "Snapshot comparison requires at least 2 snapshots in memory.\n\n"
+                    "Use 'Snapshots > Capture Process Snapshot' or 'Load Snapshot from .desnap File' first.",
+                    "Snapshot Compare", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    size_t idx_a = get_app_state().snapshot_store.size() - 2;
+    size_t idx_b = get_app_state().snapshot_store.size() - 1;
+    const auto &snap_a = get_app_state().snapshot_store[idx_a];
+    const auto &snap_b = get_app_state().snapshot_store[idx_b];
+
+    core::SnapshotCompareReport report;
+    std::string err;
+    if (core::compare_snapshots(snap_a, snap_b, report, err))
+    {
+        get_app_state().active_snapshot_compare = report;
+        get_app_state().has_snapshot_compare = true;
+        get_app_state().diff_jump_index = 0;
+
+        get_app_state().process_diffs.clear();
+        for (const auto &rd : report.region_diffs)
+        {
+            ProcessDiffItem d;
+            d.base = rd.base_address;
+            d.size = rd.region_size;
+            d.new_protect = rd.new_protect;
+            d.old_protect = rd.old_protect;
+            d.type = rd.new_type ? rd.new_type : rd.old_type;
+            d.summary = rd.summary;
+            if (rd.overall_status == core::DiffByteStatus::Added) d.kind = ProcessDiffKind::Appeared;
+            else if (rd.overall_status == core::DiffByteStatus::Removed) d.kind = ProcessDiffKind::Disappeared;
+            else if (rd.protection_changed) d.kind = ProcessDiffKind::ProtectionChg;
+            else if (rd.content_changed) d.kind = ProcessDiffKind::ContentChg;
+            else if (rd.type_changed) d.kind = ProcessDiffKind::TypeChg;
+            else d.kind = ProcessDiffKind::Unchanged;
+
+            get_app_state().process_diffs.push_back(d);
+        }
+
+        get_app_state().view_mode = ViewMode::ProcessDiff;
+        SendMessageA(get_app_state().combo_view_mode, CB_SETCURSEL, 4, 0);
+        populate_region_list();
+
+        std::string warn_text;
+        for (const auto &w : report.compatibility_warnings)
+        {
+            warn_text += "\n[!] Warning: " + w;
+        }
+
+        std::string res_msg = "Compared '" + snap_a.metadata.name + "' vs '" + snap_b.metadata.name + "':\n\n" +
+                              "• Changed regions: " + std::to_string(report.count_modified_regions) + "\n" +
+                              "• Added regions: " + std::to_string(report.count_added_regions) + "\n" +
+                              "• Removed regions: " + std::to_string(report.count_removed_regions) + "\n" +
+                              "• Unchanged regions: " + std::to_string(report.count_unchanged_regions) + "\n" +
+                              "• Total changed bytes: " + std::to_string(report.total_changed_bytes) +
+                              warn_text;
+
+        set_status("Snapshot diff: " + std::to_string(report.total_changed_bytes) + " bytes changed across " +
+                   std::to_string(report.count_modified_regions) + " regions.");
+        MessageBoxA(get_app_state().hwnd_main, res_msg.c_str(), "Snapshot Comparison Results", MB_OK | MB_ICONINFORMATION);
+    }
+    else
+    {
+        MessageBoxA(get_app_state().hwnd_main, err.c_str(), "Snapshot Compare Error", MB_OK | MB_ICONERROR);
+    }
+}
+
+void on_next_diff_range()
+{
+    if (!get_app_state().has_snapshot_compare || get_app_state().active_snapshot_compare.region_diffs.empty())
+    {
+        set_status("No active snapshot comparison. Run 'Snapshots > Compare' first.");
+        return;
+    }
+
+    const auto &diffs = get_app_state().active_snapshot_compare.region_diffs;
+    size_t count = diffs.size();
+    for (size_t step = 1; step <= count; ++step)
+    {
+        size_t idx = (get_app_state().diff_jump_index + step) % count;
+        if (!diffs[idx].changed_ranges.empty())
+        {
+            get_app_state().diff_jump_index = idx;
+            uintptr_t target_base = diffs[idx].base_address;
+            SIZE_T offset = diffs[idx].changed_ranges.front().offset_in_region;
+
+            for (size_t r = 0; r < get_app_state().regions.size(); ++r)
+            {
+                if (get_app_state().regions[r].base == target_base)
+                {
+                    get_app_state().selected_region = r;
+                    get_app_state().has_selection = true;
+                    get_app_state().view_offset = (offset / VIEW_PAGE_SIZE) * VIEW_PAGE_SIZE;
+                    display_selected_region(offset);
+                    set_status("Jumped to diff in region 0x" + to_hex_string(target_base) + " at offset +0x" + to_hex_string(offset));
+                    return;
+                }
+            }
+        }
+    }
+    set_status("No changed byte ranges found in snapshot comparison.");
+}
+
+void on_prev_diff_range()
+{
+    if (!get_app_state().has_snapshot_compare || get_app_state().active_snapshot_compare.region_diffs.empty())
+    {
+        set_status("No active snapshot comparison. Run 'Snapshots > Compare' first.");
+        return;
+    }
+
+    const auto &diffs = get_app_state().active_snapshot_compare.region_diffs;
+    size_t count = diffs.size();
+    for (size_t step = 1; step <= count; ++step)
+    {
+        size_t idx = (get_app_state().diff_jump_index + count - step) % count;
+        if (!diffs[idx].changed_ranges.empty())
+        {
+            get_app_state().diff_jump_index = idx;
+            uintptr_t target_base = diffs[idx].base_address;
+            SIZE_T offset = diffs[idx].changed_ranges.front().offset_in_region;
+
+            for (size_t r = 0; r < get_app_state().regions.size(); ++r)
+            {
+                if (get_app_state().regions[r].base == target_base)
+                {
+                    get_app_state().selected_region = r;
+                    get_app_state().has_selection = true;
+                    get_app_state().view_offset = (offset / VIEW_PAGE_SIZE) * VIEW_PAGE_SIZE;
+                    display_selected_region(offset);
+                    set_status("Jumped to diff in region 0x" + to_hex_string(target_base) + " at offset +0x" + to_hex_string(offset));
+                    return;
+                }
+            }
+        }
+    }
+    set_status("No changed byte ranges found in snapshot comparison.");
+}
+
+void on_export_region_binary()
+{
+    if (!get_app_state().has_selection || get_app_state().selected_region >= get_app_state().regions.size())
+    {
+        MessageBoxA(get_app_state().hwnd_main, "Please select a memory region to export.", "Export Region", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    auto src = get_active_source();
+    if (!src) return;
+
+    const auto &reg = get_app_state().regions[get_app_state().selected_region];
+    char file_buf[MAX_PATH] = {};
+    char def_name[64];
+    std::snprintf(def_name, sizeof(def_name), "region_0x%016llX.bin", static_cast<unsigned long long>(reg.base));
+    std::strncpy(file_buf, def_name, sizeof(file_buf) - 1);
+
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = get_app_state().hwnd_main;
+    ofn.lpstrFilter = "Binary Dump (*.bin)\0*.bin\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFile = file_buf;
+    ofn.nMaxFile = sizeof(file_buf);
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+    ofn.lpstrDefExt = "bin";
+
+    if (GetSaveFileNameA(&ofn))
+    {
+        std::vector<uint8_t> dump_buf(reg.size);
+        SIZE_T read_len = src->read(reg.base, reg.size, dump_buf.data());
+
+        std::ofstream bin_out(ofn.lpstrFile, std::ios::binary | std::ios::trunc);
+        if (bin_out.is_open())
+        {
+            if (read_len > 0)
+            {
+                bin_out.write(reinterpret_cast<const char*>(dump_buf.data()), read_len);
+            }
+            bin_out.close();
+
+            std::string meta_path = std::string(ofn.lpstrFile) + ".meta.json";
+            std::ofstream meta_out(meta_path, std::ios::trunc);
+            if (meta_out.is_open())
+            {
+                meta_out << "{\n"
+                         << "  \"base_address\": \"0x" << to_hex_string(reg.base) << "\",\n"
+                         << "  \"region_size\": " << reg.size << ",\n"
+                         << "  \"bytes_read\": " << read_len << ",\n"
+                         << "  \"is_partial\": " << (read_len < reg.size ? "true" : "false") << ",\n"
+                         << "  \"type\": \"" << type_short(reg.type) << "\",\n"
+                         << "  \"protect\": \"" << prot_short(reg.protect) << "\",\n"
+                         << "  \"source\": \"" << escape_json(src->describe()) << "\"\n"
+                         << "}\n";
+            }
+
+            set_status("Exported " + std::to_string(read_len) + " bytes to " + std::string(ofn.lpstrFile));
+            MessageBoxA(get_app_state().hwnd_main, "Region binary and metadata exported successfully.", "Export Region", MB_OK | MB_ICONINFORMATION);
+        }
+        else
+        {
+            MessageBoxA(get_app_state().hwnd_main, "Failed to create destination binary file.", "Export Error", MB_OK | MB_ICONERROR);
+        }
+    }
+}
+
+struct GotoDlgData
+{
+    HWND hEdit = nullptr;
+    HWND hBtnOk = nullptr;
+    HWND hBtnCancel = nullptr;
+    uintptr_t result_addr = 0;
+    bool ok = false;
+};
+
+static LRESULT CALLBACK GotoDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    auto *data = reinterpret_cast<GotoDlgData*>(GetWindowLongPtrA(hwnd, GWLP_USERDATA));
+    switch (msg)
+    {
+    case WM_CREATE:
+    {
+        CREATESTRUCTA *cs = reinterpret_cast<CREATESTRUCTA*>(lp);
+        data = reinterpret_cast<GotoDlgData*>(cs->lpCreateParams);
+        SetWindowLongPtrA(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(data));
+        HINSTANCE hInst = cs->hInstance;
+
+        HWND lbl = CreateWindowA("STATIC", "Enter target Virtual Address or Region Offset (e.g. 0x7FFE0000 or 0x1000):",
+                                 WS_CHILD | WS_VISIBLE, 16, 14, 380, 20, hwnd, nullptr, hInst, nullptr);
+        data->hEdit = CreateWindowA("EDIT", "", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+                                    16, 38, 380, 24, hwnd, reinterpret_cast<HMENU>(6001), hInst, nullptr);
+        data->hBtnOk = CreateWindowA("BUTTON", "Go", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+                                     210, 72, 88, 26, hwnd, reinterpret_cast<HMENU>(IDOK), hInst, nullptr);
+        data->hBtnCancel = CreateWindowA("BUTTON", "Cancel", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                                         308, 72, 88, 26, hwnd, reinterpret_cast<HMENU>(IDCANCEL), hInst, nullptr);
+
+        SendMessageA(lbl, WM_SETFONT, reinterpret_cast<WPARAM>(get_app_state().ui_font), TRUE);
+        SendMessageA(data->hEdit, WM_SETFONT, reinterpret_cast<WPARAM>(get_app_state().mono_font), TRUE);
+        SendMessageA(data->hBtnOk, WM_SETFONT, reinterpret_cast<WPARAM>(get_app_state().ui_font), TRUE);
+        SendMessageA(data->hBtnCancel, WM_SETFONT, reinterpret_cast<WPARAM>(get_app_state().ui_font), TRUE);
+
+        make_button_modern(data->hBtnOk, ModernButtonStyle::Primary);
+        make_button_modern(data->hBtnCancel, ModernButtonStyle::Standard);
+        set_window_dark_mode(hwnd, get_app_state().theme == AppTheme::Dark);
+
+        SetFocus(data->hEdit);
+        return 0;
+    }
+    case WM_CTLCOLOREDIT:
+    {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        const ThemeColors &tc = get_theme_colors(get_app_state().theme);
+        SetTextColor(hdc, tc.text_normal);
+        SetBkColor(hdc, tc.bg_control);
+        return reinterpret_cast<INT_PTR>(get_app_state().br_control);
+    }
+    case WM_CTLCOLORSTATIC:
+    {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        const ThemeColors &tc = get_theme_colors(get_app_state().theme);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, tc.text_normal);
+        SetBkColor(hdc, tc.bg_window);
+        return reinterpret_cast<INT_PTR>(get_app_state().br_window);
+    }
+    case WM_ERASEBKGND:
+    {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, get_app_state().br_window);
+        return 1;
+    }
+    case WM_COMMAND:
+    {
+        int id = LOWORD(wp);
+        if (id == IDOK)
+        {
+            char buf[64] = {};
+            GetWindowTextA(data->hEdit, buf, sizeof(buf));
+            std::string s = buf;
+            while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+            while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+
+            if (!s.empty())
+            {
+                if (s.rfind("0x", 0) == 0 || s.rfind("0X", 0) == 0) s = s.substr(2);
+                try {
+                    data->result_addr = static_cast<uintptr_t>(std::stoull(s, nullptr, 16));
+                    data->ok = true;
+                    DestroyWindow(hwnd);
+                } catch (...) {
+                    MessageBoxA(hwnd, "Invalid hexadecimal address format.", "Error", MB_ICONERROR);
+                }
+            }
+            return 0;
+        }
+        else if (id == IDCANCEL)
+        {
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    }
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+void on_goto_address_dialog()
+{
+    if (get_app_state().regions.empty())
+    {
+        MessageBoxA(get_app_state().hwnd_main, "Please load or attach to a process first.", "Go To Address", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    GotoDlgData data;
+    HWND hDlg = CreateWindowExA(WS_EX_DLGMODALFRAME, "DeadeyeGotoDlg", "Go To Address / Offset",
+                                WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                                0, 0, 428, 144, get_app_state().hwnd_main, nullptr,
+                                reinterpret_cast<HINSTANCE>(GetWindowLongPtrA(get_app_state().hwnd_main, GWLP_HINSTANCE)), &data);
+    if (!hDlg) return;
+
+    RECT rcParent, rcDlg;
+    GetWindowRect(get_app_state().hwnd_main, &rcParent);
+    GetWindowRect(hDlg, &rcDlg);
+    int x = rcParent.left + ((rcParent.right - rcParent.left) - (rcDlg.right - rcDlg.left)) / 2;
+    int y = rcParent.top + ((rcParent.bottom - rcParent.top) - (rcDlg.bottom - rcDlg.top)) / 2;
+    SetWindowPos(hDlg, HWND_TOP, x, y, 0, 0, SWP_NOSIZE);
+
+    EnableWindow(get_app_state().hwnd_main, FALSE);
+    MSG msg;
+    while (IsWindow(hDlg) && GetMessageA(&msg, nullptr, 0, 0))
+    {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+    EnableWindow(get_app_state().hwnd_main, TRUE);
+    SetForegroundWindow(get_app_state().hwnd_main);
+
+    if (data.ok)
+    {
+        uintptr_t target_addr = data.result_addr;
+        for (size_t r = 0; r < get_app_state().regions.size(); ++r)
+        {
+            const auto &reg = get_app_state().regions[r];
+            if (target_addr >= reg.base && target_addr < reg.base + reg.size)
+            {
+                get_app_state().selected_region = r;
+                get_app_state().has_selection = true;
+                SIZE_T off_in_reg = target_addr - reg.base;
+                get_app_state().view_offset = (off_in_reg / VIEW_PAGE_SIZE) * VIEW_PAGE_SIZE;
+                display_selected_region(off_in_reg);
+                set_status("Navigated to address 0x" + to_hex_string(target_addr));
+                return;
+            }
+        }
+        set_status("Address 0x" + to_hex_string(target_addr) + " is outside mapped regions.");
+        MessageBoxA(get_app_state().hwnd_main, "Address is outside any committed region in current process memory map.", "Address Not Found", MB_OK | MB_ICONWARNING);
+    }
+}
+
 void evaluate_memory_behavior_heartbeat()
 {
     if (get_app_state().current_pid == 0) return;
@@ -1212,7 +1707,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         int r2_y = M + RH + 6;
 
         get_app_state().combo_view_mode = CreateWindowA("COMBOBOX", "",
-                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL,
                                           M, r2_y, 140, 160, hwnd, reinterpret_cast<HMENU>(ID_COMBO_VIEW_MODE), hInst, nullptr);
         SendMessageA(get_app_state().combo_view_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("View: Triage Findings"));
         SendMessageA(get_app_state().combo_view_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("View: Memory Map"));
@@ -1222,7 +1717,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SendMessageA(get_app_state().combo_view_mode, CB_SETCURSEL, 0, 0);
 
         get_app_state().combo_min_sev = CreateWindowA("COMBOBOX", "",
-                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL,
                                         0, 0, 92, 140, hwnd, reinterpret_cast<HMENU>(ID_COMBO_MIN_SEV), hInst, nullptr);
         SendMessageA(get_app_state().combo_min_sev, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Min: All (0+)"));
         SendMessageA(get_app_state().combo_min_sev, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("Min: Low (10+)"));
@@ -1248,7 +1743,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
                                    0, 0, 56, RH, hwnd, reinterpret_cast<HMENU>(ID_BTN_SNAP), hInst, nullptr);
         get_app_state().combo_diff = CreateWindowA("COMBOBOX", "",
-                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL | WS_DISABLED,
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_DISABLED,
                                      0, 0, 118, 160, hwnd, reinterpret_cast<HMENU>(ID_COMBO_DIFF), hInst, nullptr);
         get_app_state().btn_clear_snaps = CreateWindowA("BUTTON", "Clear",
                                           WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_DISABLED,
@@ -1307,6 +1802,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         make_button_modern(get_app_state().btn_next_page, ModernButtonStyle::Standard);
         make_button_modern(get_app_state().btn_diff_proc, ModernButtonStyle::Accent);
 
+        // Modernize checkboxes for theme-accurate rendering and crisp custom checkmarks
+        make_checkbox_modern(get_app_state().chk_hits_only);
+        make_checkbox_modern(get_app_state().chk_heartbeat);
+        make_checkbox_modern(get_app_state().chk_hide_clean);
+
+        // Configure OS-level window frame dark mode
+        set_window_dark_mode(hwnd, get_app_state().theme == AppTheme::Dark);
+
         // Attach application menu bar
         HMENU hMenu = create_application_menu();
         SetMenu(hwnd, hMenu);
@@ -1351,6 +1854,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             mis->itemHeight = 20; // Row height
             return TRUE;
         }
+        else if (mis->CtlType == ODT_COMBOBOX)
+        {
+            mis->itemHeight = 22; // Combobox item height
+            return TRUE;
+        }
         break;
     }
 
@@ -1362,6 +1870,33 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             draw_region_list_item(dis);
             return TRUE;
         }
+        else if (dis->CtlType == ODT_COMBOBOX)
+        {
+            const ThemeColors &tc = get_theme_colors(get_app_state().theme);
+            bool is_sel = (dis->itemState & ODS_SELECTED) != 0;
+            bool is_disabled = (dis->itemState & ODS_DISABLED) != 0 || !IsWindowEnabled(dis->hwndItem);
+
+            COLORREF bg = is_sel ? tc.row_sel_bg : tc.bg_control;
+            COLORREF fg = is_disabled ? tc.text_muted : (is_sel ? tc.row_sel_text : tc.text_normal);
+
+            HBRUSH br = CreateSolidBrush(bg);
+            FillRect(dis->hDC, &dis->rcItem, br);
+            DeleteObject(br);
+
+            char text[128] = {};
+            if (dis->itemID != static_cast<UINT>(-1))
+            {
+                SendMessageA(dis->hwndItem, CB_GETLBTEXT, dis->itemID, reinterpret_cast<LPARAM>(text));
+            }
+            SetBkMode(dis->hDC, TRANSPARENT);
+            SetTextColor(dis->hDC, fg);
+            HGDIOBJ oldFont = SelectObject(dis->hDC, get_app_state().ui_font);
+            RECT text_rc = dis->rcItem;
+            text_rc.left += 6;
+            DrawTextA(dis->hDC, text, -1, &text_rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            SelectObject(dis->hDC, oldFont);
+            return TRUE;
+        }
         break;
     }
 
@@ -1369,6 +1904,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
         HDC hdc = reinterpret_cast<HDC>(wp);
         const ThemeColors &tc = get_theme_colors(get_app_state().theme);
+        SetBkMode(hdc, OPAQUE);
         SetTextColor(hdc, tc.text_normal);
         SetBkColor(hdc, tc.bg_control);
         return reinterpret_cast<INT_PTR>(get_app_state().br_control);
@@ -1379,12 +1915,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         HDC hdc = reinterpret_cast<HDC>(wp);
         HWND hctl = reinterpret_cast<HWND>(lp);
         const ThemeColors &tc = get_theme_colors(get_app_state().theme);
-        if (hctl == get_app_state().edit_hex)
+        if (hctl == get_app_state().edit_hex ||
+            hctl == get_app_state().edit_pid ||
+            hctl == get_app_state().edit_pattern)
         {
-            SetTextColor(hdc, tc.text_normal);
+            SetTextColor(hdc, IsWindowEnabled(hctl) ? tc.text_normal : tc.text_muted);
             SetBkColor(hdc, tc.bg_control);
             return reinterpret_cast<INT_PTR>(get_app_state().br_control);
         }
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, tc.text_normal);
+        SetBkColor(hdc, tc.bg_window);
+        return reinterpret_cast<INT_PTR>(get_app_state().br_window);
+    }
+
+    case WM_CTLCOLORBTN:
+    {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        const ThemeColors &tc = get_theme_colors(get_app_state().theme);
+        SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, tc.text_normal);
         SetBkColor(hdc, tc.bg_window);
         return reinterpret_cast<INT_PTR>(get_app_state().br_window);
@@ -1934,6 +2483,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         {
             PostMessageA(hwnd, WM_COMMAND, ID_BTN_NEXT_HIT, 0);
         }
+        else if (id == IDM_EDIT_GOTO)
+        {
+            on_goto_address_dialog();
+        }
+        else if (id == IDM_EDIT_EXPORT_REGION)
+        {
+            on_export_region_binary();
+        }
         else if (id == IDM_VIEW_TRIAGE_FINDINGS)
         {
             SendMessageA(get_app_state().combo_view_mode, CB_SETCURSEL, 0, 0);
@@ -2013,6 +2570,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         else if (id == IDM_DIFF_VIEW_STRINGS)
         {
             open_revealed_strings_dialog(hwnd);
+        }
+        else if (id == IDM_SNAP_CAPTURE)
+        {
+            on_capture_snapshot_dialog();
+        }
+        else if (id == IDM_SNAP_SAVE)
+        {
+            on_save_snapshot_dialog();
+        }
+        else if (id == IDM_SNAP_LOAD)
+        {
+            on_load_snapshot_dialog();
+        }
+        else if (id == IDM_SNAP_COMPARE)
+        {
+            on_compare_snapshots_dialog();
+        }
+        else if (id == IDM_SNAP_NEXT_DIFF)
+        {
+            on_next_diff_range();
+        }
+        else if (id == IDM_SNAP_PREV_DIFF)
+        {
+            on_prev_diff_range();
         }
         else if (id == IDM_VIEW_BEHAVIOR)
         {
@@ -2431,6 +3012,16 @@ int run_gui(HINSTANCE hInst, int nCmdShow)
     wcAttach.hCursor = LoadCursorA(nullptr, IDC_ARROW);
     wcAttach.hIcon = hIconSmall;
     RegisterClassExA(&wcAttach);
+
+    WNDCLASSEXA wcGoto = {};
+    wcGoto.cbSize = sizeof(wcGoto);
+    wcGoto.lpfnWndProc = GotoDlgProc;
+    wcGoto.hInstance = hInst;
+    wcGoto.hbrBackground = nullptr;
+    wcGoto.lpszClassName = "DeadeyeGotoDlg";
+    wcGoto.hCursor = LoadCursorA(nullptr, IDC_ARROW);
+    wcGoto.hIcon = hIconSmall;
+    RegisterClassExA(&wcGoto);
 
     HWND hwnd = CreateWindowA("DeadeyeHexViewer", "Deadeye",
                               WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,

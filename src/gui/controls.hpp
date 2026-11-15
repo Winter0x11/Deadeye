@@ -68,7 +68,9 @@ enum class ModernButtonStyle {
     Accent   // "Export JSON"
 };
 
-void make_button_modern(HWND btn, ModernButtonStyle style, AppTheme theme = AppTheme::Dark);
+void make_button_modern(HWND btn, ModernButtonStyle style, AppTheme theme = AppTheme::Light);
+void make_checkbox_modern(HWND chk);
+void set_window_dark_mode(HWND hwnd, bool dark);
 void copy_text_to_clipboard(HWND hwnd, const std::string &text);
 void enable_debug_privilege();
 

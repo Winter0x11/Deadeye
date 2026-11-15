@@ -98,6 +98,7 @@ LRESULT CALLBACK StringsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         make_button_modern(data->hBtnCopy, ModernButtonStyle::Standard);
         make_button_modern(data->hBtnExport, ModernButtonStyle::Accent);
         make_button_modern(data->hBtnClose, ModernButtonStyle::Standard);
+        set_window_dark_mode(hwnd, get_app_state().theme == AppTheme::Dark);
 
         populate_strings_view(data->hListStrings, "");
         return 0;
@@ -165,13 +166,30 @@ LRESULT CALLBACK StringsDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     case WM_CTLCOLOREDIT:
-    case WM_CTLCOLORSTATIC:
     {
         HDC hdc = reinterpret_cast<HDC>(wp);
         const ThemeColors &tc = get_theme_colors(get_app_state().theme);
+        SetBkMode(hdc, OPAQUE);
         SetTextColor(hdc, tc.text_normal);
         SetBkColor(hdc, tc.bg_control);
         return reinterpret_cast<INT_PTR>(get_app_state().br_control);
+    }
+
+    case WM_CTLCOLORSTATIC:
+    {
+        HDC hdc = reinterpret_cast<HDC>(wp);
+        HWND hctl = reinterpret_cast<HWND>(lp);
+        const ThemeColors &tc = get_theme_colors(get_app_state().theme);
+        if (data && (hctl == data->hListStrings || hctl == data->hFilterEdit))
+        {
+            SetTextColor(hdc, tc.text_normal);
+            SetBkColor(hdc, tc.bg_control);
+            return reinterpret_cast<INT_PTR>(get_app_state().br_control);
+        }
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, tc.text_normal);
+        SetBkColor(hdc, tc.bg_window);
+        return reinterpret_cast<INT_PTR>(get_app_state().br_window);
     }
 
     case WM_ERASEBKGND:

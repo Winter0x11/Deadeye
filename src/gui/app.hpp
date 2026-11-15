@@ -19,6 +19,7 @@
 #include "core/triage.hpp"
 #include "core/behavior.hpp"
 #include "core/pattern.hpp"
+#include "core/snapshot.hpp"
 #include "gui/controls.hpp"
 
 namespace gui {
@@ -75,7 +76,7 @@ struct WorkerResult
 struct AppState
 {
     // Themes & fonts & brushes
-    AppTheme theme = AppTheme::Dark;
+    AppTheme theme = AppTheme::Light;
     HFONT mono_font = nullptr;
     HFONT ui_font = nullptr;
     HFONT ui_font_bold = nullptr;
@@ -145,6 +146,12 @@ struct AppState
     bool has_target = false;
     std::vector<RevealedString> revealed_strings;
 
+    // Persistent Snapshot & Byte-Diff Engine
+    std::vector<core::ProcessSnapshot> snapshot_store;
+    core::SnapshotCompareReport active_snapshot_compare;
+    bool has_snapshot_compare = false;
+    size_t diff_jump_index = 0;
+
     // Strings subsystem
     std::vector<ExtractedStringItem> extracted_strings;
     std::unordered_map<uintptr_t, std::unordered_set<uint64_t>> string_baselines;
@@ -186,6 +193,14 @@ void on_capture_baseline();
 void on_capture_diff();
 void on_save_diff_session();
 void on_load_diff_session();
+void on_capture_snapshot_dialog();
+void on_save_snapshot_dialog();
+void on_load_snapshot_dialog();
+void on_compare_snapshots_dialog();
+void on_goto_address_dialog();
+void on_export_region_binary();
+void on_next_diff_range();
+void on_prev_diff_range();
 void evaluate_memory_behavior_heartbeat();
 
 void start_worker_task(WorkerTaskType task_type, bool require_pattern);
