@@ -19,6 +19,7 @@
 #include "core/memsource.hpp"
 #include "core/triage.hpp"
 #include "core/pattern.hpp"
+#include "core/timeline.hpp"
 
 // Tier 1: Process-Wide Memory Diff Structures
 struct ProcessRegionSnapshot
@@ -229,11 +230,13 @@ void evaluate_watched_region_detections(
 struct BehaviorTrackerContext
 {
     HANDLE proc = nullptr;
+    DWORD pid = 0;
     std::vector<WatchedRegionState> *watched_regions = nullptr;
     std::unordered_map<uintptr_t, uint32_t> *region_generations = nullptr;
     const std::vector<RegionInfo> *regions = nullptr;
     const TriageReport *triage_report = nullptr;
     const std::unordered_map<uintptr_t, std::unordered_set<uint64_t>> *string_baselines = nullptr;
+    core::TimelineManager *timeline = nullptr;
     bool watch_all_priv_exec = false;
     size_t *rotating_idx = nullptr;
     std::atomic<uint64_t> *total_samples = nullptr;

@@ -169,4 +169,17 @@ bool compare_snapshots(
     SnapshotCompareReport &out_report,
     std::string &out_err);
 
+// Compares two snapshot files on disk (.desnap format)
+bool compare_snapshot_files(
+    const std::string &filepath_a,
+    const std::string &filepath_b,
+    SnapshotCompareReport &out_report,
+    std::string &out_err);
+
+// Serializes a SnapshotCompareReport to JSON
+std::string export_diff_json(
+    const SnapshotCompareReport &report,
+    bool include_byte_arrays = false,
+    size_t max_bytes_cap = 1024);
+
 } // namespace core

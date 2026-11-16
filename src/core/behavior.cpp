@@ -683,6 +683,11 @@ bool run_behavior_tracker_tick(
 
         if (mbi.State == MEM_FREE)
         {
+            if (!wreg.is_deallocated && ctx.timeline != nullptr)
+            {
+                DWORD old_prot = wreg.ring_samples.empty() ? 0 : wreg.ring_samples.back().protect;
+                ctx.timeline->record_region_disappeared(ctx.pid, wreg.key.base, wreg.size, old_prot, wreg.type);
+            }
             wreg.is_deallocated = true;
             RegionSampleRecord rec;
             rec.timestamp_ms = now_ms;
@@ -690,6 +695,13 @@ bool run_behavior_tracker_tick(
             rec.is_unreadable = true;
             add_sample_to_ring(wreg, rec);
             continue;
+        }
+
+        // Check for protection transition
+        DWORD prev_prot = wreg.ring_samples.empty() ? 0 : wreg.ring_samples.back().protect;
+        if (prev_prot != 0 && prev_prot != mbi.Protect && ctx.timeline != nullptr)
+        {
+            ctx.timeline->record_protection_changed(ctx.pid, wreg.key.base, wreg.size, prev_prot, mbi.Protect, wreg.type);
         }
 
         // Handle size or allocation base change without mixing up identities
@@ -771,6 +783,20 @@ bool run_behavior_tracker_tick(
                         }
                         rec.changed_fraction = static_cast<double>(diff_bytes) / static_cast<double>(cmp_len);
                     }
+                }
+            }
+
+            if (ctx.timeline != nullptr && !wreg.ring_samples.empty())
+            {
+                double prev_ent = wreg.ring_samples.back().avg_entropy;
+                if (prev_ent > 0.0 && rec.avg_entropy > 0.0 && std::abs(rec.avg_entropy - prev_ent) >= 1.5)
+                {
+                    ctx.timeline->record_entropy_shift(ctx.pid, wreg.key.base, wreg.size, mbi.Protect, wreg.type, prev_ent, rec.avg_entropy);
+                }
+                if (rec.changed_fraction >= 0.10)
+                {
+                    SIZE_T approx_changed = static_cast<SIZE_T>(rec.changed_fraction * rec.sample_size);
+                    ctx.timeline->record_content_changed(ctx.pid, wreg.key.base, wreg.size, mbi.Protect, wreg.type, approx_changed);
                 }
             }
         }

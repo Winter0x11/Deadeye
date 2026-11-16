@@ -20,6 +20,7 @@
 #include "core/behavior.hpp"
 #include "core/pattern.hpp"
 #include "core/snapshot.hpp"
+#include "core/timeline.hpp"
 #include "gui/controls.hpp"
 
 namespace gui {
@@ -34,7 +35,8 @@ enum class ViewMode
     MemoryMap = 1,
     BehaviorTracker = 2,
     StringsView = 3,
-    ProcessDiff = 4
+    ProcessDiff = 4,
+    Timeline = 5
 };
 
 enum class WorkerTaskType
@@ -146,6 +148,11 @@ struct AppState
     bool has_target = false;
     std::vector<RevealedString> revealed_strings;
 
+    // Memory Investigation Timeline subsystem
+    core::TimelineManager timeline;
+    core::TimelineFilter timeline_filter;
+    std::vector<core::TimelineEvent> cached_timeline_events;
+
     // Persistent Snapshot & Byte-Diff Engine
     std::vector<core::ProcessSnapshot> snapshot_store;
     core::SnapshotCompareReport active_snapshot_compare;
@@ -201,6 +208,10 @@ void on_goto_address_dialog();
 void on_export_region_binary();
 void on_next_diff_range();
 void on_prev_diff_range();
+void on_export_timeline_json();
+void on_clear_timeline();
+void on_export_diff_json_dialog();
+void on_advanced_pattern_search_dialog();
 void evaluate_memory_behavior_heartbeat();
 
 void start_worker_task(WorkerTaskType task_type, bool require_pattern);

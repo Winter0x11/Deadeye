@@ -13,6 +13,7 @@
 #include "gui/attach_dialog.hpp"
 #include "gui/strings_dialog.hpp"
 #include "gui/pe_options_dialog.hpp"
+#include "gui/search_dialog.hpp"
 
 #include "core/scoring.hpp"
 #include "core/util.hpp"
@@ -190,6 +191,8 @@ DWORD WINAPI WorkerThreadProc(LPVOID param)
     {
         BehaviorTrackerContext ctx;
         ctx.proc = get_or_open_target_proc(source->get_pid());
+        ctx.pid = source->get_pid();
+        ctx.timeline = &get_app_state().timeline;
         ctx.watched_regions = &get_app_state().watched_regions;
         ctx.region_generations = &get_app_state().region_generations;
         ctx.regions = &get_app_state().regions;
@@ -417,6 +420,11 @@ void on_worker_completed(WorkerResult *res)
     get_app_state().view_offset = 0;
 
     EnableWindow(get_app_state().btn_next_hit, (get_app_state().has_pattern && res->total_hits > 0) ? TRUE : FALSE);
+
+    for (const auto &reg : get_app_state().regions)
+    {
+        get_app_state().timeline.record_region_observed(res->pid, reg.base, reg.size, reg.protect, reg.type, reg.avg_entropy);
+    }
 
     if (res->task_type == WorkerTaskType::Triage)
     {
@@ -732,6 +740,12 @@ void on_capture_baseline()
     if (capture_process_snapshot_session(get_app_state().current_pid, get_app_state().process_baseline, err))
     {
         get_app_state().has_baseline = true;
+        get_app_state().timeline.record_snapshot_captured(
+            get_app_state().process_baseline.pid,
+            std::to_string(get_app_state().process_baseline.pid),
+            "Baseline Snapshot (" + get_app_state().process_baseline.process_name + ")",
+            get_app_state().process_baseline.regions.size(),
+            get_app_state().process_baseline.total_committed_bytes);
         char msg[160];
         std::snprintf(msg, sizeof(msg), "Baseline captured: %zu committed regions (%s) for PID %u (%s)",
                       get_app_state().process_baseline.regions.size(),
@@ -788,10 +802,15 @@ void on_capture_diff()
     {
         get_app_state().has_target = true;
         compute_process_diff(get_app_state().process_baseline, get_app_state().process_target, get_app_state().process_diffs);
+        get_app_state().timeline.record_diff_generated(
+            get_app_state().current_pid,
+            "Process Baseline vs Current Target Diff",
+            get_app_state().process_diffs.size(),
+            0);
 
         // Switch to Process Diff view
         get_app_state().view_mode = ViewMode::ProcessDiff;
-        SendMessageA(get_app_state().combo_view_mode, CB_SETCURSEL, 2, 0);
+        SendMessageA(get_app_state().combo_view_mode, CB_SETCURSEL, 4, 0);
         populate_region_list();
 
         size_t new_cnt = 0, prot_cnt = 0, mod_cnt = 0, del_cnt = 0, res_cnt = 0;
@@ -927,6 +946,12 @@ void on_capture_snapshot_dialog()
     {
         get_app_state().snapshot_store.push_back(std::move(snap));
         const auto &s = get_app_state().snapshot_store.back();
+        get_app_state().timeline.record_snapshot_captured(
+            s.metadata.pid,
+            s.metadata.id,
+            s.metadata.name,
+            s.regions.size(),
+            s.metadata.total_bytes_captured);
         std::string msg = "Captured snapshot '" + s.metadata.name + "': " +
                           std::to_string(s.regions.size()) + " region(s), " +
                           std::to_string(s.metadata.total_bytes_captured / 1024) + " KB.";
@@ -1058,6 +1083,12 @@ void on_compare_snapshots_dialog()
         SendMessageA(get_app_state().combo_view_mode, CB_SETCURSEL, 4, 0);
         populate_region_list();
 
+        get_app_state().timeline.record_diff_generated(
+            snap_b.metadata.pid,
+            snap_a.metadata.name + " vs " + snap_b.metadata.name,
+            report.count_modified_regions,
+            report.total_changed_bytes);
+
         std::string warn_text;
         for (const auto &w : report.compatibility_warnings)
         {
@@ -1152,6 +1183,106 @@ void on_prev_diff_range()
         }
     }
     set_status("No changed byte ranges found in snapshot comparison.");
+}
+
+void on_export_timeline_json()
+{
+    if (get_app_state().timeline.count() == 0)
+    {
+        MessageBoxA(get_app_state().hwnd_main, "No timeline events recorded yet to export.",
+                    "No Data", MB_ICONINFORMATION);
+        return;
+    }
+
+    char filename_buf[MAX_PATH] = {};
+    std::snprintf(filename_buf, sizeof(filename_buf), "deadeye_timeline_pid%u.json", static_cast<unsigned int>(get_app_state().current_pid));
+
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = get_app_state().hwnd_main;
+    ofn.lpstrFilter = "JSON Files (*.json)\0*.json\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFile = filename_buf;
+    ofn.nMaxFile = sizeof(filename_buf);
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    ofn.lpstrDefExt = "json";
+
+    if (GetSaveFileNameA(&ofn))
+    {
+        std::string json = get_app_state().timeline.export_json(get_app_state().timeline_filter);
+        HANDLE hFile = CreateFileA(ofn.lpstrFile, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile != INVALID_HANDLE_VALUE)
+        {
+            DWORD written = 0;
+            WriteFile(hFile, json.data(), static_cast<DWORD>(json.size()), &written, nullptr);
+            CloseHandle(hFile);
+            std::string msg = "Exported " + std::to_string(get_app_state().timeline.count()) +
+                              " timeline events to:\n" + ofn.lpstrFile;
+            set_status("Timeline JSON exported to " + std::string(ofn.lpstrFile));
+            MessageBoxA(get_app_state().hwnd_main, msg.c_str(), "Timeline Export Complete", MB_OK | MB_ICONINFORMATION);
+        }
+        else
+        {
+            MessageBoxA(get_app_state().hwnd_main, "Failed to write timeline JSON file.", "Export Error", MB_ICONERROR);
+        }
+    }
+}
+
+void on_clear_timeline()
+{
+    size_t count = get_app_state().timeline.count();
+    get_app_state().timeline.clear();
+    get_app_state().cached_timeline_events.clear();
+    if (get_app_state().view_mode == ViewMode::Timeline)
+    {
+        populate_region_list();
+    }
+    set_status("Cleared " + std::to_string(count) + " timeline events.");
+}
+
+void on_export_diff_json_dialog()
+{
+    if (!get_app_state().has_snapshot_compare)
+    {
+        MessageBoxA(get_app_state().hwnd_main, "No active snapshot comparison report available. Compare snapshots first.",
+                    "No Diff Data", MB_ICONINFORMATION);
+        return;
+    }
+
+    char filename_buf[MAX_PATH] = {};
+    std::snprintf(filename_buf, sizeof(filename_buf), "deadeye_diff_compare.json");
+
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = get_app_state().hwnd_main;
+    ofn.lpstrFilter = "JSON Files (*.json)\0*.json\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFile = filename_buf;
+    ofn.nMaxFile = sizeof(filename_buf);
+    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    ofn.lpstrDefExt = "json";
+
+    if (GetSaveFileNameA(&ofn))
+    {
+        std::string json = core::export_diff_json(get_app_state().active_snapshot_compare, true);
+        HANDLE hFile = CreateFileA(ofn.lpstrFile, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile != INVALID_HANDLE_VALUE)
+        {
+            DWORD written = 0;
+            WriteFile(hFile, json.data(), static_cast<DWORD>(json.size()), &written, nullptr);
+            CloseHandle(hFile);
+            std::string msg = "Exported diff comparison report to:\n" + std::string(ofn.lpstrFile);
+            set_status("Diff JSON exported to " + std::string(ofn.lpstrFile));
+            MessageBoxA(get_app_state().hwnd_main, msg.c_str(), "Diff Export Complete", MB_OK | MB_ICONINFORMATION);
+        }
+        else
+        {
+            MessageBoxA(get_app_state().hwnd_main, "Failed to write diff JSON file.", "Export Error", MB_ICONERROR);
+        }
+    }
+}
+
+void on_advanced_pattern_search_dialog()
+{
+    open_advanced_pattern_search_dialog(get_app_state().hwnd_main);
 }
 
 void on_export_region_binary()
@@ -1714,6 +1845,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SendMessageA(get_app_state().combo_view_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("View: Behavior Tracker"));
         SendMessageA(get_app_state().combo_view_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("View: Strings"));
         SendMessageA(get_app_state().combo_view_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("View: Process Diff"));
+        SendMessageA(get_app_state().combo_view_mode, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>("View: Memory Timeline"));
         SendMessageA(get_app_state().combo_view_mode, CB_SETCURSEL, 0, 0);
 
         get_app_state().combo_min_sev = CreateWindowA("COMBOBOX", "",
@@ -2168,7 +2300,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         else if (id == ID_COMBO_VIEW_MODE && code == CBN_SELCHANGE)
         {
             LRESULT sel = SendMessageA(get_app_state().combo_view_mode, CB_GETCURSEL, 0, 0);
-            if (sel == 4)
+            if (sel == 5)
+                get_app_state().view_mode = ViewMode::Timeline;
+            else if (sel == 4)
                 get_app_state().view_mode = ViewMode::ProcessDiff;
             else if (sel == 3)
                 get_app_state().view_mode = ViewMode::StringsView;
@@ -2350,6 +2484,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                                 get_app_state().view_offset = (rel_off / VIEW_PAGE_SIZE) * VIEW_PAGE_SIZE;
                                 display_selected_region(rel_off);
                                 break;
+                            }
+                        }
+                    }
+                }
+                else if (get_app_state().view_mode == ViewMode::Timeline)
+                {
+                    if (reg_idx < get_app_state().cached_timeline_events.size())
+                    {
+                        update_triage_details_label(reg_idx);
+                        uintptr_t target_base = get_app_state().cached_timeline_events[reg_idx].base_address;
+                        if (target_base != 0)
+                        {
+                            for (size_t r = 0; r < get_app_state().regions.size(); ++r)
+                            {
+                                if (get_app_state().regions[r].base == target_base ||
+                                    (target_base >= get_app_state().regions[r].base && target_base < get_app_state().regions[r].base + get_app_state().regions[r].size))
+                                {
+                                    get_app_state().selected_region = r;
+                                    get_app_state().has_selection = true;
+                                    SIZE_T rel_off = target_base - get_app_state().regions[r].base;
+                                    get_app_state().view_offset = (rel_off / VIEW_PAGE_SIZE) * VIEW_PAGE_SIZE;
+                                    display_selected_region(rel_off);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -2609,6 +2767,27 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         {
             SendMessageA(get_app_state().combo_view_mode, CB_SETCURSEL, 4, 0);
             SendMessageA(hwnd, WM_COMMAND, MAKEWPARAM(ID_COMBO_VIEW_MODE, CBN_SELCHANGE), reinterpret_cast<LPARAM>(get_app_state().combo_view_mode));
+        }
+        else if (id == IDM_VIEW_TIMELINE)
+        {
+            SendMessageA(get_app_state().combo_view_mode, CB_SETCURSEL, 5, 0);
+            SendMessageA(hwnd, WM_COMMAND, MAKEWPARAM(ID_COMBO_VIEW_MODE, CBN_SELCHANGE), reinterpret_cast<LPARAM>(get_app_state().combo_view_mode));
+        }
+        else if (id == IDM_TIMELINE_EXPORT_JSON)
+        {
+            on_export_timeline_json();
+        }
+        else if (id == IDM_TIMELINE_CLEAR_EVENTS)
+        {
+            on_clear_timeline();
+        }
+        else if (id == IDM_SNAP_EXPORT_JSON)
+        {
+            on_export_diff_json_dialog();
+        }
+        else if (id == IDM_EDIT_ADV_SEARCH)
+        {
+            on_advanced_pattern_search_dialog();
         }
         else if (id == IDM_BEHAVIOR_PIN)
         {
@@ -3022,6 +3201,16 @@ int run_gui(HINSTANCE hInst, int nCmdShow)
     wcGoto.hCursor = LoadCursorA(nullptr, IDC_ARROW);
     wcGoto.hIcon = hIconSmall;
     RegisterClassExA(&wcGoto);
+
+    WNDCLASSEXA wcSearch = {};
+    wcSearch.cbSize = sizeof(wcSearch);
+    wcSearch.lpfnWndProc = SearchDlgProc;
+    wcSearch.hInstance = hInst;
+    wcSearch.hbrBackground = nullptr;
+    wcSearch.lpszClassName = "DeadeyeSearchDlg";
+    wcSearch.hCursor = LoadCursorA(nullptr, IDC_ARROW);
+    wcSearch.hIcon = hIconSmall;
+    RegisterClassExA(&wcSearch);
 
     HWND hwnd = CreateWindowA("DeadeyeHexViewer", "Deadeye",
                               WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,

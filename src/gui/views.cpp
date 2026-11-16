@@ -40,6 +40,24 @@ void update_triage_details_label(size_t reg_idx)
         return;
     }
 
+    if (get_app_state().view_mode == ViewMode::Timeline)
+    {
+        if (reg_idx < get_app_state().cached_timeline_events.size())
+        {
+            const auto &evt = get_app_state().cached_timeline_events[reg_idx];
+            std::string text = "Timeline [" + format_timeline_category(evt.category) + "] " +
+                               evt.timestamp_str + " | 0x" + to_hex_string(evt.base_address) +
+                               " (" + fmt_size_short(evt.region_size) + ") | " +
+                               evt.summary + (evt.details.empty() ? "" : " | " + evt.details);
+            SetWindowTextA(get_app_state().lbl_triage_reasons, text.c_str());
+        }
+        else
+        {
+            SetWindowTextA(get_app_state().lbl_triage_reasons, "Timeline Details: Ready. Real-time chronological memory lifecycle and diff timeline.");
+        }
+        return;
+    }
+
     if (get_app_state().view_mode == ViewMode::BehaviorTracker)
     {
         if (reg_idx < get_app_state().watched_regions.size())
@@ -169,6 +187,53 @@ void populate_region_list()
                               type_short(d.type).c_str(),
                               prot_short(d.new_protect ? d.new_protect : d.old_protect).c_str(),
                               d.summary.c_str());
+
+                SendMessageA(get_app_state().list_regions, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(row));
+                get_app_state().visible_indices.push_back(i);
+            }
+        }
+        SendMessageA(get_app_state().list_regions, WM_SETREDRAW, TRUE, 0);
+        InvalidateRect(get_app_state().list_regions, nullptr, TRUE);
+        return;
+    }
+
+    if (get_app_state().view_mode == ViewMode::Timeline)
+    {
+        get_app_state().cached_timeline_events = get_app_state().timeline.query(get_app_state().timeline_filter);
+        if (get_app_state().cached_timeline_events.empty())
+        {
+            SendMessageA(get_app_state().list_regions, LB_ADDSTRING, 0,
+                         reinterpret_cast<LPARAM>("No timeline events recorded yet. Memory changes, diffs, snapshots, and protection shifts will appear here."));
+        }
+        else
+        {
+            for (size_t i = 0; i < get_app_state().cached_timeline_events.size(); ++i)
+            {
+                const auto &evt = get_app_state().cached_timeline_events[i];
+                std::string badge;
+                switch (evt.event_type)
+                {
+                    case core::TimelineEventType::RegionObserved: badge = "[+OBSV  ]"; break;
+                    case core::TimelineEventType::RegionDisappeared: badge = "[-FREED ]"; break;
+                    case core::TimelineEventType::ProtectionChanged: badge = "[!PROT  ]"; break;
+                    case core::TimelineEventType::ExecPermGained: badge = "[!EXEC+ ]"; break;
+                    case core::TimelineEventType::ExecPermLost: badge = "[-EXEC  ]"; break;
+                    case core::TimelineEventType::ContentChanged: badge = "[~MODIF ]"; break;
+                    case core::TimelineEventType::EntropyShift: badge = "[~ENTRO ]"; break;
+                    case core::TimelineEventType::SleepCycleDetected: badge = "[!SLEEP ]"; break;
+                    case core::TimelineEventType::SnapshotCaptured: badge = "[*SNAP  ]"; break;
+                    case core::TimelineEventType::DiffGenerated: badge = "[#DIFF  ]"; break;
+                    default: badge = "[ EVENT ]"; break;
+                }
+
+                char row[320];
+                std::snprintf(row, sizeof(row), "%-9s %-12s %016llX %-8s %-8s %s",
+                              badge.c_str(),
+                              evt.timestamp_str.c_str(),
+                              static_cast<unsigned long long>(evt.base_address),
+                              fmt_size_short(evt.region_size).c_str(),
+                              prot_short(evt.new_protect ? evt.new_protect : evt.old_protect).c_str(),
+                              evt.summary.c_str());
 
                 SendMessageA(get_app_state().list_regions, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(row));
                 get_app_state().visible_indices.push_back(i);
@@ -595,6 +660,48 @@ void draw_region_list_item(DRAWITEMSTRUCT *dis)
             {
                 bg_color = tc.row_priv_bg;
                 text_color = tc.row_priv_text;
+            }
+        }
+    }
+    else if (get_app_state().view_mode == ViewMode::Timeline)
+    {
+        if (reg_idx < get_app_state().cached_timeline_events.size())
+        {
+            const auto &evt = get_app_state().cached_timeline_events[reg_idx];
+            switch (evt.event_type)
+            {
+                case core::TimelineEventType::ExecPermGained:
+                case core::TimelineEventType::SleepCycleDetected:
+                    bg_color = tc.row_pe_bg;
+                    text_color = tc.row_pe_text;
+                    break;
+                case core::TimelineEventType::ProtectionChanged:
+                case core::TimelineEventType::ExecPermLost:
+                    bg_color = tc.row_rwx_bg;
+                    text_color = tc.row_rwx_text;
+                    break;
+                case core::TimelineEventType::ContentChanged:
+                    bg_color = tc.row_diff_mod_bg;
+                    text_color = tc.row_diff_mod_text;
+                    break;
+                case core::TimelineEventType::RegionDisappeared:
+                    bg_color = tc.row_diff_del_bg;
+                    text_color = tc.row_diff_del_text;
+                    break;
+                case core::TimelineEventType::SnapshotCaptured:
+                case core::TimelineEventType::DiffGenerated:
+                    bg_color = tc.row_diff_new_bg;
+                    text_color = tc.row_diff_new_text;
+                    break;
+                case core::TimelineEventType::EntropyShift:
+                    bg_color = tc.row_flip_bg;
+                    text_color = tc.row_flip_text;
+                    break;
+                case core::TimelineEventType::RegionObserved:
+                default:
+                    bg_color = tc.row_priv_bg;
+                    text_color = tc.row_priv_text;
+                    break;
             }
         }
     }

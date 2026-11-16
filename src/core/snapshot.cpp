@@ -738,4 +738,128 @@ bool compare_snapshots(
     return true;
 }
 
+bool compare_snapshot_files(
+    const std::string &filepath_a,
+    const std::string &filepath_b,
+    SnapshotCompareReport &out_report,
+    std::string &out_err)
+{
+    out_err.clear();
+    ProcessSnapshot snap_a;
+    std::string err_a;
+    if (!load_snapshot_from_file(filepath_a, snap_a, err_a))
+    {
+        out_err = "Failed to load Snapshot A (" + filepath_a + "): " + err_a;
+        return false;
+    }
+
+    ProcessSnapshot snap_b;
+    std::string err_b;
+    if (!load_snapshot_from_file(filepath_b, snap_b, err_b))
+    {
+        out_err = "Failed to load Snapshot B (" + filepath_b + "): " + err_b;
+        return false;
+    }
+
+    return compare_snapshots(snap_a, snap_b, out_report, out_err);
+}
+
+std::string export_diff_json(
+    const SnapshotCompareReport &report,
+    bool include_byte_arrays,
+    size_t max_bytes_cap)
+{
+    std::ostringstream ss;
+    ss << "{\n"
+       << "  \"snapshot_a\": {\n"
+       << "    \"id\": \"" << escape_json(report.snapshot_a_id) << "\",\n"
+       << "    \"name\": \"" << escape_json(report.snapshot_a_name) << "\"\n"
+       << "  },\n"
+       << "  \"snapshot_b\": {\n"
+       << "    \"id\": \"" << escape_json(report.snapshot_b_id) << "\",\n"
+       << "    \"name\": \"" << escape_json(report.snapshot_b_name) << "\"\n"
+       << "  },\n"
+       << "  \"compatibility\": {\n"
+       << "    \"pid_match\": " << (report.pid_match ? "true" : "false") << ",\n"
+       << "    \"creation_time_match\": " << (report.creation_time_match ? "true" : "false") << ",\n"
+       << "    \"warnings\": [";
+    for (size_t i = 0; i < report.compatibility_warnings.size(); ++i)
+    {
+        ss << "\"" << escape_json(report.compatibility_warnings[i]) << "\"";
+        if (i + 1 < report.compatibility_warnings.size()) ss << ", ";
+    }
+    ss << "]\n"
+       << "  },\n"
+       << "  \"summary\": {\n"
+       << "    \"unchanged_regions\": " << report.count_unchanged_regions << ",\n"
+       << "    \"modified_regions\": " << report.count_modified_regions << ",\n"
+       << "    \"added_regions\": " << report.count_added_regions << ",\n"
+       << "    \"removed_regions\": " << report.count_removed_regions << ",\n"
+       << "    \"total_changed_bytes\": " << report.total_changed_bytes << "\n"
+       << "  },\n"
+       << "  \"region_diffs\": [\n";
+
+    for (size_t i = 0; i < report.region_diffs.size(); ++i)
+    {
+        const auto &rd = report.region_diffs[i];
+        std::string status_str = (rd.overall_status == DiffByteStatus::Added) ? "Added" :
+                                 (rd.overall_status == DiffByteStatus::Removed) ? "Removed" :
+                                 (rd.overall_status == DiffByteStatus::Modified) ? "Modified" : "Unchanged";
+
+        ss << "    {\n"
+           << "      \"base_address\": \"0x" << to_hex_string(rd.base_address) << "\",\n"
+           << "      \"region_size\": " << rd.region_size << ",\n"
+           << "      \"status\": \"" << status_str << "\",\n"
+           << "      \"old_protect\": \"" << prot_short(rd.old_protect) << "\",\n"
+           << "      \"new_protect\": \"" << prot_short(rd.new_protect) << "\",\n"
+           << "      \"old_type\": \"" << type_short(rd.old_type) << "\",\n"
+           << "      \"new_type\": \"" << type_short(rd.new_type) << "\",\n"
+           << "      \"protection_changed\": " << (rd.protection_changed ? "true" : "false") << ",\n"
+           << "      \"type_changed\": " << (rd.type_changed ? "true" : "false") << ",\n"
+           << "      \"content_changed\": " << (rd.content_changed ? "true" : "false") << ",\n"
+           << "      \"total_changed_bytes\": " << rd.total_changed_bytes << ",\n"
+           << "      \"summary\": \"" << escape_json(rd.summary) << "\",\n"
+           << "      \"changed_ranges\": [";
+
+        for (size_t j = 0; j < rd.changed_ranges.size(); ++j)
+        {
+            const auto &cr = rd.changed_ranges[j];
+            ss << "\n        {\n"
+               << "          \"offset\": " << cr.offset_in_region << ",\n"
+               << "          \"length\": " << cr.length;
+            if (include_byte_arrays)
+            {
+                ss << ",\n          \"old_hex\": \"";
+                size_t old_cap = std::min(cr.old_bytes.size(), max_bytes_cap);
+                for (size_t b = 0; b < old_cap; ++b)
+                {
+                    char hx[4];
+                    std::snprintf(hx, sizeof(hx), "%02X", cr.old_bytes[b]);
+                    ss << hx;
+                }
+                if (cr.old_bytes.size() > max_bytes_cap) ss << "...";
+                ss << "\",\n          \"new_hex\": \"";
+                size_t new_cap = std::min(cr.new_bytes.size(), max_bytes_cap);
+                for (size_t b = 0; b < new_cap; ++b)
+                {
+                    char hx[4];
+                    std::snprintf(hx, sizeof(hx), "%02X", cr.new_bytes[b]);
+                    ss << hx;
+                }
+                if (cr.new_bytes.size() > max_bytes_cap) ss << "...";
+                ss << "\"";
+            }
+            ss << "\n        }";
+            if (j + 1 < rd.changed_ranges.size()) ss << ",";
+        }
+        if (!rd.changed_ranges.empty()) ss << "\n      ";
+        ss << "]\n    }";
+        if (i + 1 < report.region_diffs.size()) ss << ",";
+        ss << "\n";
+    }
+
+    ss << "  ]\n}\n";
+    return ss.str();
+}
+
 } // namespace core

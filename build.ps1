@@ -105,14 +105,47 @@ function Build-MinGW {
 
     Write-Host "  [+] MinGW build successful: $exeOut" -ForegroundColor Green
 
-    if ($BuildTests -and (Test-Path $testTargetSrc)) {
-        $testExe = Join-Path $buildDir "test_target.exe"
-        Write-Host "  -> Compiling test target ($testExe)..." -ForegroundColor DarkGray
-        & g++ -std=c++17 -m64 -Wall -Wextra -pedantic $optFlag $testTargetSrc -o $testExe
-        if ($LASTEXITCODE -ne 0) {
-            throw "MinGW test_target compilation failed with exit code $LASTEXITCODE"
+    if ($BuildTests) {
+        if (Test-Path $testTargetSrc) {
+            $testExe = Join-Path $buildDir "test_target.exe"
+            Write-Host "  -> Compiling test target ($testExe)..." -ForegroundColor DarkGray
+            & g++ -std=c++17 -m64 -Wall -Wextra -pedantic $optFlag $testTargetSrc -o $testExe
+            if ($LASTEXITCODE -ne 0) {
+                throw "MinGW test_target compilation failed with exit code $LASTEXITCODE"
+            }
+            Write-Host "  [+] MinGW test target: $testExe" -ForegroundColor Green
         }
-        Write-Host "  [+] MinGW test target: $testExe" -ForegroundColor Green
+
+        $testTimelineSrc = Join-Path $repoRoot "tests\test_timeline.cpp"
+        $testDiffSrc = Join-Path $repoRoot "tests\test_diff.cpp"
+        $testPatternSrc = Join-Path $repoRoot "tests\test_pattern.cpp"
+
+        if (Test-Path $testTimelineSrc) {
+            $testTimelineExe = Join-Path $buildDir "test_timeline.exe"
+            Write-Host "  -> Compiling and running test_timeline..." -ForegroundColor DarkGray
+            & g++ -std=c++17 -m64 -Wall -Wextra -pedantic $optFlag -Isrc $testTimelineSrc (Join-Path $repoRoot "src\core\timeline.cpp") (Join-Path $repoRoot "src\core\util.cpp") -o $testTimelineExe
+            if ($LASTEXITCODE -ne 0) { throw "MinGW test_timeline compilation failed" }
+            & $testTimelineExe
+            if ($LASTEXITCODE -ne 0) { throw "test_timeline failed execution" }
+        }
+
+        if (Test-Path $testDiffSrc) {
+            $testDiffExe = Join-Path $buildDir "test_diff.exe"
+            Write-Host "  -> Compiling and running test_diff..." -ForegroundColor DarkGray
+            & g++ -std=c++17 -m64 -Wall -Wextra -pedantic $optFlag -Isrc $testDiffSrc (Join-Path $repoRoot "src\core\snapshot.cpp") (Join-Path $repoRoot "src\core\util.cpp") (Join-Path $repoRoot "src\core\memsource.cpp") (Join-Path $repoRoot "src\core\pattern.cpp") -o $testDiffExe
+            if ($LASTEXITCODE -ne 0) { throw "MinGW test_diff compilation failed" }
+            & $testDiffExe
+            if ($LASTEXITCODE -ne 0) { throw "test_diff failed execution" }
+        }
+
+        if (Test-Path $testPatternSrc) {
+            $testPatternExe = Join-Path $buildDir "test_pattern.exe"
+            Write-Host "  -> Compiling and running test_pattern..." -ForegroundColor DarkGray
+            & g++ -std=c++17 -m64 -Wall -Wextra -pedantic $optFlag -Isrc $testPatternSrc (Join-Path $repoRoot "src\core\pattern.cpp") (Join-Path $repoRoot "src\core\util.cpp") (Join-Path $repoRoot "src\core\memsource.cpp") (Join-Path $repoRoot "src\core\snapshot.cpp") -o $testPatternExe
+            if ($LASTEXITCODE -ne 0) { throw "MinGW test_pattern compilation failed" }
+            & $testPatternExe
+            if ($LASTEXITCODE -ne 0) { throw "test_pattern failed execution" }
+        }
     }
 
     return $true

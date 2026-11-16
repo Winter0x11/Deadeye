@@ -39,6 +39,7 @@ HMENU create_application_menu()
     AppendMenuA(hEditMenu, MF_STRING, IDM_EDIT_EXPORT_REGION, "&Export Selected Region Binary...\tCtrl+E");
     AppendMenuA(hEditMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(hEditMenu, MF_STRING, IDM_EDIT_FIND_PATTERN, "&Find Hex Pattern...\tCtrl+F");
+    AppendMenuA(hEditMenu, MF_STRING, IDM_EDIT_ADV_SEARCH, "&Advanced Pattern Search...\tCtrl+Shift+F");
     AppendMenuA(hEditMenu, MF_STRING, IDM_EDIT_FIND_NEXT, "Find &Next Hit\tF3");
     AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hEditMenu), "&Edit");
 
@@ -49,6 +50,7 @@ HMENU create_application_menu()
     AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_BEHAVIOR, "&Behavior Tracker View\tCtrl+3");
     AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_STRINGS, "&Strings View\tCtrl+4");
     AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_PROCESS_DIFF, "&Process Diff View\tCtrl+5");
+    AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_TIMELINE, "Memory &Timeline View\tCtrl+6");
     AppendMenuA(hViewMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_HIDE_CLEAN, "&Hide Clean Regions");
     AppendMenuA(hViewMenu, MF_STRING, IDM_VIEW_HITS_ONLY, "&Hits Only Filter");
@@ -84,6 +86,7 @@ HMENU create_application_menu()
     AppendMenuA(hDiffMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(hDiffMenu, MF_STRING, IDM_SNAP_SAVE, "&Save Snapshot to .desnap File...");
     AppendMenuA(hDiffMenu, MF_STRING, IDM_SNAP_LOAD, "&Load Snapshot from .desnap File...");
+    AppendMenuA(hDiffMenu, MF_STRING, IDM_SNAP_EXPORT_JSON, "Export &Diff JSON...");
     AppendMenuA(hDiffMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(hDiffMenu, MF_STRING, IDM_DIFF_CAPTURE_BASELINE, "Capture Legacy &Baseline Snapshot\tCtrl+B");
     AppendMenuA(hDiffMenu, MF_STRING, IDM_DIFF_CAPTURE_CURRENT, "Compare with &Current (Diff)\tCtrl+D");
@@ -94,6 +97,9 @@ HMENU create_application_menu()
     HMENU hTimelineMenu = CreatePopupMenu();
     AppendMenuA(hTimelineMenu, MF_STRING, IDM_TIMELINE_SNAP, "&Take Snapshot\tCtrl+N");
     AppendMenuA(hTimelineMenu, MF_STRING, IDM_TIMELINE_CLEAR, "&Clear All Snapshots");
+    AppendMenuA(hTimelineMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(hTimelineMenu, MF_STRING, IDM_TIMELINE_EXPORT_JSON, "Export &Timeline JSON...");
+    AppendMenuA(hTimelineMenu, MF_STRING, IDM_TIMELINE_CLEAR_EVENTS, "Clear Timeline &Events");
     AppendMenuA(hTimelineMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuA(hTimelineMenu, MF_STRING, IDM_TIMELINE_HEARTBEAT, "&Live Memory Heartbeat (1s)");
     AppendMenuA(hTimelineMenu, MF_SEPARATOR, 0, nullptr);
@@ -120,6 +126,7 @@ HACCEL create_application_accelerators()
         { FCONTROL | FVIRTKEY, 'T', ID_BTN_TRIAGE },
         { FCONTROL | FVIRTKEY, 'S', ID_BTN_EXPORT_JSON },
         { FCONTROL | FVIRTKEY, 'F', IDM_EDIT_FIND_PATTERN },
+        { FCONTROL | FSHIFT | FVIRTKEY, 'F', IDM_EDIT_ADV_SEARCH },
         { FVIRTKEY, VK_F3, ID_BTN_NEXT_HIT },
         { FVIRTKEY, VK_F5, ID_BTN_LOAD },
         { FCONTROL | FVIRTKEY, 'C', IDM_EDIT_COPY_ADDR },
@@ -134,6 +141,7 @@ HACCEL create_application_accelerators()
         { FCONTROL | FVIRTKEY, '3', IDM_VIEW_BEHAVIOR },
         { FCONTROL | FVIRTKEY, '4', IDM_VIEW_STRINGS },
         { FCONTROL | FVIRTKEY, '5', IDM_VIEW_PROCESS_DIFF },
+        { FCONTROL | FVIRTKEY, '6', IDM_VIEW_TIMELINE },
         { FCONTROL | FVIRTKEY, 'P', IDM_BEHAVIOR_PIN },
         { FCONTROL | FVIRTKEY, 'B', IDM_STRINGS_BASELINE },
         { FVIRTKEY, VK_F6, IDM_STRINGS_TOGGLE_NEW },
