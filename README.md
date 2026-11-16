@@ -52,4 +52,4 @@ See the build script and source tree for the full build configuration.
 
 ## License
 
-See [LICENSE](LICENSE).
+Deadeye is licensed under the [MIT License](LICENSE). See the license text for terms.
