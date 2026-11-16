@@ -52,4 +52,4 @@ See the build script and source tree for the full build configuration.
 
 ## License
 
-Deadeye is licensed under the [MIT License](LICENSE). See the license text for terms.
+Deadeye is licensed under the [Apache License 2.0](LICENSE).
