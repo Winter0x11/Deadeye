@@ -21,7 +21,7 @@ $RepoName  = "Deadeye"
 $ApiUrl    = "https://api.github.com/repos/$RepoOwner/$RepoName/releases/latest"
 
 # 1. Ensure TLS 1.2+ is active
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # 2. Query GitHub for latest release asset or fallback to latest tag redirect
 Write-Host "[*] Resolving latest Deadeye release..." -ForegroundColor Yellow
@@ -54,9 +54,7 @@ if (-not $DownloadUrl) {
             Write-Host "[+] Resolved latest release via redirect: $LatestTag" -ForegroundColor Green
         }
     } catch {
-        # Fallback to current release
-        $DownloadUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/v1.0.6/Deadeye-v1.0.6-windows-x64.zip"
-        Write-Host "[*] Falling back to standard release asset: $DownloadUrl" -ForegroundColor Yellow
+        throw "Could not resolve the latest Deadeye release. Check your internet connection and try again."
     }
 }
 
