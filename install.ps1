@@ -5,6 +5,7 @@
 [CmdletBinding()]
 param(
     [string]$InstallDir = "$env:LOCALAPPDATA\Deadeye",
+    [string]$SourceExe = "",
     [switch]$NoLaunch
 )
 
@@ -16,49 +17,7 @@ Write-Host "   Deadeye - Memory Triage Scanner & Hex Viewer           " -Foregro
 Write-Host "==========================================================" -ForegroundColor Cyan
 Write-Host ""
 
-$RepoOwner = "Winter0x11"
-$RepoName  = "Deadeye"
-$ApiUrl    = "https://api.github.com/repos/$RepoOwner/$RepoName/releases/latest"
-
-# 1. Ensure TLS 1.2+ is active
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-# 2. Query GitHub for latest release asset or fallback to latest tag redirect
-Write-Host "[*] Resolving latest Deadeye release..." -ForegroundColor Yellow
-
-$DownloadUrl = $null
-try {
-    $Release = Invoke-RestMethod -Uri $ApiUrl -UseBasicParsing -TimeoutSec 15
-    if ($Release.assets) {
-        $ZipAsset = $Release.assets | Where-Object { $_.name -like "*windows-x64*.zip" } | Select-Object -First 1
-        if ($ZipAsset) {
-            $DownloadUrl = $ZipAsset.browser_download_url
-            Write-Host "[+] Found release $($Release.tag_name): $($ZipAsset.name)" -ForegroundColor Green
-        }
-    }
-} catch {
-    Write-Host "[!] Could not query GitHub releases API: $_" -ForegroundColor DarkGray
-}
-
-if (-not $DownloadUrl) {
-    # If API is rate-limited, resolve latest tag via HTTP redirect header (does not consume API quota)
-    try {
-        $Req = [System.Net.HttpWebRequest]::Create("https://github.com/$RepoOwner/$RepoName/releases/latest")
-        $Req.AllowAutoRedirect = $false
-        $Resp = $Req.GetResponse()
-        $Location = $Resp.GetResponseHeader("Location")
-        $Resp.Close()
-        if ($Location -match "/tag/(v[0-9\.]+)") {
-            $LatestTag = $Matches[1]
-            $DownloadUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/$LatestTag/Deadeye-$LatestTag-windows-x64.zip"
-            Write-Host "[+] Resolved latest release via redirect: $LatestTag" -ForegroundColor Green
-        }
-    } catch {
-        throw "Could not resolve the latest Deadeye release. Check your internet connection and try again."
-    }
-}
-
-# 3. Create install destination directory & stop running instances for clean update
+# 1. Stop running Deadeye instance for clean update
 Get-Process -Name "deadeye" -ErrorAction SilentlyContinue | ForEach-Object {
     Write-Host "[*] Stopping running Deadeye instance (PID $($_.Id)) for update..." -ForegroundColor Yellow
     Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
@@ -69,24 +28,88 @@ if (-not (Test-Path $InstallDir)) {
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 }
 
-$TempZip = Join-Path $env:TEMP "Deadeye-Setup.zip"
-if (Test-Path $TempZip) {
+$ExePath = Join-Path $InstallDir "deadeye.exe"
+
+# 2. Check for current local build first (workspace or specified path)
+$LocalCandidate = if ($SourceExe -and (Test-Path $SourceExe)) {
+    $SourceExe
+} else {
+    $candidates = @(
+        (Join-Path (Get-Location) "build\bin\deadeye.exe"),
+        (Join-Path (Get-Location) "build\deadeye.exe")
+    )
+    if ($PSScriptRoot) {
+        $candidates += (Join-Path $PSScriptRoot "build\bin\deadeye.exe")
+        $candidates += (Join-Path $PSScriptRoot "build\deadeye.exe")
+    }
+    $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+}
+
+if ($LocalCandidate) {
+    Write-Host "[+] Installing from current local build: $LocalCandidate" -ForegroundColor Green
+    Copy-Item -Path $LocalCandidate -Destination $ExePath -Force
+} else {
+    $RepoOwner = "Winter0x11"
+    $RepoName  = "Deadeye"
+    $ApiUrl    = "https://api.github.com/repos/$RepoOwner/$RepoName/releases/latest"
+
+    # Ensure TLS 1.2+ is active
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    # Query GitHub for latest release asset or fallback to latest tag redirect
+    Write-Host "[*] Resolving latest Deadeye release..." -ForegroundColor Yellow
+
+    $DownloadUrl = $null
+    try {
+        $Release = Invoke-RestMethod -Uri $ApiUrl -UseBasicParsing -TimeoutSec 15
+        if ($Release.assets) {
+            $ZipAsset = $Release.assets | Where-Object { $_.name -like "*windows-x64*.zip" } | Select-Object -First 1
+            if ($ZipAsset) {
+                $DownloadUrl = $ZipAsset.browser_download_url
+                Write-Host "[+] Found release $($Release.tag_name): $($ZipAsset.name)" -ForegroundColor Green
+            }
+        }
+    } catch {
+        Write-Host "[!] Could not query GitHub releases API: $_" -ForegroundColor DarkGray
+    }
+
+    if (-not $DownloadUrl) {
+        # If API is rate-limited, resolve latest tag via HTTP redirect header (does not consume API quota)
+        try {
+            $Req = [System.Net.HttpWebRequest]::Create("https://github.com/$RepoOwner/$RepoName/releases/latest")
+            $Req.AllowAutoRedirect = $false
+            $Resp = $Req.GetResponse()
+            $Location = $Resp.GetResponseHeader("Location")
+            $Resp.Close()
+            if ($Location -match "/tag/(v[0-9\.]+)") {
+                $LatestTag = $Matches[1]
+                $DownloadUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/$LatestTag/Deadeye-$LatestTag-windows-x64.zip"
+                Write-Host "[+] Resolved latest release via redirect: $LatestTag" -ForegroundColor Green
+            }
+        } catch {
+            throw "Could not resolve the latest Deadeye release. Check your internet connection and try again."
+        }
+    }
+
+    $TempZip = Join-Path $env:TEMP "Deadeye-Setup.zip"
+    if (Test-Path $TempZip) {
+        Remove-Item $TempZip -Force -ErrorAction SilentlyContinue
+    }
+
+    # Download archive
+    Write-Host "[*] Downloading Deadeye binary..." -ForegroundColor Yellow
+    try {
+        Invoke-WebRequest -Uri $DownloadUrl -OutFile $TempZip -UseBasicParsing
+    } catch {
+        Write-Host "[X] Download failed from $($DownloadUrl): $_" -ForegroundColor Red
+        return
+    }
+
+    # Extract files
+    Write-Host "[*] Extracting binaries to $InstallDir..." -ForegroundColor Yellow
+    Expand-Archive -Path $TempZip -DestinationPath $InstallDir -Force
     Remove-Item $TempZip -Force -ErrorAction SilentlyContinue
 }
-
-# 4. Download archive
-Write-Host "[*] Downloading Deadeye binary..." -ForegroundColor Yellow
-try {
-    Invoke-WebRequest -Uri $DownloadUrl -OutFile $TempZip -UseBasicParsing
-} catch {
-    Write-Host "[X] Download failed from $($DownloadUrl): $_" -ForegroundColor Red
-    return
-}
-
-# 5. Extract files
-Write-Host "[*] Extracting binaries to $InstallDir..." -ForegroundColor Yellow
-Expand-Archive -Path $TempZip -DestinationPath $InstallDir -Force
-Remove-Item $TempZip -Force -ErrorAction SilentlyContinue
 
 $ExePath = Join-Path $InstallDir "deadeye.exe"
 if (-not (Test-Path $ExePath)) {
