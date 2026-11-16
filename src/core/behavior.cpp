@@ -379,7 +379,7 @@ void evaluate_watched_region_detections(
             last_prot = s.protect;
         }
 
-        bool is_exec = (s.protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0;
+        bool sample_is_exec = (s.protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0;
         bool is_dormant_prot = (s.protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0;
         bool is_non_exec_rw = (s.protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_WRITECOPY)) != 0;
 
@@ -388,7 +388,7 @@ void evaluate_watched_region_detections(
         // or a non-executable buffer with high entropy (> 6.8).
         // Standard PAGE_READWRITE buffers with low entropy are NEVER considered dormant.
         bool cur_dormant = is_dormant_prot || (is_non_exec_rw && s.avg_entropy > 6.8);
-        bool cur_active = is_exec && (s.avg_entropy < 6.4 && s.avg_entropy > 0.0);
+        bool cur_active = sample_is_exec && (s.avg_entropy < 6.4 && s.avg_entropy > 0.0);
 
         if (!in_dormant_state && cur_dormant)
         {

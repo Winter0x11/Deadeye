@@ -14,34 +14,34 @@ void test_timeline_recording_and_counts()
     assert(tm.count() == 0);
 
     // Record observed region
-    uint64_t id1 = tm.record_region_observed(1234, 0x7FFE0000, 0x10000, PAGE_READWRITE, MEM_PRIVATE, 4.5);
+    [[maybe_unused]] uint64_t id1 = tm.record_region_observed(1234, 0x7FFE0000, 0x10000, PAGE_READWRITE, MEM_PRIVATE, 4.5);
     assert(id1 == 1);
     assert(tm.count() == 1);
 
     // Record protection change: RW -> RX (ExecPermGained)
-    uint64_t id2 = tm.record_protection_changed(1234, 0x7FFE0000, 0x10000, PAGE_READWRITE, PAGE_EXECUTE_READ, MEM_PRIVATE);
+    [[maybe_unused]] uint64_t id2 = tm.record_protection_changed(1234, 0x7FFE0000, 0x10000, PAGE_READWRITE, PAGE_EXECUTE_READ, MEM_PRIVATE);
     assert(id2 == 2);
     assert(tm.count() == 2);
 
     // Record protection change: RX -> RW (ExecPermLost)
-    uint64_t id3 = tm.record_protection_changed(1234, 0x7FFE0000, 0x10000, PAGE_EXECUTE_READ, PAGE_READWRITE, MEM_PRIVATE);
+    [[maybe_unused]] uint64_t id3 = tm.record_protection_changed(1234, 0x7FFE0000, 0x10000, PAGE_EXECUTE_READ, PAGE_READWRITE, MEM_PRIVATE);
     assert(id3 == 3);
 
     // Record content changed
-    uint64_t id4 = tm.record_content_changed(1234, 0x7FFE0000, 0x10000, PAGE_READWRITE, MEM_PRIVATE, 512, "Decryption detected");
+    [[maybe_unused]] uint64_t id4 = tm.record_content_changed(1234, 0x7FFE0000, 0x10000, PAGE_READWRITE, MEM_PRIVATE, 512, "Decryption detected");
     assert(id4 == 4);
 
     // Record entropy shift
-    uint64_t id5 = tm.record_entropy_shift(1234, 0x7FFE0000, 0x10000, PAGE_READWRITE, MEM_PRIVATE, 3.2, 7.8, "Encrypted / Packed");
+    [[maybe_unused]] uint64_t id5 = tm.record_entropy_shift(1234, 0x7FFE0000, 0x10000, PAGE_READWRITE, MEM_PRIVATE, 3.2, 7.8, "Encrypted / Packed");
     assert(id5 == 5);
 
     // Record region disappeared
-    uint64_t id6 = tm.record_region_disappeared(1234, 0x7FFE0000, 0x10000, PAGE_READWRITE, MEM_PRIVATE);
+    [[maybe_unused]] uint64_t id6 = tm.record_region_disappeared(1234, 0x7FFE0000, 0x10000, PAGE_READWRITE, MEM_PRIVATE);
     assert(id6 == 6);
 
     // Record snapshot and diff
-    uint64_t id7 = tm.record_snapshot_captured(1234, "snap_01", "Snapshot 1", 10, 409600);
-    uint64_t id8 = tm.record_diff_generated(1234, "Snap 1 vs Snap 2", 2, 1024);
+    [[maybe_unused]] uint64_t id7 = tm.record_snapshot_captured(1234, "snap_01", "Snapshot 1", 10, 409600);
+    [[maybe_unused]] uint64_t id8 = tm.record_diff_generated(1234, "Snap 1 vs Snap 2", 2, 1024);
     assert(id7 == 7 && id8 == 8);
     assert(tm.count() == 8);
 

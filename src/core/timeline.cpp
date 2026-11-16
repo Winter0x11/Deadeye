@@ -316,9 +316,10 @@ std::vector<TimelineEvent> TimelineManager::query(const TimelineFilter &filter) 
             std::string q = filter.text_query;
             std::string s1 = evt.summary;
             std::string s2 = evt.details;
-            std::transform(q.begin(), q.end(), q.begin(), ::tolower);
-            std::transform(s1.begin(), s1.end(), s1.begin(), ::tolower);
-            std::transform(s2.begin(), s2.end(), s2.begin(), ::tolower);
+            auto to_lower_char = [](unsigned char c) -> char { return static_cast<char>(std::tolower(c)); };
+            std::transform(q.begin(), q.end(), q.begin(), to_lower_char);
+            std::transform(s1.begin(), s1.end(), s1.begin(), to_lower_char);
+            std::transform(s2.begin(), s2.end(), s2.begin(), to_lower_char);
             if (s1.find(q) == std::string::npos && s2.find(q) == std::string::npos)
                 continue;
         }

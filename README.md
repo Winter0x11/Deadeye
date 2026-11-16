@@ -40,17 +40,41 @@ Some processes and memory regions may be inaccessible due to Windows permissions
 
 ## Build from source
 
-Requires a Windows development environment and a C++17 compiler.
+Requires a Windows development environment and a C++17 compiler (MSVC or MinGW-w64).
+
+### Option 1: CMake (Recommended)
+
+```powershell
+# Configure and build with CMake
+cmake -B build
+cmake --build build --config Release
+
+# Run the test suite
+ctest --test-dir build -C Release --output-on-failure
+```
+
+### Option 2: GNU Make (MinGW-w64)
+
+```bash
+# Build deadeye.exe and test_target.exe
+make
+
+# Run the test suite
+make check
+
+# Clean build artifacts
+make clean
+```
+
+### Option 3: PowerShell Script
 
 ```powershell
 .\build.ps1
 
-# Select a toolchain
+# Or select a specific toolchain
 .\build.ps1 -Toolchain msvc
 .\build.ps1 -Toolchain mingw
 ```
-
-See the build script and source tree for the full build configuration.
 
 ## License
 

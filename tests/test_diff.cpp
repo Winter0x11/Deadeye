@@ -89,7 +89,7 @@ void test_single_byte_and_multi_range_diff()
 
     assert(report.count_modified_regions == 1);
     assert(report.total_changed_bytes == 6); // 1 + 5
-    const auto &rd = report.region_diffs[0];
+    [[maybe_unused]] const auto &rd = report.region_diffs[0];
     assert(rd.overall_status == core::DiffByteStatus::Modified);
     assert(rd.changed_ranges.size() == 2);
 

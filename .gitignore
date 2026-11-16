@@ -1,5 +1,8 @@
-build/
+build*/
+bin/
 *.exe
 *.o
 *.obj
+*.res
+*.desnap
 tests/triage_current.json

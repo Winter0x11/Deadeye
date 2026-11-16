@@ -3,6 +3,7 @@
 #include "core/live_source.hpp"
 #include <cstring>
 #include <unordered_set>
+#include <winternl.h>
 
 typedef NTSTATUS(NTAPI *pfnNtQueryInformationProcess)(
     HANDLE, ULONG, PVOID, ULONG, PULONG);
