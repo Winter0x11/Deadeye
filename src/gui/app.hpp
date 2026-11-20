@@ -212,6 +212,7 @@ void on_export_timeline_json();
 void on_clear_timeline();
 void on_export_diff_json_dialog();
 void on_advanced_pattern_search_dialog();
+void on_pe_integrity_dialog();
 void evaluate_memory_behavior_heartbeat();
 
 void start_worker_task(WorkerTaskType task_type, bool require_pattern);

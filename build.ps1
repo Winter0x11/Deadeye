@@ -146,6 +146,16 @@ function Build-MinGW {
             & $testPatternExe
             if ($LASTEXITCODE -ne 0) { throw "test_pattern failed execution" }
         }
+
+        $testPeIntegritySrc = Join-Path $repoRoot "tests\test_pe_integrity.cpp"
+        if (Test-Path $testPeIntegritySrc) {
+            $testPeIntegrityExe = Join-Path $buildDir "test_pe_integrity.exe"
+            Write-Host "  -> Compiling and running test_pe_integrity..." -ForegroundColor DarkGray
+            & g++ -std=c++17 -m64 -Wall -Wextra -pedantic $optFlag -Isrc $testPeIntegritySrc (Join-Path $repoRoot "src\core\pe_integrity.cpp") (Join-Path $repoRoot "src\core\live_source.cpp") (Join-Path $repoRoot "src\core\util.cpp") (Join-Path $repoRoot "src\core\timeline.cpp") -ladvapi32 -o $testPeIntegrityExe
+            if ($LASTEXITCODE -ne 0) { throw "MinGW test_pe_integrity compilation failed" }
+            & $testPeIntegrityExe
+            if ($LASTEXITCODE -ne 0) { throw "test_pe_integrity failed execution" }
+        }
     }
 
     return $true

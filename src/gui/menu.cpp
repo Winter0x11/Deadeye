@@ -91,6 +91,8 @@ HMENU create_application_menu()
     AppendMenuA(hDiffMenu, MF_STRING, IDM_DIFF_CAPTURE_BASELINE, "Capture Legacy &Baseline Snapshot\tCtrl+B");
     AppendMenuA(hDiffMenu, MF_STRING, IDM_DIFF_CAPTURE_CURRENT, "Compare with &Current (Diff)\tCtrl+D");
     AppendMenuA(hDiffMenu, MF_STRING, IDM_DIFF_VIEW_STRINGS, "View Newly &Revealed Strings...\tCtrl+U");
+    AppendMenuA(hDiffMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuA(hDiffMenu, MF_STRING, IDM_DIFF_PE_INTEGRITY, "PE &Integrity Comparison...\tCtrl+Shift+I");
     AppendMenuA(hMenuBar, MF_POPUP, reinterpret_cast<UINT_PTR>(hDiffMenu), "&Snapshots");
 
     // 7. Timeline Menu
@@ -147,7 +149,8 @@ HACCEL create_application_accelerators()
         { FVIRTKEY, VK_F6, IDM_STRINGS_TOGGLE_NEW },
         { FVIRTKEY, VK_F7, IDM_STRINGS_EXTRACT_SEL },
         { FCONTROL | FVIRTKEY, 'D', IDM_DIFF_CAPTURE_CURRENT },
-        { FCONTROL | FVIRTKEY, 'U', IDM_DIFF_VIEW_STRINGS }
+        { FCONTROL | FVIRTKEY, 'U', IDM_DIFF_VIEW_STRINGS },
+        { FCONTROL | FSHIFT | FVIRTKEY, 'I', IDM_DIFF_PE_INTEGRITY }
     };
     return CreateAcceleratorTableA(accels, static_cast<int>(sizeof(accels) / sizeof(accels[0])));
 }

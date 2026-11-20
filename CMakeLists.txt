@@ -55,6 +55,7 @@ set(DEADEYE_SOURCES
     src/core/live_source.cpp
     src/core/memsource.cpp
     src/core/pattern.cpp
+    src/core/pe_integrity.cpp
     src/core/pe_source.cpp
     src/core/snapshot.cpp
     src/core/timeline.cpp
@@ -65,6 +66,7 @@ set(DEADEYE_SOURCES
     src/gui/controls.cpp
     src/gui/hexview.cpp
     src/gui/menu.cpp
+    src/gui/pe_integrity_dialog.cpp
     src/gui/pe_options_dialog.cpp
     src/gui/search_dialog.cpp
     src/gui/strings_dialog.cpp
@@ -132,3 +134,14 @@ add_executable(test_pattern
 )
 target_link_libraries(test_pattern PRIVATE advapi32 user32)
 add_test(NAME test_pattern COMMAND test_pattern)
+
+# 4. PE Integrity & Memory Comparison Unit Tests
+add_executable(test_pe_integrity
+    tests/test_pe_integrity.cpp
+    src/core/pe_integrity.cpp
+    src/core/live_source.cpp
+    src/core/util.cpp
+    src/core/timeline.cpp
+)
+target_link_libraries(test_pe_integrity PRIVATE advapi32 user32)
+add_test(NAME test_pe_integrity COMMAND test_pe_integrity)

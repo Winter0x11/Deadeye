@@ -14,6 +14,7 @@
 #include "gui/strings_dialog.hpp"
 #include "gui/pe_options_dialog.hpp"
 #include "gui/search_dialog.hpp"
+#include "gui/pe_integrity_dialog.hpp"
 
 #include "core/scoring.hpp"
 #include "core/util.hpp"
@@ -1283,6 +1284,11 @@ void on_export_diff_json_dialog()
 void on_advanced_pattern_search_dialog()
 {
     open_advanced_pattern_search_dialog(get_app_state().hwnd_main);
+}
+
+void on_pe_integrity_dialog()
+{
+    open_pe_integrity_dialog(get_app_state().hwnd_main);
 }
 
 void on_export_region_binary()
@@ -2789,6 +2795,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         {
             on_advanced_pattern_search_dialog();
         }
+        else if (id == IDM_DIFF_PE_INTEGRITY)
+        {
+            on_pe_integrity_dialog();
+        }
         else if (id == IDM_BEHAVIOR_PIN)
         {
             if (get_app_state().has_selection && get_app_state().selected_region < get_app_state().regions.size())
@@ -3211,6 +3221,16 @@ int run_gui(HINSTANCE hInst, int nCmdShow)
     wcSearch.hCursor = LoadCursorA(nullptr, IDC_ARROW);
     wcSearch.hIcon = hIconSmall;
     RegisterClassExA(&wcSearch);
+
+    WNDCLASSEXA wcPeInt = {};
+    wcPeInt.cbSize = sizeof(wcPeInt);
+    wcPeInt.lpfnWndProc = PeIntegrityDlgProc;
+    wcPeInt.hInstance = hInst;
+    wcPeInt.hbrBackground = nullptr;
+    wcPeInt.lpszClassName = "DeadeyePeIntegrityDlg";
+    wcPeInt.hCursor = LoadCursorA(nullptr, IDC_ARROW);
+    wcPeInt.hIcon = hIconSmall;
+    RegisterClassExA(&wcPeInt);
 
     HWND hwnd = CreateWindowA("DeadeyeHexViewer", "Deadeye",
                               WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,

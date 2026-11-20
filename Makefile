@@ -21,6 +21,7 @@ SRC_CORE = src/core/behavior.cpp \
            src/core/live_source.cpp \
            src/core/memsource.cpp \
            src/core/pattern.cpp \
+           src/core/pe_integrity.cpp \
            src/core/pe_source.cpp \
            src/core/snapshot.cpp \
            src/core/timeline.cpp \
@@ -32,6 +33,7 @@ SRC_GUI = src/gui/app.cpp \
           src/gui/controls.cpp \
           src/gui/hexview.cpp \
           src/gui/menu.cpp \
+          src/gui/pe_integrity_dialog.cpp \
           src/gui/pe_options_dialog.cpp \
           src/gui/search_dialog.cpp \
           src/gui/strings_dialog.cpp \
@@ -46,6 +48,7 @@ TARGET_TEST_TARGET = $(BIN_DIR)/test_target.exe
 TARGET_TEST_TIMELINE = $(BIN_DIR)/test_timeline.exe
 TARGET_TEST_DIFF = $(BIN_DIR)/test_diff.exe
 TARGET_TEST_PATTERN = $(BIN_DIR)/test_pattern.exe
+TARGET_TEST_PE_INTEGRITY = $(BIN_DIR)/test_pe_integrity.exe
 
 # Platform directory management
 ifeq ($(OS),Windows_NT)
@@ -73,7 +76,7 @@ $(TARGET_DEADEYE): $(SRC_DEADEYE) $(RES_OBJ) | dirs
 $(TARGET_TEST_TARGET): tests/test_target.cpp | dirs
 	$(CXX) $(CXXFLAGS) $(INCLUDES) tests/test_target.cpp -o $@ $(LDFLAGS) $(LIBS_BASE)
 
-tests: dirs $(TARGET_TEST_TIMELINE) $(TARGET_TEST_DIFF) $(TARGET_TEST_PATTERN)
+tests: dirs $(TARGET_TEST_TIMELINE) $(TARGET_TEST_DIFF) $(TARGET_TEST_PATTERN) $(TARGET_TEST_PE_INTEGRITY)
 
 $(TARGET_TEST_TIMELINE): tests/test_timeline.cpp src/core/timeline.cpp src/core/util.cpp | dirs
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS) $(LIBS_BASE)
@@ -84,6 +87,9 @@ $(TARGET_TEST_DIFF): tests/test_diff.cpp src/core/snapshot.cpp src/core/util.cpp
 $(TARGET_TEST_PATTERN): tests/test_pattern.cpp src/core/pattern.cpp src/core/util.cpp src/core/memsource.cpp src/core/snapshot.cpp | dirs
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS) $(LIBS_BASE)
 
+$(TARGET_TEST_PE_INTEGRITY): tests/test_pe_integrity.cpp src/core/pe_integrity.cpp src/core/live_source.cpp src/core/util.cpp src/core/timeline.cpp | dirs
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $^ -o $@ $(LDFLAGS) $(LIBS_BASE)
+
 check: tests
 	@echo [RUN] Running test_timeline...
 	@$(TARGET_TEST_TIMELINE)
@@ -91,6 +97,8 @@ check: tests
 	@$(TARGET_TEST_DIFF)
 	@echo [RUN] Running test_pattern...
 	@$(TARGET_TEST_PATTERN)
+	@echo [RUN] Running test_pe_integrity...
+	@$(TARGET_TEST_PE_INTEGRITY)
 	@echo [SUCCESS] All unit tests passed!
 
 clean:
