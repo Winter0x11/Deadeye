@@ -21,6 +21,7 @@ Prefer a manual download? Get the [latest release](https://github.com/Winter0x11
 - **Process inspection** — Find and attach to running processes; inspect process metadata and architecture.
 - **Memory maps** — Explore committed regions, addresses, sizes, types, protections, and entropy.
 - **Hex inspection** — Examine process memory, visually compare modified bytes, and navigate to addresses.
+- **PE Integrity & Memory Comparison** (`Ctrl+Shift+I`) — Compare loaded modules in a live process against on-disk PE executables and libraries. Detects inline hooks (x86/x64 jumps and redirections), code modifications, IAT redirections, relocation discrepancies, and code cave injections with side-by-side hex comparison and JSON/Timeline export.
 - **Memory Investigation Timeline** (`Ctrl+6`) — Chronological stream tracking memory events over time (region allocations, inferred deallocations, protection transitions, execution permission gains/losses, entropy shifts, snapshots, and diffs) with query filtering and JSON export.
 - **Advanced Byte-Level Memory Diffing** (`F8`/`Shift+F8`) — Deep byte comparison between earlier and later memory states highlighting changed byte ranges, distinguishing unreadable from zeroed bytes, diffing offline `.desnap` files, and exporting structured diff reports.
 - **Advanced Pattern Search** (`Ctrl+Shift+F`) — Search readable space, selected regions, custom address ranges, or snapshots for hex wildcards (`48 8B ?? ?? 48 85 C0`), case-sensitive/insensitive ASCII strings, and UTF-16LE strings with cross-chunk boundary overlap handling.

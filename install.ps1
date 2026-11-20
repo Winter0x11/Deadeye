@@ -30,16 +30,22 @@ if (-not (Test-Path $InstallDir)) {
 
 $ExePath = Join-Path $InstallDir "deadeye.exe"
 
-# 2. Check for current local build first (workspace or specified path)
+# 2. Check for current local build first (workspace, extracted archive, or specified path)
 $LocalCandidate = if ($SourceExe -and (Test-Path $SourceExe)) {
     $SourceExe
 } else {
     $candidates = @(
+        (Join-Path (Get-Location) "deadeye.exe"),
         (Join-Path (Get-Location) "build\bin\deadeye.exe"),
+        (Join-Path (Get-Location) "build\bin\Release\deadeye.exe"),
+        (Join-Path (Get-Location) "build\Release\deadeye.exe"),
         (Join-Path (Get-Location) "build\deadeye.exe")
     )
     if ($PSScriptRoot) {
+        $candidates += (Join-Path $PSScriptRoot "deadeye.exe")
         $candidates += (Join-Path $PSScriptRoot "build\bin\deadeye.exe")
+        $candidates += (Join-Path $PSScriptRoot "build\bin\Release\deadeye.exe")
+        $candidates += (Join-Path $PSScriptRoot "build\Release\deadeye.exe")
         $candidates += (Join-Path $PSScriptRoot "build\deadeye.exe")
     }
     $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
