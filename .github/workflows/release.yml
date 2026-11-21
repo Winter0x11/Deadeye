@@ -36,7 +36,7 @@ jobs:
         shell: powershell
         run: |
           $tag = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "v1.0.0" }
-          Compress-Archive -Path build\deadeye.exe, README.md, install.ps1 -DestinationPath "build\Deadeye-$tag-windows-x64.zip" -Force
+          Compress-Archive -Path build\deadeye.exe, README.md, install.ps1, LICENSE -DestinationPath "build\Deadeye-$tag-windows-x64.zip" -Force
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

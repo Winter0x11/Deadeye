@@ -3006,10 +3006,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         else if (id == IDM_HELP_ABOUT)
         {
             std::string about =
-                "Deadeye v1.0\n"
+                "Deadeye v1.0.8\n"
                 "Process Memory Triage Scanner & Real-Time Diff Timeline\n\n"
                 "Built with C++17 & Native Win32 for defensive reverse engineering,\n"
                 "malware analysis, and detection engineering.\n\n"
+                "License: GNU General Public License v3.0 (GPL-3.0)\n"
                 "Repository: https://github.com/Winter0x11/Deadeye";
             MessageBoxA(hwnd, about.c_str(), "About Deadeye", MB_OK | MB_ICONINFORMATION);
         }

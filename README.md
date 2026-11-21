@@ -79,4 +79,4 @@ make clean
 
 ## License
 
-Deadeye is licensed under the [Apache License 2.0](LICENSE).
+Deadeye is free software licensed under the [GNU General Public License v3.0 (GPL-3.0)](LICENSE).

@@ -6,6 +6,7 @@
 param(
     [string]$InstallDir = "$env:LOCALAPPDATA\Deadeye",
     [string]$SourceExe = "",
+    [string]$Version = "",
     [switch]$NoLaunch
 )
 
@@ -62,38 +63,48 @@ if ($LocalCandidate) {
     # Ensure TLS 1.2+ is active
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-    # Query GitHub for latest release asset or fallback to latest tag redirect
-    Write-Host "[*] Resolving latest Deadeye release..." -ForegroundColor Yellow
-
     $DownloadUrl = $null
-    try {
-        $Release = Invoke-RestMethod -Uri $ApiUrl -UseBasicParsing -TimeoutSec 15
-        if ($Release.assets) {
-            $ZipAsset = $Release.assets | Where-Object { $_.name -like "*windows-x64*.zip" } | Select-Object -First 1
-            if ($ZipAsset) {
-                $DownloadUrl = $ZipAsset.browser_download_url
-                Write-Host "[+] Found release $($Release.tag_name): $($ZipAsset.name)" -ForegroundColor Green
-            }
-        }
-    } catch {
-        Write-Host "[!] Could not query GitHub releases API: $_" -ForegroundColor DarkGray
-    }
 
-    if (-not $DownloadUrl) {
-        # If API is rate-limited, resolve latest tag via HTTP redirect header (does not consume API quota)
+    if ($Version) {
+        $tagToUse = if ($Version.StartsWith("v")) { $Version } else { "v$Version" }
+        $DownloadUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/$tagToUse/Deadeye-$tagToUse-windows-x64.zip"
+        Write-Host "[*] Targeting specified release version: $tagToUse" -ForegroundColor Yellow
+    } else {
+        # Query GitHub for latest release asset
+        Write-Host "[*] Resolving latest Deadeye release..." -ForegroundColor Yellow
+
         try {
-            $Req = [System.Net.HttpWebRequest]::Create("https://github.com/$RepoOwner/$RepoName/releases/latest")
-            $Req.AllowAutoRedirect = $false
-            $Resp = $Req.GetResponse()
-            $Location = $Resp.GetResponseHeader("Location")
-            $Resp.Close()
-            if ($Location -match "/tag/(v[0-9\.]+)") {
-                $LatestTag = $Matches[1]
-                $DownloadUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/$LatestTag/Deadeye-$LatestTag-windows-x64.zip"
-                Write-Host "[+] Resolved latest release via redirect: $LatestTag" -ForegroundColor Green
+            $Releases = Invoke-RestMethod -Uri "https://api.github.com/repos/$RepoOwner/$RepoName/releases" -UseBasicParsing -TimeoutSec 15
+            foreach ($rel in $Releases) {
+                if ($rel.assets) {
+                    $ZipAsset = $rel.assets | Where-Object { $_.name -like "*windows-x64*.zip" } | Select-Object -First 1
+                    if ($ZipAsset) {
+                        $DownloadUrl = $ZipAsset.browser_download_url
+                        Write-Host "[+] Found release $($rel.tag_name): $($ZipAsset.name)" -ForegroundColor Green
+                        break
+                    }
+                }
             }
         } catch {
-            throw "Could not resolve the latest Deadeye release. Check your internet connection and try again."
+            Write-Host "[!] Could not query GitHub releases API: $_" -ForegroundColor DarkGray
+        }
+
+        if (-not $DownloadUrl) {
+            # Fallback to /releases/latest redirect header (rate-limit safe)
+            try {
+                $Req = [System.Net.HttpWebRequest]::Create("https://github.com/$RepoOwner/$RepoName/releases/latest")
+                $Req.AllowAutoRedirect = $false
+                $Resp = $Req.GetResponse()
+                $Location = $Resp.GetResponseHeader("Location")
+                $Resp.Close()
+                if ($Location -match "/tag/(v[0-9\.]+)") {
+                    $LatestTag = $Matches[1]
+                    $DownloadUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/$LatestTag/Deadeye-$LatestTag-windows-x64.zip"
+                    Write-Host "[+] Resolved latest release via redirect: $LatestTag" -ForegroundColor Green
+                }
+            } catch {
+                throw "Could not resolve the latest Deadeye release. Check your internet connection and try again."
+            }
         }
     }
 

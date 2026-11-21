@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(Deadeye
-    VERSION 1.0.7
+    VERSION 1.0.8
     DESCRIPTION "Defensive Windows Process Memory Triage Scanner & Inspection Tool"
     LANGUAGES CXX RC
 )
